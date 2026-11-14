@@ -209,6 +209,12 @@ public:
     size_t size_up_to_pos(llama_pos max_pos) const;
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
+    size_t n_media_chunks() const { return map_idx_to_media.size(); }
+    std::vector<uint32_t> media_chunk_indices() const;
+    std::vector<uint32_t> media_chunk_token_counts() const;
+    std::string media_chunk_id(size_t idx) const;
+    size_t media_chunk_token_count(size_t idx) const;
+    void append_media_placeholders_from(const server_tokens & source);
 
     // find next media chunk after idx
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens

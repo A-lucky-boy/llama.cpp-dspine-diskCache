@@ -101,6 +101,44 @@ static void test_server_tokens_serialize(testing & t) {
         t.assert_true("tokens", restored.get_tokens() == st.get_tokens());
     });
 
+    t.test("media placeholder roundtrip", [&](testing & t) {
+        mtmd::input_chunks chunks(mtmd_test_create_input_chunks());
+        t.assert_true("fixture created", chunks.ptr != nullptr);
+        if (!chunks.ptr) {
+            return;
+        }
+        const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+        size_t image_index = n_chunks;
+        for (size_t i = 0; i < n_chunks; ++i) {
+            if (mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks.ptr.get(), i)) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                image_index = i;
+                break;
+            }
+        }
+        t.assert_true("fixture has image chunk", image_index < n_chunks);
+        if (image_index == n_chunks) {
+            return;
+        }
+
+        server_tokens source(chunks, true);
+        auto * image = mtmd_input_chunks_get(chunks.ptr.get(), image_index);
+        t.assert_true("image id available", mtmd_input_chunk_get_id(image) != nullptr && mtmd_input_chunk_get_id(image)[0] != '\0');
+        mtmd::input_chunk_ptr placeholder(mtmd_input_chunk_get_placeholder(image));
+        t.assert_true("placeholder created", placeholder != nullptr);
+        if (!placeholder) {
+            return;
+        }
+
+        llama_tokens media_tokens{1, 2, 3, 4, 5};
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(placeholder.get());
+        media_tokens.insert(media_tokens.end(), n_tokens, LLAMA_TOKEN_NULL);
+        server_tokens restored(media_tokens, true);
+        restored.append_media_placeholders_from(source);
+        t.assert_equal("media chunk count", (size_t) 1, restored.n_media_chunks());
+        t.assert_equal("media token count", n_tokens, restored.media_chunk_token_count(5));
+        t.assert_true("media id preserved", restored.media_chunk_id(5) == mtmd_input_chunk_get_id(placeholder.get()));
+    });
+
     t.test("roundtrip empty", [&](testing & t) {
         server_tokens st(llama_tokens{}, false);
         server_tokens restored = server_tokens::deserialize(pack(st.serialize()), false);
@@ -357,7 +395,7 @@ static void test_server_pipe(testing & t) {
         server_pipe<int> p;
         std::thread producer([&]() {
             for (int i = 0; i < n; i++) {
-                p.write(int(i));
+                p.write(i + 0);
             }
             p.close_write();
         });

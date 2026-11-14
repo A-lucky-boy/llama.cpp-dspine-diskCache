@@ -899,8 +899,8 @@ static void test_mrope(testing & t) {
     });
 
     t.test("pos_jump_allowed", [&](testing & t) {
-        const uint32_t n_pos  = 4;
-        const uint32_t n_embd = 2;
+        constexpr uint32_t n_pos  = 4;
+        constexpr uint32_t n_embd = 2;
 
         mock_memory mem;
         mem.ranges[0] = {0, 9};
@@ -910,7 +910,7 @@ static void test_mrope(testing & t) {
         auto try_pos = [&](llama_pos p0) {
             batch_builder bb(n_embd, &mem, 4, n_pos);
 
-            const llama_pos pos[n_pos] = { p0, 1, 1, 0 };
+            const llama_pos pos[4] = { p0, 1, 1, 0 };
             bb.add_embd(pos, {0}, true);
 
             return ba.init(bb.b, vocab, false);

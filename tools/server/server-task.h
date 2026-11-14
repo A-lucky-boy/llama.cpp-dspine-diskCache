@@ -740,6 +740,9 @@ struct server_disk_cache_entry {
     std::string  path;
     uint64_t     hash      = 0;
     llama_tokens tokens;      // plain token ids, media placeholders included
+    std::vector<uint32_t> media_indices;
+    std::vector<uint32_t> media_token_counts;
+    std::vector<std::string> media_ids;
     size_t       size_main = 0;
     size_t       size_drft = 0;
     size_t       size_file = 0; // whole file, including the header
@@ -748,8 +751,12 @@ struct server_disk_cache_entry {
 
 // an entry queued for the background writer
 struct server_disk_cache_pending {
-    std::vector<char>  packed;      // server_tokens::serialize() of the prompt
-    llama_tokens       ids;         // token ids extracted from packed
+    uint64_t           hash   = 0;
+    std::vector<char>  packed;      // plain tokens plus media chunk indices
+    llama_tokens       ids;         // plain token ids, with media placeholders
+    std::vector<uint32_t> media_indices;
+    std::vector<uint32_t> media_token_counts;
+    std::vector<std::string> media_ids;
     common_state_data  main;
     common_state_data  drft;
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
@@ -796,12 +803,26 @@ struct server_disk_cache {
     std::deque<server_disk_cache_pending> queue;
     size_t                  queue_bytes = 0;
 
+    // hashes of entries that are queued or being written, so store() and
+    // mirror() do not enqueue the same prompt twice
+    std::unordered_set<uint64_t> inflight;
+
 private:
     bool write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out);
     bool read_entry(const server_disk_cache_entry & entry, size_t lcp, std::vector<char> & packed, common_state_data & main, common_state_data & drft,
             std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints);
+    // persist the entry's last-used timestamp in the file header
+    bool touch_entry(const server_disk_cache_entry & e);
     void scan();
     void enforce_limit();
+    // remove entries whose prompt is a strict prefix of the given prompt
+    // (and whose media chunks are a subset of the given ones): the longer
+    // entry serves any lookup the shorter one would
+    void drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
+            const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids);
+    // remove any stored entry that is a redundant prefix of another stored
+    // entry (run once at startup, after scan)
+    void dedup_prefixes();
     void worker();
 };
 

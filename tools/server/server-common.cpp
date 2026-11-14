@@ -611,6 +611,75 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
+std::string server_tokens::media_chunk_id(size_t idx) const {
+    const auto & chunk = find_chunk(idx);
+    const char * id = mtmd_input_chunk_get_id(chunk.get());
+    return id ? id : "";
+}
+
+size_t server_tokens::media_chunk_token_count(size_t idx) const {
+    return mtmd_input_chunk_get_n_tokens(find_chunk(idx).get());
+}
+
+std::vector<uint32_t> server_tokens::media_chunk_token_counts() const {
+    std::vector<uint32_t> result;
+    result.reserve(map_idx_to_media.size());
+    for (const auto & item : map_idx_to_media) {
+        const size_t count = mtmd_input_chunk_get_n_tokens(item.second.get());
+        if (count > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("Media chunk token count exceeds serialized range");
+        }
+        result.push_back((uint32_t) count);
+    }
+    return result;
+}
+
+std::vector<uint32_t> server_tokens::media_chunk_indices() const {
+    std::vector<uint32_t> result;
+    result.reserve(map_idx_to_media.size());
+    for (const auto & item : map_idx_to_media) {
+        if (item.first > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("Media chunk index exceeds serialized range");
+        }
+        result.push_back((uint32_t) item.first);
+    }
+    return result;
+}
+
+void server_tokens::append_media_placeholders_from(const server_tokens & source) {
+    if (tokens.size() > source.tokens.size()) {
+        throw std::runtime_error("Cached prompt is longer than the current prompt");
+    }
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] != source.tokens[i]) {
+            throw std::runtime_error("Cached prompt does not match the current prefix");
+        }
+    }
+    for (const auto & item : source.map_idx_to_media) {
+        const size_t idx = item.first;
+        if (idx >= tokens.size()) {
+            continue;
+        }
+        if (map_idx_to_media.find(idx) != map_idx_to_media.end()) {
+            continue;
+        }
+        const size_t count = mtmd_input_chunk_get_n_tokens(item.second.get());
+        if (idx + count > tokens.size()) {
+            throw std::runtime_error("Media chunk exceeds cached prompt length");
+        }
+        for (size_t i = idx; i < idx + count; ++i) {
+            if (tokens[i] != LLAMA_TOKEN_NULL) {
+                throw std::runtime_error("Cached media chunk does not match token placeholders");
+            }
+        }
+        mtmd::input_chunk_ptr placeholder(mtmd_input_chunk_get_placeholder(item.second.get()));
+        if (!placeholder) {
+            throw std::runtime_error("Failed to create cached media placeholder");
+        }
+        map_idx_to_media[idx] = std::move(placeholder);
+    }
+}
+
 std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
     auto it = map_idx_to_media.upper_bound(idx);
     if (it != map_idx_to_media.end()) {

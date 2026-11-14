@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 //
@@ -1751,12 +1752,13 @@ json server_task_result_apply_lora::to_json() {
 //   uint32   version
 //   uint32   sig_len
 //   char     sig[sig_len]  model/context signature
-//   uint32   n_tokens
-//   uint32   packed[n_tokens]  server_tokens::serialize() output
+//   uint32   packed_size
+//   uint32   packed[packed_size]  token ids plus media metadata
 //   uint64   size_main
 //   uint64   size_drft
 //   uint32   n_ckpt
 //   uint64   created       unix seconds
+//   uint64   last_used     unix seconds (rewritten in place on every hit)
 //   checkpoint table: n_ckpt x { int64 n_tokens, int32 pos_min, int32 pos_max, uint64 size_spec, uint64 size_tgt, uint64 size_dft }
 //   main[size_main]
 //   drft[size_drft]
@@ -1766,18 +1768,42 @@ json server_task_result_apply_lora::to_json() {
 namespace {
 
 constexpr char     DISK_CACHE_MAGIC[8] = { 'L', 'L', 'D', 'S', 'C', '0', '0', '1' };
-constexpr uint32_t DISK_CACHE_VERSION  = 3;
+constexpr uint32_t DISK_CACHE_VERSION  = 5;
+
+// version 5 added the last_used field. Header layout is fixed except for the
+// model/context signature, so its size is DISK_CACHE_HEADER_FIXED + sig.size()
+// bytes; touch_entry() rewrites the last 8 bytes of it in place
+constexpr size_t DISK_CACHE_HEADER_FIXED = 8 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8; // magic..last_used, without sig (56)
+
+// skip entries shorter than this in the lookup: the lcp with any prompt
+// cannot reach min_tokens, so they can never be restored
+constexpr size_t DISK_CACHE_MIN_LOOKUP_TOKENS = 64;
 
 // do not buffer more than this many bytes of pending writes
 constexpr size_t DISK_CACHE_QUEUE_BYTES = 4096ull*1024ull*1024ull;
 
-uint64_t disk_cache_hash(const llama_tokens & tokens) {
+uint64_t disk_cache_hash(const llama_tokens & tokens, const std::vector<uint32_t> & media_indices,
+        const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids) {
     uint64_t h = 1469598103934665603ull; // FNV-1a
-    for (const llama_token t : tokens) {
-        const uint32_t v = (uint32_t) t;
+    auto add = [&](uint8_t value) {
+        h ^= value;
+        h *= 1099511628211ull;
+    };
+    auto add_u32 = [&](uint32_t value) {
         for (int i = 0; i < 4; ++i) {
-            h ^= (uint64_t) ((v >> (8*i)) & 0xFF);
-            h *= 1099511628211ull;
+            add((uint8_t) ((value >> (8*i)) & 0xFF));
+        }
+    };
+    for (const llama_token t : tokens) {
+        add_u32((uint32_t) t);
+    }
+    add_u32((uint32_t) media_indices.size());
+    for (size_t i = 0; i < media_indices.size(); ++i) {
+        add_u32(media_indices[i]);
+        add_u32(media_token_counts[i]);
+        add_u32((uint32_t) media_ids[i].size());
+        for (unsigned char c : media_ids[i]) {
+            add(c);
         }
     }
     return h;
@@ -1799,65 +1825,133 @@ int64_t disk_cache_now() {
             std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// extract the plain token ids from a packed server_tokens buffer
-bool disk_cache_unpack_ids(const std::vector<char> & packed, llama_tokens & ids) {
-    const size_t n_words = packed.size() / sizeof(llama_token);
-    if (n_words < 3) {
+bool disk_cache_unpack_ids(const std::vector<char> & packed, llama_tokens & ids,
+        std::vector<uint32_t> & media_indices, std::vector<uint32_t> & media_token_counts,
+        std::vector<std::string> & media_ids) {
+    if (packed.size() < sizeof(uint32_t) * 2) {
         return false;
     }
 
-    llama_token marker = 0;
-    uint32_t n_ids = 0;
-    memcpy(&marker, packed.data(), sizeof(llama_token));
-    memcpy(&n_ids,  packed.data() + 2*sizeof(llama_token), sizeof(uint32_t));
-
-    if (marker != LLAMA_TOKEN_NULL) {
-        // legacy plain token list
-        ids.resize(n_words);
-        memcpy(ids.data(), packed.data(), n_words * sizeof(llama_token));
+    size_t offset = 0;
+    auto read = [&](void * dst, size_t size) {
+        if (offset > packed.size() || size > packed.size() - offset) {
+            return false;
+        }
+        memcpy(dst, packed.data() + offset, size);
+        offset += size;
         return true;
-    }
+    };
+    auto read_string = [&](std::string & value) {
+        uint32_t size = 0;
+        if (!read(&size, sizeof(size)) || size > packed.size() - offset) {
+            return false;
+        }
+        value.assign(packed.data() + offset, size);
+        offset += size;
+        return true;
+    };
 
-    if ((size_t) 3 + n_ids > n_words) {
+    uint32_t n_tokens = 0;
+    if (!read(&n_tokens, sizeof(n_tokens)) || n_tokens > (packed.size() - offset) / sizeof(llama_token)) {
+        return false;
+    }
+    ids.resize(n_tokens);
+    if (n_tokens > 0 && !read(ids.data(), (size_t) n_tokens * sizeof(llama_token))) {
         return false;
     }
 
-    ids.resize(n_ids);
-    if (n_ids > 0) {
-        memcpy(ids.data(), packed.data() + 3*sizeof(llama_token), (size_t) n_ids*sizeof(llama_token));
+    uint32_t n_media = 0;
+    if (!read(&n_media, sizeof(n_media)) || n_media > (packed.size() - offset) / sizeof(uint32_t)) {
+        return false;
     }
-
-    return true;
+    media_indices.resize(n_media);
+    media_token_counts.resize(n_media);
+    media_ids.resize(n_media);
+    size_t previous_end = 0;
+    for (uint32_t i = 0; i < n_media; ++i) {
+        if (!read(&media_indices[i], sizeof(uint32_t)) || !read(&media_token_counts[i], sizeof(uint32_t)) ||
+                !read_string(media_ids[i])) {
+            return false;
+        }
+        if (media_indices[i] < previous_end || media_indices[i] >= ids.size() || media_token_counts[i] == 0 ||
+                media_token_counts[i] > ids.size() - media_indices[i] || media_ids[i].empty()) {
+            return false;
+        }
+        previous_end = (size_t) media_indices[i] + media_token_counts[i];
+        for (size_t j = media_indices[i]; j < previous_end; ++j) {
+            if (ids[j] != LLAMA_TOKEN_NULL) {
+                return false;
+            }
+        }
+    }
+    return offset == packed.size();
 }
 
-bool disk_cache_pack(const server_tokens & tokens, std::vector<char> & packed, llama_tokens & ids) {
+bool disk_cache_pack(const server_tokens & tokens, std::vector<char> & packed, llama_tokens & ids,
+        std::vector<uint32_t> & media_indices, std::vector<uint32_t> & media_token_counts,
+        std::vector<std::string> & media_ids) {
+    if (tokens.size() > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+
+    ids.resize(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        ids[i] = tokens[i];
+    }
+
     try {
-        packed = tokens.serialize();
+        media_indices = tokens.media_chunk_indices();
+        media_token_counts = tokens.media_chunk_token_counts();
+        media_ids.clear();
+        media_ids.reserve(media_indices.size());
+        for (uint32_t index : media_indices) {
+            const std::string id = tokens.media_chunk_id(index);
+            if (id.empty()) {
+                return false;
+            }
+            media_ids.push_back(id);
+        }
     } catch (const std::exception &) {
         return false;
     }
 
-    const size_t n_words = packed.size() / sizeof(llama_token);
-    if (n_words < 3) {
+    packed.clear();
+    auto append = [&](const void * data, size_t size) {
+        const auto * first = reinterpret_cast<const char *>(data);
+        packed.insert(packed.end(), first, first + size);
+    };
+    if (media_indices.size() != media_token_counts.size() || media_indices.size() != media_ids.size() ||
+            media_indices.size() > std::numeric_limits<uint32_t>::max()) {
         return false;
     }
 
-    // layout: [marker][version][count][tokens...][media keys...][media chunks...]
-    llama_token marker = 0;
-    uint32_t n_ids = 0;
-    memcpy(&marker, packed.data(), sizeof(llama_token));
-    memcpy(&n_ids,  packed.data() + 2*sizeof(llama_token), sizeof(uint32_t));
+    auto append_string = [&](const std::string & value) {
+        if (value.size() > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        const uint32_t size = (uint32_t) value.size();
+        append(&size, sizeof(size));
+        if (size > 0) {
+            append(value.data(), size);
+        }
+        return true;
+    };
 
-    if (marker == LLAMA_TOKEN_NULL && (size_t) 3 + n_ids < n_words) {
-        uint32_t n_media = 0;
-        memcpy(&n_media, packed.data() + (3 + (size_t) n_ids)*sizeof(llama_token), sizeof(uint32_t));
-        if (n_media != 0) {
-            // the prompt carries images/audio that are not part of the entry
+    const uint32_t n_tokens = (uint32_t) ids.size();
+    append(&n_tokens, sizeof(n_tokens));
+    if (!ids.empty()) {
+        append(ids.data(), ids.size() * sizeof(llama_token));
+    }
+    const uint32_t n_media = (uint32_t) media_indices.size();
+    append(&n_media, sizeof(n_media));
+    for (size_t i = 0; i < media_indices.size(); ++i) {
+        append(&media_indices[i], sizeof(media_indices[i]));
+        append(&media_token_counts[i], sizeof(media_token_counts[i]));
+        if (!append_string(media_ids[i])) {
             return false;
         }
     }
-
-    return disk_cache_unpack_ids(packed, ids);
+    return true;
 }
 
 template <typename T>
@@ -1897,8 +1991,13 @@ server_disk_cache::server_disk_cache(const std::string & dir, const std::string 
     scan();
 
     {
-        // trim an existing cache that no longer fits the current limit (e.g. after lowering --cache-disk-max)
         std::lock_guard<std::mutex> lock(mtx);
+
+        // entries stored before prefix dedup was added may still hold a chain
+        // of prefix prompts - drop the redundant ones
+        dedup_prefixes();
+
+        // trim an existing cache that no longer fits the current limit (e.g. after lowering --cache-disk-max)
         enforce_limit();
     }
 
@@ -1987,20 +2086,20 @@ void server_disk_cache::scan() {
             continue;
         }
 
-        uint32_t n_packed = 0;
-        if (!disk_cache_read(f, n_packed) || n_packed > (1u << 26)) {
-            drop("bad token count");
+        uint32_t packed_size = 0;
+        if (!disk_cache_read(f, packed_size) || packed_size > (1u << 28)) {
+            drop("bad prompt metadata size");
             continue;
         }
 
-        std::vector<char> packed((size_t) n_packed * sizeof(llama_token));
-        if (n_packed > 0) {
+        std::vector<char> packed(packed_size);
+        if (packed_size > 0) {
             f.read(packed.data(), (std::streamsize) packed.size());
         }
 
         server_disk_cache_entry e;
         e.path = de.path().string();
-        if (!f || !disk_cache_unpack_ids(packed, e.tokens)) {
+        if (!f || !disk_cache_unpack_ids(packed, e.tokens, e.media_indices, e.media_token_counts, e.media_ids)) {
             drop("truncated tokens");
             continue;
         }
@@ -2009,16 +2108,18 @@ void server_disk_cache::scan() {
         uint64_t size_drft = 0;
         uint32_t n_ckpt    = 0;
         uint64_t created   = 0;
+        uint64_t last_used = 0;
         if (!disk_cache_read(f, size_main) || !disk_cache_read(f, size_drft) ||
-                !disk_cache_read(f, n_ckpt) || !disk_cache_read(f, created)) {
+                !disk_cache_read(f, n_ckpt) || !disk_cache_read(f, created) ||
+                !disk_cache_read(f, last_used)) {
             drop("truncated header");
             continue;
         }
 
-        e.hash      = disk_cache_hash(e.tokens);
+        e.hash      = disk_cache_hash(e.tokens, e.media_indices, e.media_token_counts, e.media_ids);
         e.size_main = (size_t) size_main;
         e.size_drft = (size_t) size_drft;
-        e.last_used = (int64_t) created;
+        e.last_used = (int64_t) (last_used > 0 ? last_used : created);
 
         std::error_code ec_size;
         e.size_file = (size_t) fs::file_size(de.path(), ec_size);
@@ -2035,7 +2136,7 @@ void server_disk_cache::scan() {
 bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out) {
     namespace fs = std::filesystem;
 
-    const uint64_t hash = disk_cache_hash(pending.ids);
+    const uint64_t hash = disk_cache_hash(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
 
     const std::string name = string_format("pc-%016" PRIx64 ".bin", hash);
     const std::string path = dir + "/" + name;
@@ -2052,7 +2153,7 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         disk_cache_write(f, (uint32_t) DISK_CACHE_VERSION);
         disk_cache_write(f, (uint32_t) sig.size());
         f.write(sig.data(), (std::streamsize) sig.size());
-        disk_cache_write(f, (uint32_t) (pending.packed.size() / sizeof(llama_token)));
+        disk_cache_write(f, (uint32_t) pending.packed.size());
         if (!pending.packed.empty()) {
             f.write(pending.packed.data(), (std::streamsize) pending.packed.size());
         }
@@ -2062,6 +2163,7 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         disk_cache_write(f, (uint64_t) pending.drft.size());
         disk_cache_write(f, (uint32_t) ckpts.size());
         disk_cache_write(f, (uint64_t) disk_cache_now());
+        disk_cache_write(f, (uint64_t) disk_cache_now()); // last_used
 
         for (const auto & c : ckpts) {
             disk_cache_write(f, (int64_t)  c->n_tokens);
@@ -2141,12 +2243,12 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
         return false;
     }
 
-    uint32_t n_packed = 0;
-    if (!disk_cache_read(f, n_packed) || n_packed < 3 || n_packed > (1u << 26)) {
+    uint32_t packed_size = 0;
+    if (!disk_cache_read(f, packed_size) || packed_size > (1u << 28)) {
         return false;
     }
 
-    packed.resize((size_t) n_packed * sizeof(llama_token));
+    packed.resize(packed_size);
     f.read(packed.data(), (std::streamsize) packed.size());
     if (!f) {
         return false;
@@ -2156,8 +2258,10 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
     uint64_t size_drft = 0;
     uint32_t n_ckpt    = 0;
     uint64_t created   = 0;
+    uint64_t last_used = 0;
     if (!disk_cache_read(f, size_main) || !disk_cache_read(f, size_drft) ||
-            !disk_cache_read(f, n_ckpt) || !disk_cache_read(f, created)) {
+            !disk_cache_read(f, n_ckpt) || !disk_cache_read(f, created) ||
+            !disk_cache_read(f, last_used)) {
         return false;
     }
 
@@ -2259,17 +2363,162 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
     return true;
 }
 
+bool server_disk_cache::touch_entry(const server_disk_cache_entry & e) {
+    // rewrite only the 8-byte last_used field in place: a full copy of a
+    // multi-gigabyte entry on every hit would be far too expensive
+    std::fstream f(e.path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!f) {
+        return false;
+    }
+
+    uint8_t fixed[20]; // magic(8), version(4), sig_len(4), packed_size(4)
+    f.seekg(0, std::ios::beg);
+    f.read(reinterpret_cast<char *>(fixed), sizeof(fixed));
+    if (!f) {
+        return false;
+    }
+
+    const uint32_t sig_len     = *reinterpret_cast<const uint32_t *>(fixed + 12);
+    const uint32_t packed_size = *reinterpret_cast<const uint32_t *>(fixed + 16);
+
+    // last_used is the 8 bytes right after size_main/size_drft/n_ckpt/created,
+    // which follow the variable-length signature and packed metadata
+    const std::streamoff off_last_used = (std::streamoff) (DISK_CACHE_HEADER_FIXED - 8 + sig_len + packed_size);
+
+    const uint64_t now = (uint64_t) disk_cache_now();
+    f.seekp(off_last_used, std::ios::beg);
+    f.write(reinterpret_cast<const char *>(&now), sizeof(now));
+    f.flush();
+
+    return (bool) f;
+}
+
+void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
+        const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids) {
+    namespace fs = std::filesystem;
+
+    // mtx must be held
+    for (auto it = entries.begin(); it != entries.end(); ) {
+        const llama_tokens & old_ids = it->tokens;
+        if (old_ids.size() < ids.size() && disk_cache_lcp(old_ids, ids) == old_ids.size()) {
+            // the token sequence is a strict prefix, but the media placeholders
+            // could differ: every media chunk of the shorter entry must also be
+            // present in the longer one at the same position with the same id
+            bool media_ok = true;
+            for (size_t i = 0; i < it->media_indices.size() && media_ok; ++i) {
+                const uint32_t idx = it->media_indices[i];
+                const auto m = std::lower_bound(media_indices.begin(), media_indices.end(), idx);
+                if (m == media_indices.end() || *m != idx) {
+                    media_ok = false;
+                    break;
+                }
+                const size_t j = (size_t) (m - media_indices.begin());
+                if (it->media_token_counts[i] != media_token_counts[j] || it->media_ids[i] != media_ids[j]) {
+                    media_ok = false;
+                }
+            }
+
+            if (media_ok) {
+                const size_t size_file = std::min(total_size, it->size_file);
+                std::error_code ec;
+                fs::remove(it->path, ec);
+                SRV_INF("disk cache: dropping '%s': prefix of a stored prompt, %zu tokens, %.2f MiB\n",
+                        it->path.c_str(), old_ids.size(), size_file/(1024.0*1024.0));
+                total_size -= size_file;
+                it = entries.erase(it);
+            } else {
+                ++it;
+            }
+        } else {
+            ++it;
+        }
+    }
+}
+
+void server_disk_cache::dedup_prefixes() {
+    // mtx must be held
+    namespace fs = std::filesystem;
+
+    // mark every entry that is a redundant prefix of a longer stored entry,
+    // then erase the marked ones (erasing while comparing would invalidate
+    // the comparison loop)
+    std::vector<bool> drop(entries.size(), false);
+
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (drop[i]) {
+            continue;
+        }
+        const auto & a = entries[i];
+
+        for (size_t j = i + 1; j < entries.size(); ++j) {
+            if (drop[j]) {
+                continue;
+            }
+            const auto & b = entries[j];
+
+            // a is a strict prefix of b (and b is not a prefix of a)
+            const bool a_in_b = a.tokens.size() < b.tokens.size() && disk_cache_lcp(a.tokens, b.tokens) == a.tokens.size();
+            const bool b_in_a = b.tokens.size() < a.tokens.size() && disk_cache_lcp(b.tokens, a.tokens) == b.tokens.size();
+            if (!a_in_b && !b_in_a) {
+                continue;
+            }
+
+            // the shorter one is the redundant prefix; it must also have the
+            // media chunks of the longer one as a subset to be safely droppable
+            const auto & shorter = a_in_b ? a : b;
+            const auto & longer  = a_in_b ? b : a;
+
+            bool media_ok = true;
+            for (size_t k = 0; k < shorter.media_indices.size() && media_ok; ++k) {
+                const uint32_t idx = shorter.media_indices[k];
+                const auto m = std::lower_bound(longer.media_indices.begin(), longer.media_indices.end(), idx);
+                if (m == longer.media_indices.end() || *m != idx) {
+                    media_ok = false;
+                    break;
+                }
+                const size_t p = (size_t) (m - longer.media_indices.begin());
+                if (shorter.media_token_counts[k] != longer.media_token_counts[p] || shorter.media_ids[k] != longer.media_ids[p]) {
+                    media_ok = false;
+                }
+            }
+            if (!media_ok) {
+                continue;
+            }
+
+            const size_t shorter_idx = a_in_b ? i : j;
+            if (!drop[shorter_idx]) {
+                std::error_code ec;
+                fs::remove(entries[shorter_idx].path, ec);
+                SRV_INF("disk cache: dropping '%s': prefix of a stored prompt, %zu tokens, %.2f MiB\n",
+                        entries[shorter_idx].path.c_str(), entries[shorter_idx].tokens.size(),
+                        entries[shorter_idx].size_file/(1024.0*1024.0));
+                total_size -= std::min(total_size, entries[shorter_idx].size_file);
+                drop[shorter_idx] = true;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < entries.size(); ) {
+        if (drop[i]) {
+            entries.erase(entries.begin() + (long) i);
+        } else {
+            ++i;
+        }
+    }
+}
+
 bool server_disk_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     if (!active) {
         return true;
     }
 
-    // pack the incoming prompt: gives both the ids for prefix matching and the
-    // buffer that will be restored; fails for prompts carrying media chunks
-    std::vector<char>  packed_new;
-    llama_tokens       tokens;
-    if (!disk_cache_pack(tokens_new, packed_new, tokens)) {
-        SRV_TRC("%s", "disk cache: request prompt cannot be packed (media chunks), skipping\n");
+    std::vector<char> packed_new;
+    llama_tokens tokens;
+    std::vector<uint32_t> media_indices;
+    std::vector<uint32_t> media_token_counts;
+    std::vector<std::string> media_ids;
+    if (!disk_cache_pack(tokens_new, packed_new, tokens, media_indices, media_token_counts, media_ids)) {
+        SRV_TRC("%s", "disk cache: request prompt metadata could not be packed, skipping\n");
         return true;
     }
 
@@ -2278,42 +2527,83 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
 
     size_t best_lcp = 0;
 
-    float f_keep_best = -1.0f;
-    float f_sim_best  = -1.0f;
-
     {
         std::lock_guard<std::mutex> lock(mtx);
 
         SRV_TRC("disk cache: lookup for %zu tokens, %zu entries, min %zu tokens\n", tokens.size(), entries.size(), min_tokens);
 
         for (const auto & e : entries) {
-            if (e.tokens.empty()) {
+            const size_t e_size = e.tokens.size();
+
+            // an entry shorter than the minimum can never yield a restorable lcp
+            if (e_size < DISK_CACHE_MIN_LOOKUP_TOKENS || e_size < min_tokens) {
                 continue;
             }
 
-            const size_t lcp = disk_cache_lcp(e.tokens, tokens);
+            // the lcp cannot exceed either length; if that is below the minimum,
+            // skip the whole-token comparison
+            if (std::min(e_size, tokens.size()) < min_tokens) {
+                continue;
+            }
+
+            size_t lcp = disk_cache_lcp(e.tokens, tokens);
+            if (e.media_indices.size() != e.media_token_counts.size() || e.media_indices.size() != e.media_ids.size()) {
+                continue;
+            }
+            for (size_t i = 0; i < e.media_indices.size(); ++i) {
+                const uint32_t idx = e.media_indices[i];
+                if ((size_t) idx >= lcp) {
+                    continue;
+                }
+                const auto it = std::lower_bound(media_indices.begin(), media_indices.end(), idx);
+                if (it == media_indices.end() || *it != idx) {
+                    lcp = std::min(lcp, (size_t) idx);
+                    break;
+                }
+                const size_t j = (size_t) (it - media_indices.begin());
+                if (e.media_token_counts[i] != media_token_counts[j] || e.media_ids[i] != media_ids[j]) {
+                    lcp = std::min(lcp, (size_t) idx);
+                    break;
+                }
+            }
+            for (size_t i = 0; i < media_indices.size(); ++i) {
+                const uint32_t idx = media_indices[i];
+                const auto it = std::lower_bound(e.media_indices.begin(), e.media_indices.end(), idx);
+                if (it == e.media_indices.end() || *it != idx) {
+                    lcp = std::min(lcp, (size_t) idx);
+                    break;
+                }
+                const size_t j = (size_t) (it - e.media_indices.begin());
+                if (media_token_counts[i] != e.media_token_counts[j] || media_ids[i] != e.media_ids[j]) {
+                    lcp = std::min(lcp, (size_t) idx);
+                    break;
+                }
+            }
+            for (size_t i = 0; i < e.media_indices.size(); ++i) {
+                const size_t start = e.media_indices[i];
+                const size_t end = start + e.media_token_counts[i];
+                if (lcp > start && lcp < end) {
+                    lcp = start;
+                    break;
+                }
+            }
 
             SRV_TRC("disk cache:   - entry with length %7zu, lcp = %7zu, f_keep = %.3f\n",
-                    e.tokens.size(), lcp, float(lcp) / e.tokens.size());
+                    e_size, lcp, float(lcp) / e_size);
 
+            // unlike the RAM cache there is no eviction cost here: a restore
+            // reads the file and keeps every entry, so the f_keep floor does
+            // not apply. min_tokens is the only guard - it keeps the file read
+            // cheaper than the prefill it replaces.
             if (lcp < min_tokens) {
                 continue;
             }
 
-            const float f_keep = float(lcp) / e.tokens.size();
-            const float f_sim  = float(lcp) / std::max<size_t>(1, tokens.size());
-
-            // same heuristics as the RAM cache: do not trash large prompts
-            if (f_keep < 0.25f) {
-                continue;
-            }
-
-            if (f_keep > f_keep_best && f_sim > f_sim_best) {
-                f_keep_best = f_keep;
-                f_sim_best  = f_sim;
-
-                best     = e;
+            // the longest shared prefix wins; on a tie the most recently used
+            // entry is fresher and the more similar one keeps more of the cache
+            if (lcp > best_lcp) {
                 best_lcp = lcp;
+                best     = e;
                 found    = true;
             }
         }
@@ -2323,8 +2613,11 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
         return true;
     }
 
+    const float f_keep = float(best_lcp) / best.tokens.size();
+    const float f_sim  = float(best_lcp) / std::max<size_t>(1, tokens.size());
+
     SRV_TRC("disk cache: candidate '%s' with %zu tokens, f_keep = %.3f, f_sim = %.3f\n",
-            best.path.c_str(), best.tokens.size(), f_keep_best, f_sim_best);
+            best.path.c_str(), best.tokens.size(), f_keep, f_sim);
 
     const int64_t t_start = ggml_time_us();
 
@@ -2363,30 +2656,59 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
         }
     }
 
-    llama_tokens packed_tokens(packed.size() / sizeof(llama_token));
-    if (!packed_tokens.empty()) {
-        memcpy(packed_tokens.data(), packed.data(), packed.size());
+    llama_tokens restored_tokens;
+    std::vector<uint32_t> restored_media_indices;
+    std::vector<uint32_t> restored_media_token_counts;
+    std::vector<std::string> restored_media_ids;
+    if (!disk_cache_unpack_ids(packed, restored_tokens, restored_media_indices, restored_media_token_counts, restored_media_ids)) {
+        SRV_WRN("disk cache: failed to decode prompt metadata of '%s'\n", best.path.c_str());
+        return true;
     }
 
     try {
-        // media are not part of the entry: the restored prompt keeps the placeholders only
-        prompt.tokens = server_tokens::deserialize(packed_tokens, false);
+        for (size_t i = 0; i < restored_media_indices.size(); ++i) {
+            const uint32_t idx = restored_media_indices[i];
+            if (idx >= best_lcp || idx >= tokens_new.size() ||
+                    tokens_new.media_chunk_token_count(idx) != restored_media_token_counts[i] ||
+                    tokens_new.media_chunk_id(idx) != restored_media_ids[i]) {
+                throw std::runtime_error("cached media metadata differs from the current prompt");
+            }
+        }
+
+        // only the shared prefix (best_lcp tokens) was restored from disk: the
+        // remainder of the cached prompt diverges from the current one and must
+        // not be kept, otherwise the media-placeholder fill would compare tokens
+        // past the prefix and reject the restore
+        if (best_lcp < restored_tokens.size()) {
+            restored_tokens.resize(best_lcp);
+        }
+
+        prompt.tokens = server_tokens(restored_tokens, tokens_new.has_mtmd);
+        prompt.tokens.append_media_placeholders_from(tokens_new);
     } catch (const std::exception & err) {
-        SRV_WRN("disk cache: failed to deserialize the prompt of '%s': %s\n", best.path.c_str(), err.what());
+        SRV_WRN("disk cache: failed to restore prompt metadata of '%s': %s\n", best.path.c_str(), err.what());
         return true;
     }
 
     prompt.checkpoints = std::move(checkpoints);
 
+    const int64_t now = disk_cache_now();
+
     {
         std::lock_guard<std::mutex> lock(mtx);
-        const int64_t now = disk_cache_now();
         for (auto & e : entries) {
             if (e.path == best.path) {
                 e.last_used = now;
                 break;
             }
         }
+    }
+
+    // persist the timestamp so the LRU order survives a restart; the rewrite is
+    // a single 8-byte in-place write and a failure only degrades back to
+    // creation-time ordering
+    if (!touch_entry(best)) {
+        SRV_TRC("disk cache: could not persist last_used for '%s'\n", best.path.c_str());
     }
 
     SRV_DBG("disk cache: restored %zu tokens (%zu + %zu bytes) in %.2f ms\n",
@@ -2406,8 +2728,9 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
 
     server_disk_cache_pending pending;
 
-    if (!disk_cache_pack(state.prompt.tokens, pending.packed, pending.ids)) {
-        SRV_TRC("%s", "disk cache: prompt cannot be packed (media chunks), skipping\n");
+    if (!disk_cache_pack(state.prompt.tokens, pending.packed, pending.ids,
+                pending.media_indices, pending.media_token_counts, pending.media_ids)) {
+        SRV_TRC("%s", "disk cache: prompt metadata cannot be packed, skipping\n");
         return;
     }
 
@@ -2424,7 +2747,7 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
         return;
     }
 
-    const uint64_t hash = disk_cache_hash(pending.ids);
+    const uint64_t hash = disk_cache_hash(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
 
     {
         std::lock_guard<std::mutex> lock(mtx);
@@ -2434,6 +2757,11 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
                 SRV_TRC("disk cache: %016" PRIx64 " is already stored, skipping\n", hash);
                 return;
             }
+        }
+
+        if (inflight.count(hash)) {
+            SRV_TRC("disk cache: %016" PRIx64 " is already queued, skipping\n", hash);
+            return;
         }
 
         if (queue_bytes + pending.bytes > DISK_CACHE_QUEUE_BYTES) {
@@ -2446,7 +2774,9 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
         pending.drft        = std::move(state.data.drft);
         pending.checkpoints = state.prompt.checkpoints;
 
-        queue_bytes += pending.bytes;
+        pending.hash    = hash;
+        queue_bytes    += pending.bytes;
+        inflight.insert(hash);
         queue.push_back(std::move(pending));
     }
 
@@ -2474,7 +2804,8 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
 
     server_disk_cache_pending pending;
 
-    if (!disk_cache_pack(state.prompt.tokens, pending.packed, pending.ids)) {
+    if (!disk_cache_pack(state.prompt.tokens, pending.packed, pending.ids,
+                pending.media_indices, pending.media_token_counts, pending.media_ids)) {
         return false;
     }
 
@@ -2484,7 +2815,7 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
 
     pending.bytes = bytes;
 
-    const uint64_t hash = disk_cache_hash(pending.ids);
+    const uint64_t hash = disk_cache_hash(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
 
     {
         std::lock_guard<std::mutex> lock(mtx);
@@ -2495,10 +2826,8 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
                 return false;
             }
         }
-        for (const auto & q : queue) {
-            if (q.ids.size() == pending.ids.size() && disk_cache_hash(q.ids) == hash) {
-                return false;
-            }
+        if (inflight.count(hash)) {
+            return false;
         }
 
         if (queue_bytes + pending.bytes > DISK_CACHE_QUEUE_BYTES) {
@@ -2510,7 +2839,9 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
         pending.drft        = state.data.drft;
         pending.checkpoints = state.prompt.checkpoints;
 
-        queue_bytes += pending.bytes;
+        pending.hash    = hash;
+        queue_bytes    += pending.bytes;
+        inflight.insert(hash);
         queue.push_back(std::move(pending));
     }
 
@@ -2560,12 +2891,35 @@ void server_disk_cache::worker() {
 
         const size_t n_tokens = pending.ids.size();
         const size_t bytes    = pending.bytes;
-        const uint64_t hash   = disk_cache_hash(pending.ids);
+        const uint64_t hash   = pending.hash;
 
         const int64_t t_start = ggml_time_us();
 
         std::string path;
         size_t size_file = 0;
+
+        // skip the write when a longer stored entry already has this prompt as
+        // a strict prefix: the longer one serves every lookup this one would,
+        // so writing it would only waste disk
+        bool redundant = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            for (const auto & e : entries) {
+                if (pending.ids.size() < e.tokens.size() &&
+                        disk_cache_lcp(pending.ids, e.tokens) == pending.ids.size()) {
+                    redundant = true;
+                    break;
+                }
+            }
+        }
+
+        if (redundant) {
+            std::lock_guard<std::mutex> lock(mtx);
+            queue_bytes -= std::min(queue_bytes, bytes);
+            inflight.erase(hash);
+            SRV_TRC("disk cache: skipping %zu tokens, already covered by a stored prompt\n", n_tokens);
+            continue;
+        }
 
         const bool ok = write_entry(pending, path, size_file);
 
@@ -2573,12 +2927,16 @@ void server_disk_cache::worker() {
             std::lock_guard<std::mutex> lock(mtx);
 
             queue_bytes -= std::min(queue_bytes, bytes);
+            inflight.erase(hash);
 
             if (ok) {
                 server_disk_cache_entry e;
                 e.path      = path;
                 e.hash      = hash;
                 e.tokens    = pending.ids;
+                e.media_indices = pending.media_indices;
+                e.media_token_counts = pending.media_token_counts;
+                e.media_ids = pending.media_ids;
                 e.size_main = pending.main.size();
                 e.size_drft = pending.drft.size();
                 e.size_file = size_file;
@@ -2586,6 +2944,10 @@ void server_disk_cache::worker() {
 
                 total_size += size_file;
                 entries.push_back(std::move(e));
+
+                // this prompt subsumes any shorter stored prompt that is its
+                // prefix, so those files are dead weight - drop them
+                drop_prefixes(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
 
                 enforce_limit();
             }
