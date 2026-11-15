@@ -284,6 +284,15 @@ bool lora_all_alora(const std::vector<common_adapter_lora_info> & loras) {
     return found_alora;
 }
 
+bool lora_blocks_cache(const std::vector<common_adapter_lora_info> & loras) {
+    for (const auto & lora : loras) {
+        if (lora.scale != 0 && llama_adapter_get_alora_n_invocation_tokens(lora.ptr) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool lora_should_clear_cache(
         const std::vector<common_adapter_lora_info> & current,
         const std::vector<common_adapter_lora_info> & next) {

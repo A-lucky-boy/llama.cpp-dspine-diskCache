@@ -713,11 +713,14 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    common_state_data main;
-    common_state_data drft;
+    // shared so the disk tier can mirror an entry without copying gigabytes of
+    // KV state: the RAM cache and the pending write hold references to the
+    // same buffers, and the memory is freed when both are gone
+    std::shared_ptr<common_state_data> main;
+    std::shared_ptr<common_state_data> drft;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return (main ? main->size() : 0) + (drft ? drft->size() : 0);
     }
 };
 
@@ -747,6 +750,7 @@ struct server_disk_cache_entry {
     size_t       size_drft = 0;
     size_t       size_file = 0; // whole file, including the header
     int64_t      last_used = 0; // unix seconds
+    bool         last_used_dirty = false; // in-memory last_used differs from the on-disk header
 };
 
 // an entry queued for the background writer
@@ -757,17 +761,27 @@ struct server_disk_cache_pending {
     std::vector<uint32_t> media_indices;
     std::vector<uint32_t> media_token_counts;
     std::vector<std::string> media_ids;
-    common_state_data  main;
-    common_state_data  drft;
+    std::shared_ptr<const common_state_data> main;
+    std::shared_ptr<const common_state_data> drft;
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
     size_t             bytes = 0;
+};
+
+// one record of the on-disk index file (see load_manifest/save_manifest)
+struct disk_cache_manifest_meta {
+    uint64_t            hash      = 0;
+    uint64_t            size_file = 0;
+    uint64_t            size_main = 0; // KV state payload sizes, cross-checked by read_entry
+    uint64_t            size_drft = 0;
+    int64_t             last_used = 0;
+    std::vector<char>   packed;   // prompt metadata, same encoding as in the entry header
 };
 
 // second-level (on-disk) tier of the prompt cache: entries evicted from the RAM
 // cache are written in the background and restored when a new prompt shares a
 // long enough prefix with them. Survives restarts.
 struct server_disk_cache {
-    server_disk_cache(const std::string & dir, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens);
+    server_disk_cache(const std::string & dir, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib);
     ~server_disk_cache();
 
     // restore the best matching entry (if any) into the contexts
@@ -793,6 +807,14 @@ struct server_disk_cache {
     size_t limit_size = 0;
     size_t min_tokens = 0;
 
+    // entries idle for longer than this are dropped, 0 = never expire
+    int64_t ttl_seconds = 0;
+
+    // pending-write byte budget; the queued entries share the RAM cache buffers
+    // (shared_ptr, no extra memory), but a slow disk must not let the queue
+    // grow without bound and pin those buffers forever. 0 = no limit
+    size_t queue_bytes_max = 0;
+
     std::vector<server_disk_cache_entry> entries;
     size_t total_size = 0;
 
@@ -808,6 +830,9 @@ struct server_disk_cache {
     std::unordered_set<uint64_t> inflight;
 
 private:
+    // delete a broken entry (file + index + manifest); must not be called with mtx held
+    void drop_entry(const std::string & path);
+
     bool write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out);
     bool read_entry(const server_disk_cache_entry & entry, size_t lcp, std::vector<char> & packed, common_state_data & main, common_state_data & drft,
             std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints);
@@ -820,9 +845,19 @@ private:
     // entry serves any lookup the shorter one would
     void drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
             const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids);
+    // true when a stored entry already shares all but a short tail of the given
+    // prompt, so rewriting the entry would cost more than the prefill the longer
+    // prefix saves; mtx must be held
+    bool covered_cheaply(const llama_tokens & ids) const;
     // remove any stored entry that is a redundant prefix of another stored
     // entry (run once at startup, after scan)
     void dedup_prefixes();
+    // drop entries whose last_used is older than the TTL (no-op when disabled)
+    void sweep_expired();
+    // startup index: avoids opening and parsing every entry file when the
+    // cache holds many entries; trusted only when the file size matches
+    bool load_manifest(std::map<std::string, disk_cache_manifest_meta> & out);
+    void save_manifest(); // mtx must be held
     void worker();
 };
 
@@ -843,7 +878,7 @@ struct server_prompt_cache {
     }
 
     // attach the second-level on-disk tier
-    void init_disk(const std::string & path, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens);
+    void init_disk(const std::string & path, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib);
 
     std::list<server_prompt_cache_state> states;
 

@@ -345,6 +345,13 @@ struct server_slot {
             return false;
         }
 
+        // KV computed under a non-zero LoRA scale is only valid with that same
+        // LoRA active: it must never be shared through the prompt cache
+        if (lora_blocks_cache(lora)) {
+            SLT_TRC(*this, "%s", "skipping prompt cache save: active LoRA changes the model weights\n");
+            return false;
+        }
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -358,8 +365,8 @@ struct server_slot {
             return false;
         }
 
-        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main->data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft->data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         if (n_tgt != cur_size_tgt || n_dft != cur_size_dft) {
             SLT_ERR(*this, "%s", "failed to save complete prompt state\n");
             prompt_cache.states.pop_back();
@@ -370,9 +377,23 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        // see prompt_save: never pull shared KV while a non-zero LoRA is active.
+        // this is a skip, not a failure: the slot KV is kept, so a deployment
+        // with a fixed global lora keeps incrementally extending its context
+        // instead of re-prefilling from scratch on every request. a lora change
+        // (switching or dropping the adapter) is detected in launch_slot_with_task,
+        // which clears the prompt when the effective lora set differs from the
+        // one the slot KV was built under - that branch is the load-bearing
+        // part, because this function is not even called when a similar slot
+        // is reused with f_keep >= 0.5
+        if (lora_blocks_cache(lora)) {
+            SLT_TRC(*this, "%s", "skipping prompt cache load: active LoRA changes the model weights\n");
+            return true;
+        }
+
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
-            SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            SLT_TRC(*this, "%s", "no reusable prompt in cache\n");
         }
 
         return res;
@@ -1621,7 +1642,12 @@ private:
                     return string_format("%" PRIu64 "@%" PRId64, (uint64_t) size, count);
                 };
 
-                const std::string sig = string_format("%s|%s|%s|%s|%d|%d|%d|%d",
+                // entries are only valid for the exact same model + context configuration.
+                // the draft KV types, unified-KV mode and the vision encoder change the
+                // format/content of the stored state, so they are part of the signature:
+                // a config change must invalidate the old entries instead of restoring
+                // incompatible KV
+                std::string sig = string_format("%s|%s|%s|%s|%d|%d|%d|%d",
                         params_base.model.path.c_str(),
                         file_sig(params_base.model.path).c_str(),
                         params_base.speculative.draft.mparams.path.c_str(),
@@ -1631,11 +1657,24 @@ private:
                         (int) n_ctx,
                         (int) params_base.n_parallel);
 
+                sig += string_format("|%d|%d|%d",
+                        (int) params_base.speculative.draft.cache_type_k,
+                        (int) params_base.speculative.draft.cache_type_v,
+                        (int) params_base.kv_unified);
+
+                if (!params_base.mmproj.path.empty()) {
+                    sig += string_format("|mmproj:%s@%s",
+                            params_base.mmproj.path.c_str(),
+                            file_sig(params_base.mmproj.path).c_str());
+                }
+
                 prompt_cache->init_disk(
                         params_base.cache_disk_path,
                         sig,
                         params_base.cache_disk_max_mib,
-                        params_base.cache_disk_min_tokens);
+                        params_base.cache_disk_min_tokens,
+                        params_base.cache_disk_ttl,
+                        params_base.cache_disk_queue_max_mib);
             }
         } else {
             if (!params_base.cache_disk_path.empty()) {
@@ -1650,6 +1689,10 @@ private:
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        if (lora_blocks_cache(params_base.lora_adapters)) {
+            SRV_INF("%s", "prompt cache effectively disabled: active LoRA adapters change the model weights, cached KV would be invalid\n");
         }
 
         if (!params_base.model_alias.empty()) {
@@ -1926,6 +1969,14 @@ private:
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
 
+            // the incoming task may carry its own LoRA config, while slot.lora
+            // is only updated later in launch_slot_with_task: if the task runs
+            // with a non-zero scale its KV is not shareable, so skip the cache
+            if (update_cache && !task.params.lora.empty()) {
+                const auto task_loras = construct_lora_list(task.params.lora);
+                update_cache = !lora_blocks_cache(task_loras);
+            }
+
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -2006,6 +2057,18 @@ private:
                 slot.lora = task_loras;
             }
         } else {
+            // the request does not carry a lora config: if the effective lora set
+            // changed (e.g. a global lora was added or removed), the KV still in
+            // the slot was computed under different weights and must not be
+            // reused - clear the prompt so the next prefill starts clean.
+            // the are_lora_equal guard is required: lora_should_clear_cache
+            // asserts that the two sets differ
+            if (!are_lora_equal(slot.lora, params_base.lora_adapters) &&
+                    lora_should_clear_cache(slot.lora, params_base.lora_adapters)) {
+                SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n",
+                        slot.lora.size(), params_base.lora_adapters.size());
+                slot.prompt.clear();
+            }
             slot.lora = params_base.lora_adapters;
         }
 

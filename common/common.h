@@ -650,6 +650,8 @@ struct common_params {
     int32_t     cache_disk_max_mib   = 65536; // -1 = no limit, 0 = disable
     int32_t     cache_disk_min_tokens = 2048; // do not store prompts shorter than this
     int32_t     cache_disk_idle_flush = 60;   // mirror the RAM cache to disk after N seconds of inactivity, 0 = disable
+    int32_t     cache_disk_ttl       = 0;     // --cache-disk-ttl: drop entries unused for N seconds, 0 = never expire
+    int32_t     cache_disk_queue_max_mib = 24576; // --cache-disk-queue-max: pending disk-cache write budget (MiB), -1 = no limit
 
     // llama-connect params
     bool        server_connect      = false;

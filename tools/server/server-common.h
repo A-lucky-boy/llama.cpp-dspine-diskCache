@@ -146,6 +146,13 @@ bool are_lora_equal(
         const std::vector<common_adapter_lora_info> & l1,
         const std::vector<common_adapter_lora_info> & l2);
 
+// true when the given lora set must not share KV through the prompt cache:
+// any non-zero scale adapter that is not an aLoRA changes the model weights,
+// so KV computed under it is only valid with that exact lora active.
+// note: checks scale != 0 on purpose - negative scales modify the model too
+// but are not returned by lora_get_enabled_ids (which only lists scale > 0)
+bool lora_blocks_cache(const std::vector<common_adapter_lora_info> & loras);
+
 // get the ids of all enabled loras
 std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_info> & loras);
 

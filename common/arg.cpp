@@ -1728,6 +1728,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_IDLE_FLUSH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-ttl"}, "N",
+        string_format("drop on-disk cache entries that have not been used for N seconds "
+                      "(default: %d, 0 - never expire)", params.cache_disk_ttl),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-ttl must be non-negative");
+            }
+            params.cache_disk_ttl = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-queue-max"}, "N",
+        string_format("do not buffer more than N MiB of pending disk cache writes "
+                      "(default: %d, -1 - no limit)", params.cache_disk_queue_max_mib),
+        [](common_params & params, int value) {
+            if (value < -1 || value == 0) {
+                throw std::invalid_argument("cache-disk-queue-max must be -1 or positive");
+            }
+            params.cache_disk_queue_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_QUEUE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
