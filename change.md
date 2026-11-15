@@ -1312,3 +1312,136 @@ GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `
   - **跨进程 hash 文件名冲突的端到端构造**：无法在合理时间内找到 64 位 hash 碰撞，`claim_path_locked` 的 `conflict` 分支只有单元测试（`classify_duplicate` 的不同长度/不同媒体分支）与静态核对
   - **真实媒体 prompt**：测试机为纯文本，媒体相关分支全部由单元测试覆盖
   - 多 slot、Linux、中断路径：本轮范围外
+
+# 2026-11-15 22-30 - Change Record（test1_2 修复轮：配额准入先于替代）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-15 21-55 - test1_2` 修复轮要求，修正 `worker()` 中"先删替代对象、后淘汰新条目"的不可逆顺序缺陷。基线 HEAD `a37ac4e`，上一轮修复提交 `5627aed`。
+
+缺陷：`worker()` 在 `write_entry()` 成功、新条目入 `entries` 之后，先调 `drop_prefixes(..., size_file)` 删除被替代的短快照，再调 `enforce_limit()`。但"文件已写入 + 已进 `entries`"并不能证明配额淘汰不会立刻删掉它。示意：
+
+```text
+Q：已隔离/不可删除，占 600 MiB
+S：可恢复短前缀，200 MiB
+L：新长快照，300 MiB，静态上可替代 S
+limit = 800 MiB
+
+旧顺序：Q+S 在限内 → 写入 L → drop_prefixes 删 S（Q+L=900 仍超额）
+        → enforce_limit 跳过 Q，淘汰 L → 最终 Q 独存，S 与 L 都没了
+```
+
+本轮只做准入顺序、容量淘汰保护集合与替代确认；不改变 v8/v3、CRC、`768 KiB/token`、4096-token lag、`load()` 校验顺序、采样与 `n_past`，不新增通知通道。
+
+## 修改文件
+
+### tools/server/server-disk-cache-quota.h / .cpp
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/server-disk-cache-quota.h、tools/server/server-disk-cache-quota.cpp
+- 修改位置：新模块全文
+- 具体变更：
+  - `disk_cache_quota_item`：`path / size_file / last_used / quarantined / protected_`，只描述状态，不持有 KV 指针
+  - `disk_cache_plan_quota(items, limit)`：只读规划。隔离条目与受保护条目一律不进候选；其余按 LRU 顺序回收直到总量落回上限。返回 `fits`（回滚与否的唯一依据）、`protected_bytes`、`overshoot`、`evict_order`
+  - `limit == 0` 明确表示不限量（服务端把 `--cache-disk-max -1` 映射为 0），此时不回收任何条目
+  - `disk_cache_replacement_dep` / `disk_cache_replacements_safe()`：判断某条"短快照被长快照替代"的依赖是否安全（长条目必须受保护且未被隔离）
+- 修改原因：规划 §四.1 要求"只读容量规划"与"计划—物理动作—确认"分离；该模块不取锁、不碰文件，可独立单测
+
+### tools/server/CMakeLists.txt
+
+- 修改类型：修改
+- 修改前路径：tools/server/CMakeLists.txt
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/CMakeLists.txt（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`server-context` 源列表
+- 具体变更：加入 `server-disk-cache-quota.cpp/.h`
+- 修改原因：注册新模块
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：包含、`disk_cache_counters`、`drop_prefixes()` 形参、`enforce_limit()` 重载、新增 `quota_items_locked()`
+- 具体变更：引入配额模块；计数器新增 `n_write_rejected`；`drop_prefixes()` 增加 `replacement_is_admitted`；`enforce_limit()` 新增接受"本次事务不可失去的条目"集合的重载；新增 `quota_items_locked()`（在锁内构造规划输入，路径存于调用方提供的 `path_storage` 以保证指针稳定）
+- 修改原因：规划 §三
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`worker()`、`enforce_limit()`、`quota_items_locked()`（新增）、`drop_prefixes()`、`to_metrics()`
+- 具体变更：
+  - **先准入**：`worker()` 在 `write_entry()` 成功后先构造含新条目的规划输入（新条目 `protected_ = true`），调用 `disk_cache_plan_quota()`。不通过则 `remove_file(path)` 回滚新文件、计 `n_write_rejected`、不改动任何既有条目，并打印 `does not fit ... dropping it`
+  - **再回收**：通过后才 `total_size += size_file`、入 `entries`，并把该条目加入保护集调用 `enforce_limit(keep)`。配额淘汰跳过保护集（以及隔离条目）
+  - **最后替代**：只有在 `entries` 中仍能找到该路径（即确实存活过容量处理）时，才以 `replacement_is_admitted = true` 调用 `drop_prefixes()`；否则传 `false`，函数只统计、不删除
+  - **drop_prefixes 门禁**：`replacement_is_admitted == false` 时直接返回（不删任何短快照），避免"为尚未确认存活的条目删除旧数据"
+  - `enforce_limit()` 保留原无参重载（内部委托为空保护集），其余 LRU/隔离语义不变；仍然不会反复选中同一失败对象
+  - 指标新增 `cache_disk_write_rejected_total`
+- 修改原因：规划 §二、§四.1、§四.2
+
+### tools/server/tests/unit/test_disk_cache_quota.cpp
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/tests/unit/test_disk_cache_quota.cpp
+- 修改位置：新文件（12 组检查）
+- 具体变更：覆盖核心回归场景（Q 隔离 + S 短 + L 长，`fits == false`）；可回收时准入成功且 S 被回收而 L 存活；隔离字节始终计入且永不成为候选；LRU 顺序；受保护条目即使最旧也不被选；无可回收对象时 `fits == false`；边界（恰好等于上限 / 少 1 字节 / 极端小上限）；上限小于单体条目；不限量（`limit == 0`）；替代依赖安全性；以及**旧顺序与新顺序的对照模拟**——同一组模拟文件下旧顺序得到 `S=false, L=false`（两者都消失），新顺序得到 `S=true, L=false`（保留 S）
+- 修改原因：规划 §三、§五.1 明确要求"不加载模型即可覆盖容量-替代顺序"
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：指标表、行为边界；projectSummary §3.1 不变量表与 §8 边界
+- 具体变更：补 `cache_disk_write_rejected_total`；写明"先准入、后替代"与替代存活不变量
+- 修改原因：规划 §六
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real）2 次
+- 检查结果：通过，`0 FAILED`；`--version` 为 `0.9.0-dev (build 20, commit a37ac4e)`
+
+- 已执行检查：配额规划单测 `tools/server/tests/unit/test_disk_cache_quota.cpp`（cl 直接编译，不加载模型）
+- 检查结果：**先失败后通过，且首轮失败抓到一个实现 bug**。规划器最初把 `limit == 0` 当成"淘汰到 0"，导致不限量场景仍会清空缓存，并且 `fits` 的判定与迭代顺序耦合（7 项断言失败）。修正为"`limit == 0` 即不限量、直接返回 `fits = true`"，并把 `fits` 统一为"回收后是否落在上限内"。另有 5 处是我自己对用例的期望写错（例如两个未受保护条目都需回收时我写成 1 个、把 `overshoot` 的基数算错），逐项核对后修正。最终 12 组全部通过（`all disk-cache quota checks passed`）
+
+- 已执行检查：旧顺序对照（同单测的 `test_order_regression`）
+- 检查结果：通过。同一组模拟文件（Q 600 MiB 不可删 / S 200 MiB / L 300 MiB，limit 800 MiB）：旧顺序 `!old_res.s_present && !old_res.l_present`——S 与 L 都消失；新顺序 `new_res.s_present && !new_res.l_present && !new_res.over_quota`——回滚 L、保留 S
+
+- 已执行检查：端到端核心场景（`test-run/logs/fix4-a2.log`，`--cache-disk-max 1400`，句柄持有短条目使 TTL 删除失败）
+- 检查结果：通过。
+  - Q1 写入 1385-token 短快照（505.77 MiB）
+  - Python 持有该 `.bin` 句柄；Q2 触发 TTL 清扫 → `failed to remove ... being used by another process` + `quarantined ... keeping 505.77 MiB accounted for and excluding it from lookups`
+  - 随后写入 6233-token 长条目：日志 `stored 6233 tokens, 1059.80 MiB`
+  - 指标 `entries 2 / bytes 1.64161e+09（= 505.77 + 1059.80 MiB）/ quarantined 1 / write_rejected 0`——隔离条目的账面字节未被抹除，长条目正常落盘，配额超额如实显示
+
+- 已执行检查：非经济替代时短快照不再被误删（同日志）
+- 检查结果：通过。1400 MiB 配额下长条目对 1385-token 前缀的读盘成本为 1059.80 MiB/1385 = 783 KiB/token，超出 768 KiB 守卫，因此 `drop_prefixes` 不再删除短快照，日志中无 `prefix of a stored prompt` 记录，两个文件并存——这正是上一轮修好的判据与本轮顺序修复叠加后的预期行为
+
+- 已执行检查：配额充足时不误伤（`test-run/logs/fix4-a3.log`，`--cache-disk-max 4096`）
+- 检查结果：通过。`entries 2 / bytes 1.64161e+09 / write_rejected 0`，短长快照并存，说明准入判定没有把正常写入误判为超限
+
+- 已执行检查：`mirror` 抑制路径仍生效（`test-run/logs/fix4-a4.log`）
+- 检查结果：通过。`1456 tokens are covered up to a 4096-token tail by a stored entry, skipping a 672.48 MiB mirror`——原有写入抑制语义未受影响
+
+- 已执行检查：标准回归（`test-run/logs/fix4-reg.log`，发现开启 + both 捕获，双卡 `-ts 38,62`，语料 `E:\小说\正文.md`）
+- 检查结果：通过。`1385/0`、`4/1381`、`215/1381` 与上一轮逐项相同；输出 sha 相同（`fd7c5bda…`、`03e0e517…`）；`write_rejected 0 / path_conflict 0 / cache_prefix_nodes 3`
+
+- 已执行检查：强杀重启（`test-run/logs/fix4-restart.log`）
+- 检查结果：通过。`1 entries (manifest 1, stale index records 0)`、`1 after dedup/trim`、`prefix discovery ... 1 snapshot(s) registered`；请求恢复 `cache_n=1381`
+
+- 已执行检查：清理
+- 检查结果：通过。4 个测试缓存目录（约 4 GiB）、临时脚本/可执行文件、构建日志、根目录 `.obj` 均已删除；`test-run/` 降至 889 KB。清理时两个测试 `.obj` 因 `cl` 产物被后台进程短暂占用而需二次删除，已确认删除
+
+- 未执行的检查及原因：
+  - **"手工构造完全对称的 Q/S/L 三态"**：本机条目体积由检查点主导（1.4K token 即 505 MiB），无法精确构造"Q+S 在限内、Q+S+L 超限且先删 S 仍超限"的真实文件组合。已用 (a) 单测的旧/新顺序对照模拟与 (b) 端到端的 Q（隔离）+ S + L 三态（账面超额如实显示、无错误替代）双向覆盖
+  - **`write_rejected` 分支的端到端触发**：需要新条目单体在配额内但回收全部可回收对象后仍放不下。本机每次写入都是 GB 级、配额以 MiB 计，构造该组合需要缩放条目体积，属于人为注入；该分支由单测 `test_nothing_reclaimable` / `test_limit_below_entry_size` 覆盖，代码路径已静态核对
+  - **真实媒体 prompt、多 slot、Linux、中断路径**：本轮范围外

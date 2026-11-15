@@ -31,6 +31,8 @@ add_library(${TARGET} STATIC
     server-prefix-index.h
     server-disk-cache-match.cpp
     server-disk-cache-match.h
+    server-disk-cache-quota.cpp
+    server-disk-cache-quota.h
 )
 
 if (BUILD_SHARED_LIBS)

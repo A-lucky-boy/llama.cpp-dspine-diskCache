@@ -18,6 +18,7 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 #include "server-disk-cache-match.h"
+#include "server-disk-cache-quota.h"
 #include "server-prefix-index.h"
 #include "mtmd-helper.h"
 
@@ -683,6 +684,7 @@ struct disk_cache_counters {
     uint64_t n_read_bytes           = 0;
     uint64_t n_restore_us           = 0;
     uint64_t n_write_bytes          = 0;
+    uint64_t n_write_rejected       = 0; // entries rolled back because they did not fit, cumulative
     uint64_t n_manifest_fallback    = 0;
     uint64_t n_reject[(size_t) cache_reject_reason::count] = {};
     uint64_t n_enqueue_queued       = 0;
@@ -1014,15 +1016,32 @@ private:
     bool touch_entry(const server_disk_cache_entry & e);
     void scan();
     void enforce_limit();
+
+    // evict unprotected entries until the accounted total fits the limit.
+    //
+    // `keep_quota_item` marks the provisional new entry (and anything else this
+    // transaction must not lose); those items are never evicted here. the plan is
+    // computed before any file is touched, so a deletion failure can be handled
+    // without having traded one snapshot for another
+    void enforce_limit(const std::vector<const server_disk_cache_entry *> & keep);
+
+    // build the planning input for the current entry set plus, optionally, a
+    // provisional entry that is not in `entries` yet; mtx must be held
+    std::vector<disk_cache_quota_item> quota_items_locked(const server_disk_cache_entry * keep_new,
+            std::vector<std::string> & path_storage) const;
     // remove entries whose prompt is a strict prefix of the given prompt
     // (and whose media chunks are a subset of the given ones): the longer
     // entry serves any lookup the shorter one would
     // `committed_file_bytes` must be the real size of a file that is already on
     // disk and admitted into `entries` - a pre-write estimate may not decide
-    // whether an existing snapshot is deleted
+    // whether an existing snapshot is deleted. `replacement_is_admitted` tells the
+    // function whether that entry has already been guaranteed to survive this
+    // capacity transaction: only then may it actually delete the shorter
+    // snapshots it supersedes. when false the superseded snapshots are kept and
+    // only reported
     void drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
             const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids,
-            size_t committed_file_bytes);
+            size_t committed_file_bytes, bool replacement_is_admitted);
     // true when a stored entry already shares all but a short tail of the given
     // prompt **and** could actually be restored for it (media-compatible over the
     // shared prefix, cost guard satisfied), so rewriting would cost more than the

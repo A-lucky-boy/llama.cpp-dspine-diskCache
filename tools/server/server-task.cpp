@@ -1734,6 +1734,10 @@ std::string server_task_result_metrics::to_metrics() {
             "Writes refused because the content-addressed path stayed occupied",
             (double) cache_disk.n_path_conflicts
         }, {
+            "cache_disk_write_rejected_total",
+            "Entries rolled back because they did not fit the quota",
+            (double) cache_disk.n_write_rejected
+        }, {
             "cache_disk_queue_entries",
             "Number of disk cache writes waiting for the writer",
             (double) cache_disk.n_queue_entries
@@ -3381,8 +3385,38 @@ bool server_disk_cache::covered_cheaply(const disk_cache_prompt_identity & wante
 
 void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
         const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids,
-        size_t committed_file_bytes) {
+        size_t committed_file_bytes, bool replacement_is_admitted) {
     // mtx must be held
+    if (!replacement_is_admitted) {
+        // the long entry exists on disk but its survival in this capacity
+        // transaction is not guaranteed. deleting the shorter snapshots now would
+        // make the cache strictly worse if the long one is evicted afterwards, so
+        // the decision is postponed instead
+        size_t follow_ups = 0;
+
+        for (const auto & e : entries) {
+            if (is_reusable_entry(e) && disk_cache_can_replace(
+                        [&]() {
+                            disk_cache_prompt_identity longer;
+                            longer.tokens             = &ids;
+                            longer.media_indices      = &media_indices;
+                            longer.media_token_counts = &media_token_counts;
+                            longer.media_ids          = &media_ids;
+                            longer.file_bytes         = committed_file_bytes;
+                            return longer;
+                        }(), identity_of(e), min_tokens)) {
+                follow_ups++;
+            }
+        }
+
+        if (follow_ups > 0) {
+            SRV_TRC("disk cache: keeping %zu superseded snapshot(s): the replacing entry is not admitted yet\n",
+                    follow_ups);
+        }
+
+        return;
+    }
+
     disk_cache_prompt_identity longer;
     longer.tokens             = &ids;
     longer.media_indices      = &media_indices;
@@ -4056,12 +4090,55 @@ void server_disk_cache::sweep_expired() {
     }
 }
 
+std::vector<disk_cache_quota_item> server_disk_cache::quota_items_locked(const server_disk_cache_entry * keep_new,
+        std::vector<std::string> & path_storage) const {
+    // mtx must be held. paths are stored in `path_storage` so the plan can hold
+    // stable pointers while the caller mutates `entries`
+    std::vector<disk_cache_quota_item> items;
+    items.reserve(entries.size() + (keep_new != nullptr ? 1 : 0));
+
+    path_storage.reserve(entries.size() + 1);
+
+    const auto append = [&](const server_disk_cache_entry & e, bool is_new) {
+        path_storage.push_back(e.path);
+
+        disk_cache_quota_item item;
+        item.path        = &path_storage.back();
+        item.size_file   = e.size_file;
+        item.last_used   = e.last_used;
+        item.quarantined = e.quarantined;
+        // the provisional entry is protected by construction: it is the one whose
+        // admission the whole transaction is about
+        item.protected_  = is_new;
+        items.push_back(item);
+    };
+
+    for (const auto & e : entries) {
+        if (keep_new != nullptr && &e == keep_new) {
+            continue; // appended below as the provisional entry
+        }
+        append(e, false);
+    }
+
+    if (keep_new != nullptr) {
+        append(*keep_new, true);
+    }
+
+    return items;
+}
+
 void server_disk_cache::enforce_limit() {
+    enforce_limit({});
+}
+
+void server_disk_cache::enforce_limit(const std::vector<const server_disk_cache_entry *> & keep) {
     namespace fs = std::filesystem;
 
     // mtx must be held
     sweep_expired();
 
+    // entries that could not be deleted are quarantined and skipped for the rest
+    // of this pass: picking the same unremovable file again would loop forever
     // entries that could not be deleted are quarantined and skipped for the rest
     // of this pass: picking the same unremovable file again would loop forever
     while (limit_size > 0 && total_size > limit_size && !entries.empty()) {
@@ -4071,14 +4148,17 @@ void server_disk_cache::enforce_limit() {
             if (cur->quarantined) {
                 continue;
             }
+            if (std::find(keep.begin(), keep.end(), &*cur) != keep.end()) {
+                continue; // this transaction must not lose it
+            }
             if (it == entries.end() || cur->last_used < it->last_used) {
                 it = cur;
             }
         }
 
         if (it == entries.end()) {
-            // nothing droppable left (everything is quarantined): stop instead of
-            // spinning, and leave the over-quota state visible in the log
+            // nothing droppable left (everything is quarantined or protected): stop
+            // instead of spinning, and leave the over-quota state visible
             SRV_WRN("disk cache: over the %.2f MiB limit but no removable entry left (%.2f MiB used)\n",
                     limit_size/(1024.0*1024.0), total_size/(1024.0*1024.0));
             break;
@@ -4214,7 +4294,6 @@ void server_disk_cache::worker() {
             if (ok) {
                 server_disk_cache_entry committed;
                 bool                    have_committed = false;
-                bool                    admitted       = false;
 
                 server_disk_cache_entry e;
                 e.path      = path;
@@ -4231,40 +4310,69 @@ void server_disk_cache::worker() {
                 // index record to the file it describes
                 e.packed_crc = disk_cache_crc64(pending.packed);
 
-                total_size += size_file;
-                entries.push_back(std::move(e));
+                // admission first, replacement second.
+                //
+                // the file is on disk, but that alone does not mean it will
+                // survive: the quota pass may evict it right away. deleting the
+                // shorter snapshots it supersedes before knowing that would trade
+                // a working snapshot for one that is about to disappear.
+                //
+                // so: plan the capacity transaction with the new entry protected,
+                // reclaim only what is genuinely reclaimable, and only then decide
+                // about the superseded short snapshots
+                std::vector<std::string>                     path_storage;
+                std::vector<const server_disk_cache_entry *> keep;
 
-                // the short snapshots this prompt supersedes may only be deleted
-                // when this file is actually there and admitted. `size_file` is the
-                // real committed size read back from disk - never the pre-write
-                // estimate, which serves the queue budget only
-                for (const auto & cur : entries) {
-                    if (cur.path == path) {
-                        admitted = true;
-                        break;
+                std::vector<disk_cache_quota_item> plan_in = quota_items_locked(&e, path_storage);
+                disk_cache_quota_plan              plan    = disk_cache_plan_quota(plan_in, limit_size);
+
+                if (!plan.fits) {
+                    // even after reclaiming everything reclaimable the new entry
+                    // does not fit. roll it back instead of deleting snapshots for
+                    // a file that cannot stay
+                    SRV_WRN("disk cache: '%s' (%.2f MiB) does not fit the %.2f MiB limit with %.2f MiB protected, dropping it\n",
+                            path.c_str(), size_file/(1024.0*1024.0),
+                            limit_size/(1024.0*1024.0), plan.protected_bytes/(1024.0*1024.0));
+
+                    remove_file(path);
+
+                    counters.n_write_rejected++;
+                } else {
+                    total_size += size_file;
+                    entries.push_back(std::move(e));
+
+                    // the entry is in `entries` now: protect it for this transaction
+                    for (const auto & cur : entries) {
+                        if (cur.path == path) {
+                            keep.push_back(&cur);
+                            break;
+                        }
                     }
-                }
 
-                if (admitted) {
+                    // reclaim the planned candidates. an entry that refuses to be
+                    // deleted is quarantined by the quota pass and its bytes stay
+                    // accounted for
+                    enforce_limit(keep);
+
+                    // the new entry survived the capacity pass - it is admitted.
+                    // only now may it justify deleting the snapshots it supersedes
+                    const bool admitted =
+                        std::any_of(entries.begin(), entries.end(),
+                                [&path](const server_disk_cache_entry & cur) { return cur.path == path; });
+
                     drop_prefixes(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids,
-                            size_file);
-
-                    // a quota eviction may already have taken this file away; the
-                    // short snapshots are only gone because the long one was there
-                    // at that moment, so the order matters
-                    enforce_limit();
+                            size_file, /*replacement_is_admitted=*/admitted);
                 }
 
                 // the entry set changed - persist the startup index
                 save_manifest();
 
-                // only now is the file committed and discoverable. drop_prefixes
-                // and enforce_limit above may have removed it again (a shorter
-                // prefix or a quota eviction), so look it up instead of assuming
-                // it is the last entry. the notification is delivered here, inside
-                // the lock and in the same critical section that changed the entry
-                // set, so it can never arrive after a later withdrawal of the
-                // same path
+                // only now is the file committed and discoverable. the quota pass
+                // and drop_prefixes above may have removed it again, so look it up
+                // instead of assuming it is the last entry. the notification is
+                // delivered here, inside the lock and in the same critical section
+                // that changed the entry set, so it can never arrive after a later
+                // withdrawal of the same path
                 for (const auto & e : entries) {
                     if (e.path == path) {
                         committed = e;

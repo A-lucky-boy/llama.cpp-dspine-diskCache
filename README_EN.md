@@ -293,6 +293,7 @@ Disabled by default (`--cache-prefix-discovery`). When enabled it keeps a **read
 | `llamacpp:cache_disk_remove_failed_total` | failed deletion attempts |
 | `llamacpp:cache_disk_hash_collision_total` | writes refused because a hash/length hit had a different token/media identity |
 | `llamacpp:cache_disk_path_conflict_total` | writes refused because the content-addressed path stayed occupied |
+| `llamacpp:cache_disk_write_rejected_total` | new entries rolled back because they did not fit the quota |
 | `llamacpp:cache_prefix_requests_total` | requests published to the directory |
 | `llamacpp:cache_prefix_candidates_total` | candidates reported (cumulative) |
 | `llamacpp:cache_prefix_observed_total` / `_eligible_total` | cumulative transitions into `observed` / `eligible` |
@@ -307,6 +308,7 @@ Do not mix the three quantities: `candidate_lcp` is the prefix a candidate share
 
 - The CUDA backend only supports layer split (`-sm layer`); `-sm row` is rejected at model load.
 - With an active non-aLoRA adapter the shared cache does not write for that slot; the slot's own incremental continuation still works.
+- **Admission first, replacement second**: after a new entry is written, a read-only quota plan decides whether it can stay (quarantined entries count with their real bytes and are never eviction candidates; the new entry itself is protected). If the plan fails, the new file is rolled back and the existing snapshots are kept - instead of deleting the short snapshot first and then letting the new entry be evicted, which would lose both. Only once the new entry has survived the capacity pass may it justify deleting the snapshots it supersedes.
 - The file name comes from the content hash, so a **hash hit is a path hit**: the owner of that path is resolved under the lock before anything is written, and an existing file is only replaced when no record claims it. A same-name entry with a different identity is refused and counted; a same-name quarantined entry is reclaimed for real (the path is freed only after `remove_file` succeeds), and if it cannot be removed the write is refused instead of overwriting.
 - Media matching **scans both directions** and takes the min of their earliest differences. Short-circuit `||` evaluation misses the earlier difference in the second direction and therefore over-reports the usable prefix (verified with a deterministic case: the old form returned 12, the correct answer is 4). A media description is also validated structurally first (equal array lengths, strictly increasing indices, non-empty in-range chunks, non-empty ids); anything else is treated as unverifiable and yields usable prefix 0.
 - "An existing entry may replace a new one" has one definition: token prefix, **bidirectional** media identity over the shared range, and a file that still satisfies the `768 KiB/token` read-cost guard at that length. Write suppression, the background redundancy check and prefix dedup all use it, so "a longer entry exists" is by itself no reason to suppress or delete a shorter one.
