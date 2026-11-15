@@ -21,6 +21,7 @@
 
 #include "server-disk-cache-quota.h"
 #include "server-prefix-index.h"
+#include "server-prefix-materialize.h"
 #include "mtmd-helper.h"
 
 
@@ -693,6 +694,12 @@ struct disk_cache_counters {
     uint64_t n_write_rejected       = 0; // entries rolled back because they did not fit, cumulative
     uint64_t n_rollback_failed      = 0; // rollbacks whose file could not be deleted and had to be quarantined
     uint64_t n_quota_unreclaimed    = 0; // transactions that ended over quota because a physical removal failed
+
+    // prefix materialization: scheduling and export are reported separately from a
+    // real cache hit - only a committed disk entry makes the prefix reusable
+    uint64_t n_materialize_scheduled = 0;
+    uint64_t n_materialize_exported  = 0;
+    uint64_t n_materialize_skipped   = 0;
     uint64_t n_manifest_fallback    = 0;
     uint64_t n_reject[(size_t) cache_reject_reason::count] = {};
     uint64_t n_enqueue_queued       = 0;
@@ -721,6 +728,12 @@ struct server_task_result_metrics : server_task_result {
 
     // counters of the optional prefix directory (zero when it is disabled)
     prefix_index_stats cache_prefix;
+
+    // prefix materialization outcomes. these live in the context, not the disk
+    // tier, because scheduling and export happen before anything reaches a file
+    uint64_t n_materialize_scheduled = 0;
+    uint64_t n_materialize_exported  = 0;
+    uint64_t n_materialize_skipped   = 0;
 
     virtual json to_json() override;
 
@@ -1133,6 +1146,15 @@ struct server_prompt_cache {
     // queue a disk write for the entry that was added last (boundary capture).
     // the usual admission guards apply, so a covered or oversized entry is a no-op
     void mirror_latest(size_t budget);
+
+    // export a prefix as its own disk object without going through the RAM tier.
+    //
+    // the RAM tier's own admission rules answer a different question - "does this
+    // session want to keep the state in memory" - and a prefix that is too large
+    // for it is still worth a disk snapshot. the disk tier applies its own
+    // identity, dedup, cost and quota checks to the object handed over here
+    bool materialize(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+            server_prompt_cache_state & out);
 
 private:
     // move an entry that is about to be dropped to the disk tier

@@ -296,6 +296,9 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `llamacpp:cache_disk_write_rejected_total` | 因配额无法准入而被回滚的新条目数 |
 | `llamacpp:cache_disk_rollback_failed_total` | 回滚失败、被迫以隔离条目登记的写入数 |
 | `llamacpp:cache_disk_quota_unreclaimed_total` | 因物理删除失败而未能真实回收配额的准入事务数 |
+| `llamacpp:cache_prefix_materialize_scheduled_total` | 已安排的前缀主动捕获数（尚不代表文件存在） |
+| `llamacpp:cache_prefix_materialize_exported_total` | 推理线程成功导出完整状态的捕获数 |
+| `llamacpp:cache_prefix_materialize_skipped_total` | 未产出任何状态的捕获数（拒绝、越过边界、导出失败） |
 | `llamacpp:cache_prefix_requests_total` | 已发布观察的请求数 |
 | `llamacpp:cache_prefix_candidates_total` | 返回给调用方的候选前缀数（累计） |
 | `llamacpp:cache_prefix_observed_total` / `_eligible_total` | 进入 `observed` / `eligible` 的累计次数 |
@@ -310,6 +313,8 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 
 - CUDA 后端只支持按层切分（`-sm layer`）；`-sm row` 在模型加载阶段即被拒绝。
 - 生效的非 aLoRA 适配器下，共享缓存对该 slot 不写入；slot 自身的增量续算仍可用。
+- **公共前缀可被主动物化**：`--cache-prefix-materialize`（默认关闭）在下次经过目录标记为 `eligible` 的公共前缀时，把 prefill 批次**精确停在该前缀结束处**，在两处上下文都完成到该位置后导出完整序列状态，经磁盘层正常写队列落成一个独立快照；只有真实提交后目录才登记 `persisted`。规划、导出、提交、复用四层分别记数，互不冒充。
+- **独立磁盘对象不受 RAM 驻留策略阻挡**：RAM 缓存的容量准入回答的是"本会话要不要把状态留在内存"，与"该前缀是否值得一个独立磁盘文件"是两回事。主动捕获走专用导出路径，磁盘层仍独立执行身份、去重、读盘成本与配额判定；被拒绝的候选保留其正常拒绝语义。
 - **只有可用条目才发布持久化引用**：前缀目录的 `persisted` 引用来自提交事件，而提交资格是"路径存在**且条目未被隔离**"。被拒绝写入但回滚失败的文件留在 `entries` 里仅为记账，绝不能发给前缀目录——否则目录会持有一个 `load()` 拒绝使用、且重启后消失的物理引用（启动登记本就跳过隔离条目）。
 - **保护身份用路径而非指针**：配额淘汰里"本次事务不可失去的条目"以路径字符串集合表示。`entries` 是 `std::vector`，`erase()` 会移动其后的元素，用裸指针保存的保护集会在 TTL 清扫删除前置条目后失效——TTL 清理与 LRU 淘汰共用同一保护集。
 - **计划不等于兑现**：`plan.fits` 只是"假定候选都能删除"时的可行性。真实删除可能失败并把条目隔离，因此物理回收后会重新核对 `total_size`：若本次没有删除任何被替代的短快照，则回滚新条目；若已删除，则保留真实超额账本并拒绝进一步不受控写入。回滚本身删除失败时，该文件以隔离条目登记（计入配额、排除出复用），不虚报已回收。

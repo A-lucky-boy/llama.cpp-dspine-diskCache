@@ -1779,3 +1779,241 @@ server_disk_cache::on_entry_committed
 本文件仅记录本轮代码修复规划与算法修改日志，不编写性能收益设想、早停要求、计算报告或最终判定规则。保留现有实验设计记录，不覆盖历史章节。
 
 本次修复是推进后续单用户公共前缀物理缓存的先决步骤，不在本节规划新的实验代码。完成后，应重新审查 `change.md` 与 baseline 差异，再决定是否进入下一个独立实验。
+
+---
+
+# 2026-11-15 23-38 - test1_3
+
+## 一、实验目标
+
+**实验名称：公共前缀主动捕获与独立 KV 快照持久化（Eligible Prefix Materialization）**
+
+当前单用户缓存系统能够在 radix-tree 元数据目录中识别多次出现的公共 token/media 前缀，也能将已经真实提交的磁盘快照登记为 `persisted`。但是，发现公共前缀 `A` 并不等于磁盘上存在能独立恢复 `A` 的 KV 状态。已有输入/输出边界捕获在完整请求边界工作，无法自动把两个不同请求的公共中间前缀变成独立可恢复对象。
+
+本实验只引入**前瞻式、精确边界的完整序列状态捕获**：在下一次经过已经识别的合格公共前缀时，准确停止本次 prefill 批次，在目标与草稿模型状态均完成到该位置后，使用现有 `llama_state_seq_get_size_ext/get_data_ext` 导出完整序列状态，复用现有磁盘写入、完整性校验、提交/失效与恢复机制保存一个独立前缀快照。
+
+目标是打通如下实际数据链路：
+
+```text
+多个请求包含相同的公共前缀 A
+    → 公共前缀目录返回 eligible(A)
+    → 后续真实请求的 prompt prefill 经过 A 的结束位置
+    → 目标/草稿状态在该位置完整、可同步导出
+    → 捕获 A 对应的完整序列 KV 状态
+    → 正常的磁盘缓存队列与配额事务
+    → 磁盘条目真实提交后，目录才登记 persisted(A)
+    → 重启后由既有 disk.load() 读取该条目，按 n_past 真实复用
+```
+
+**本次不实现任意字节偏移的 KV 分块、差量序列化或新的物理文件格式**。已经存在的 state API 的使用范围仅是完整序列状态的导出/恢复；“API 正确性”指模型状态与 token 位置一致，不是网络/API 权限安全审查。本机单用户、单实例、单 Slot（`-np 1`）为唯一目标范围。
+
+## 二、源码依据与前置核对
+
+编写规划前已按顺序核对远端 `change.md` 的最新 `2026-11-15 23-40 - Change Record`、`projectSummary.md`、实际源码，并与改造前 baseline 对比：
+
+- 本轮审查仓库：`A-lucky-boy/llama.cpp-dspine-diskCache`。
+- 远端审查 HEAD：`147001c920436d03688428bf6388db77e75472e3`（文档提交）；最新代码修复提交：`1ab6528464e7cdfbbb43dedf3ef895eab2e6f268`。
+- 改造前 baseline：`eb7681889f44304d2bd5b3e41572f5530af91a1d`。
+- 已核对 `tools/server/server-task.cpp` 的配额与可替代性路径、`server-disk-cache-quota.cpp` 的提交资格谓词、`server-context.cpp` 的输入边界捕获与 prefill/post-decode、`server-prefix-index.cpp` 的 `candidates()`/`observe()`，以及 `src/llama-context.cpp` 的完整序列 state IO。
+- 最新修复的隔离引用撤销、有效条目提交通知、路径保护、删除失败的真实字节记账已进入源码。主功能没有发现阻止开始本实验的新增算法错误。
+- **源码一致性整理**：当前 `worker()` 内的直接提交资格使用 `is_reusable_entry(cur)`，而新增 `disk_cache_commit_eligible()` 仅被独立测试直接调用；两者现有谓词等价，但不符合“运行时代码和测试使用同一函数”的原交付叙述。实施时应消除这一重复判定，并把该代码整理与本轮功能改动分别记录。另将提交诊断日志里的字面量 `@NL@` 替换为正确的换行符，确保日志按行可解析。不得因此改变隔离/有效条目的真实提交资格。
+
+实验人员开始修改时仍须先读取**当前本地** `change.md`、`projectSummary.md`、Git HEAD 和未提交差异；如远端再次变化，应先逐函数核查上述基础逻辑，避免覆盖修复。
+
+## 三、实验边界与方案选择
+
+### 3.1 仅捕获真实计算已经完成的前缀
+
+选择**前瞻式 prefill 边界捕获**，而不是在已计算完整请求 `A+B` 后，直接把该序列化字节裁剪成 `A`。
+
+原因：`llama_state_seq_get_data_ext()` 导出的是完整的当前序列内存状态，现有文件格式并未证明字节区间与 token 区间一一对应。只有实际执行到边界 `A` 且其 KV 已完成的时刻，导出的状态才能明确属于该前缀。
+
+禁止以下替代实现：
+
+- 把已有 `A+B` 的 KV blob 按 token 比例截断；
+- 把目录的 `eligible` 直接变成 `persisted`；
+- 让后台文件线程访问实时 `llama_context`；
+- 改变恢复端的 `n_past`、CRC 校验、target/draft 恢复顺序或成本守卫；
+- 为了一次捕获在推理线程中主动重算已经跳过的前缀。
+
+### 3.2 触发条件
+
+为每个当前请求的 slot 维护一个轻量的、非持久的 `prefix_capture_target`，至少包含：
+
+```text
+request_id
+prefix_tokens
+token/media identity（读取时用同一请求的不可变 token 视图）
+generation/version（防止 slot 被复用后执行旧计划）
+state = none | scheduled | reached | exporting | queued | skipped
+```
+
+配置建议新增 `--cache-prefix-materialize`，**默认关闭**。只在原本已启用磁盘层与 `--cache-prefix-discovery` 时允许开启；未具备条件则清晰拒绝或说明该开关无效。
+
+从 `server_prefix_index::candidates()` 读取已存在目录的候选，不增加观察次数，不修改目录。选择规则：
+
+1. 候选 `state == eligible`，且 `prefix_tokens >= --cache-disk-min-tokens`、不超过本次输入长度。
+2. 优先选当前请求**最长**的一个合法、尚无独立物理引用的公共前缀；单次请求最多安排一次主动捕获。
+3. 候选对应的 token/media 身份必须与当前任务真实前缀完全一致，结束位置不能位于媒体块内部。
+4. 本次只执行**纯文本输入**的主动捕获；遇到 mtmd 嵌入块、跨越媒体边界、上下文转换/稀疏位置等无法明确界定完整序列边界的情况，记录 `skipped` 并保留原推理路径，不生成伪快照。
+5. `prefix_tokens <= n_past` 时，只有已有序列状态**恰好停在**捕获边界、目标与草稿状态确认一致，才能直接捕获；如已经计算越过该位置则跳过，禁止倒退裁剪 live KV。
+6. 如果本次请求结束后才首次成为 `eligible`，只允许后续请求执行；不对已完成的前缀进行事后重算或伪造提交。
+
+`--cache-prefix-min-tokens` 仍只决定目录观察资格；磁盘层继续使用独立的 `--cache-disk-min-tokens` 门槛，不为了捕获短前缀而暗中降低原磁盘恢复要求。
+
+### 3.3 真实 prefill 分段与捕获安全点
+
+在请求 token 进入批处理之前，确定目标 `K=prefix_tokens`。若 `n_past < K < task.n_tokens()`：
+
+- 在 `server-context.cpp` 已有 `add_prompt` / batch filling 循环中，不允许单个 prefill 批次跨越 `K`；当 `slot.prompt.n_tokens() == K`，结束本批填充。
+- 必须等本批 `llama_process(ctx_tgt, ...)` 成功、`common_speculative_process(...)` 完成必要的 draft 状态更新，且目标/草稿上下文已同步以后，才允许导出。
+- 再次校验 `slot.prompt.tokens.size()`、`llama_memory_seq_pos_max()` 与 `size_up_to_pos` 一致地覆盖到且只覆盖到 `K`；若目标/draft 的位置或状态边界不同步，取消本次捕获但继续正常 prefill。
+- 在当前推理线程、允许序列化的安全点调用已有完整 state 导出 API。导出完成后恢复原 prefill 流程，从 `K` 继续处理剩余输入；不改变生成采样及后续 output 边界捕获。
+- 对原有 checkpoint，只有确属 `K` 及以前、且与实际 target/draft 状态位置相容的检查点才纳入前缀快照。不能让 checkpoint 描述超出 `K` 的内存。
+- 任务取消、异常、模型状态导出不完整或 batch decode 失败时，不生成文件、不通知 `persisted`；仍走原有请求错误/清理路径。
+
+实现时优先沿用现有 `capture_boundary()` / `server_slot::prompt_capture()` 内的序列化逻辑，将“从 live 状态获取准确完整序列”抽取为可复用的内部操作。**不能简单在 `post_decode()` 的早退分支后附加代码而遗漏普通中间 prefill 批次**；必须定位能覆盖所有成功中间批次、且 target/draft 都已更新的真实调用点。
+
+### 3.4 独立磁盘对象，不受常规 RAM 长前缀去重误阻
+
+现有 `server_prompt_cache::alloc()` 会在 RAM 中已有更长序列覆盖待捕获前缀时直接返回 `nullptr`，也可能在加入长序列时移除其短前缀。这属于正常会话 RAM 缓存策略，但不能用来决定公共前缀是否有必要形成**独立磁盘对象**。
+
+为本次功能增加独立于普通 RAM 驻留策略的短生命周期捕获路径：
+
+1. 导出 `server_prompt` 的前 `K` 个 token、对应媒体元数据与合规 checkpoint；
+2. 使用已有 `server_prompt_cache_state` 兼容的数据载体，暂存目标与草稿完整序列状态；
+3. 将捕获对象通过磁盘层已有 `mirror`/写队列接口或等价薄封装入队，由其继续执行 token/media 身份、重复路径、成本守卫、配额事务和真实提交；
+4. 排队成功后由后台 worker 持有缓冲区直至写入结束，不允许悬空引用；无需把该独立前缀常驻在常规 RAM `states` 中；
+5. 如果正常写入抑制判定认为已有长快照能够经济地替代 `K`，按现有政策拒绝冗余新文件即可；**不能**因此声称新增独立前缀文件，也不能提前登记 `persisted(K)`；
+6. 只在真实文件写入、配额准入、manifest 和有效提交资格全部通过后，继续使用原 `notify_committed()` 令目录精确节点转到 `persisted`；删除/隔离仍走原失效通知。
+
+本次不改变磁盘缓存 v8 条目协议和 manifest v3；不增加第二套前缀文件名空间、不引入新的后台队列线程。
+
+## 四、预期修改文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `common/common.h` | 增加默认关闭的主动前缀物化布尔参数 |
+| `common/arg.cpp` | 注册 `--cache-prefix-materialize` 参数及原有缓存开关的组合校验 |
+| `tools/server/server-context.cpp` | 候选前瞻查询、slot 级捕获计划、prefill 边界批次切分、decode 成功后的状态同步/捕获及任务结束清理 |
+| `tools/server/server-task.h` | 最小的独立前缀快照提交接口或已有内存载体薄封装；必要时加入可观测指标 |
+| `tools/server/server-task.cpp` | 复用 `server_prompt_cache_state` 的导出结果进入磁盘正常写队列；避免普通 RAM `alloc()` 的长前缀抑制误挡独立捕获；整理单一提交资格调用与诊断换行 |
+| `tools/server/server-prefix-index.h/.cpp` | 原则上仅调用既有 `candidates()` / 提交回调；若需要增加只读的“精确节点是否已有物理引用”查询，保持其无副作用 |
+| `tools/server/server-common.h`（必要时） | 将主动捕获指标纳入 `/metrics`，不能与真实复用统计混用 |
+| `tools/server/tests/unit/` | 候选选择、媒体边界、重复请求、只捕获一次及清理状态的纯元数据测试 |
+| `test-run/` | 增加单用户多分支请求、进程重启、磁盘恢复与关闭态对照脚本 |
+| `change.md` | 实施人员真实修改的路径、函数、数据流和回归记录 |
+| `projectSummary.md` | 实验实际落地后更新项目总体架构与功能限制；未实现的不写成已实现 |
+
+不修改模型权重、训练程序、网络服务权限、推测采样语义，也不触及多用户/多 Slot 设计。
+
+## 五、数据流修改
+
+### 5.1 原始请求链路保持可用
+
+```text
+tokenize → 选槽 / 尝试 slot、RAM、disk 恢复
+         → 普通 prompt prefill
+         → 输入边界捕获与目录观察
+         → 生成与输出边界捕获
+```
+
+### 5.2 新增的可选分支
+
+```text
+tokenize / 已知本次请求 token-media 身份
+  → 查询只读前缀目录 candidates()
+  → 筛选 eligible + K ≥ disk_min + 媒体边界合法
+  → 保存 request-scoped capture target K
+  → 经过既有 slot/RAM/disk 复用后确定 n_past
+       ├─ KV 已越过 K：skipped（不倒退状态）
+       ├─ KV 恰好在 K：核对状态，执行一次捕获
+       └─ KV 尚未到 K：
+            ├─ prefill batch 不得越过 K
+            ├─ target / draft decode 成功并同步
+            └─ 状态恰好覆盖 K，执行一次捕获
+  → 原有完整序列 state_get_* 导出 target + draft
+  → 使用现有 disk mirror/worker 写盘和配额管理
+       ├─ 被原有成本/去重/配额规则拒绝：未 persisted
+       └─ 真实提交且有效：notify_committed(K) → persisted
+  → 继续正常 prompt prefill、采样及生成
+```
+
+与现有目录观察的时序保持独立：`candidates()` 是不增加观察数的只读查询；输入边界的 `observe()` 在原位置仍然执行一次。新物理捕获不应重复增加 `observations`。
+
+## 六、训练与推理流水线影响
+
+**训练流水线：**本项目不涉及训练，训练数据、模型参数与 checkpoint 均不修改。
+
+**推理流水线：**增加一次只读候选筛选、最多一次精确 prefill 分段和一次完整 state 导出。捕获本身属于可选磁盘加速路径，不影响采样 token、DSpine draft 选择、模型权重、模型配置或原缓存恢复条件。目标/draft 的序列 state 导出必须保持原 API 语义；缺失/不一致时不能产生新缓存条目。
+
+缓存可用性统计分层记录：
+
+- `prefix_materialize_scheduled`：已安排，尚不代表文件存在。
+- `prefix_materialize_exported`：推理线程已成功导出完整状态。
+- `prefix_materialize_queued`：磁盘写队列接收了对象。
+- `prefix_materialize_committed`：磁盘层成功准入后真实发布有效引用（只能由成功提交事件增加）。
+- `prefix_materialize_skipped`：本次没有物理对象，需区分已经越过边界、媒体、过小、已有经济可用覆盖、队列/预算等原因。
+
+以上指标名称可按现有 metrics 风格落地，但须保持**候选/捕获/物理提交/真实恢复四个层次互不冒充**。真正节省的 prefill 仍只使用现有 `reused_slot/reused_ram/reused_disk` 统计。
+
+## 七、与现有缓存实现的兼容性
+
+1. **默认关闭兼容**：新参数缺省 false 时，不改变原始 batch 分割、目录观察、`capture_boundary` 或 RAM/disk 快照策略。
+2. **真实文件兼容**：沿用 v8、manifest v3、CRC64、配置签名、完整 token/media 身份、`768 KiB/token` 读盘成本守卫、4096-token 写入抑制与路径所有权。
+3. **回滚隔离一致**：失败删除的文件继续计入 `total_size` 并 `quarantined`，不能因新主动捕获变成 `persisted`。
+4. **前缀引用一致**：只在磁盘有效条目提交后通知。既有 `on_snapshot_invalidated`、`event_epoch`、tombstone、启动重建不改变。
+5. **RAM 生命周期一致**：新增专用捕获不得修改普通 `states` 的容量裁剪/会话缓存策略，不把短前缀强行设为 RAM 常驻对象。
+6. **线程一致**：`llama_context` 的 state 导出仅在推理安全点；后台 worker 仅处理已经完成序列化的数据与文件 IO。单用户也不能忽略这一线程约束。
+7. **上下文位置一致**：遇到 context shift、target/draft 位置不同步、checkpoint 超界、媒体块边界或取消任务时不宣称导出成功。
+8. **兼容不同配置**：若模型未启用 draft，则只导出目标 state；启用 draft 的当前部署必须同时保留并验证两个上下文的原恢复要求。
+9. **不做网络功能**：本机部署不添加鉴权、权限、限流、多租户或公网风险相关功能。
+10. **不做原始 KV blob 分块**：不对序列化状态随意 `memcpy` 切片，不改 `state_seq_write_data()` 的协议。
+
+## 八、验证检查清单
+
+### 8.1 修改前审查
+
+- [ ] 复读最新本地 `change.md` 并和 baseline / 本文审查提交核对，确认原配额、恢复、隔离、提交通知和提交资格逻辑没有新问题。
+- [ ] 消除 `disk_cache_commit_eligible()` 与运行时资格判定的重复实现；修复提交日志的 `@NL@` 字面字符串；确认等价分支仍由单测直接覆盖。
+- [ ] 检查开关默认关闭以及关闭时 batch 构造顺序与原始路径一致。
+
+### 8.2 前缀发现和调度
+
+- [ ] 构造纯文本共同前缀 `A` 与两个不同后缀，观察目录的 `observed/eligible` 变化；候选未达到资格时不能安排捕获。
+- [ ] 对符合磁盘最小 token 门槛的最长 `eligible` 前缀安排一次捕获；不增加本次 `observe()` 次数。
+- [ ] 同一 slot 后续复用给新的 request_id 时不得执行上一请求遗留的计划。
+- [ ] 边界不足最小长度、已有经济可用的物理条目、已越过边界、媒体输入等场景不制造错误文件。
+- [ ] candidate 仅为 metadata 时，不得增加 `reused_disk`、`restored` 或 `persisted`。
+
+### 8.3 KV 捕获正确性
+
+- [ ] 将预定边界 K 选在原 batch 中间，确认 batch 不跨越 K，且真正捕获发生在该批 target/draft 成功处理并同步以后。
+- [ ] 证明 `slot.prompt.tokens`、目标 `llama_memory_seq_pos_max()`、草稿状态与 K 的对应关系。若不同步，必须记录跳过原因且保留正确的后续 prefill。
+- [ ] 对完整 target/draft state 导出检查 `get_size_ext` 和 `get_data_ext` 字节计数一致；不得导出不完整对象。
+- [ ] 检查 checkpoint 没有超出前缀 K；不可移除/稀疏序列不允许伪造连续状态。
+- [ ] 故障/取消/重试、decode 批次缩减时不会重复捕获或对提前追加但尚未真正计算的 token 做快照。
+- [ ] 捕获后生成流程仍正确从原任务位置继续，不发生 token 重复或漏算。
+
+### 8.4 物理持久化与真正复用
+
+- [ ] 在独立缓存目录中以 `A+B`、`A+C`、`A+D` 等请求组合产生合格候选，使用单 Slot、固定配置及真实 target/draft 模型验证单个前缀独立快照的入队与落盘。
+- [ ] 只以磁盘 worker 的有效提交作为 `persisted` 依据；排队成功或文件只被写到临时路径不算提交。
+- [ ] 检查 `pc-<hash>.bin`、manifest 与实际 token/media 身份一致；未改变旧格式可读性。
+- [ ] 强制退出进程并用**完全相同**模型/上下文配置重启，使 slot/RAM 在位状态不再存在，再验证目标公共前缀通过 `source=disk`、`restored` 与 `reused_disk` 真实恢复；不以目录候选数代替磁盘复用。
+- [ ] 比较相同输入的原有关闭态与开启态生成输出一致性；确认 `prompt = reused_slot + reused_ram + reused_disk + prefill` 恒等式保持成立。
+- [ ] 校验重复分支、较长前缀、配额淘汰、短快照替代、TTL 失效以及隔离删除失败后目录引用同步撤销。
+- [ ] 对仍受原读盘成本守卫拒绝的候选，保留其正常拒绝语义；不可通过调大阈值伪装为物理命中。
+
+### 8.5 交付
+
+- [ ] 将实际修改文件、函数、数据流、执行过的单测与真实恢复检查追加到 `change.md`。
+- [ ] 将已经实现的新功能与范围更新到 `projectSummary.md`，不把计划项写成已完成。
+- [ ] 本文件只保留实验规划与修改日志，不填写未来性能收益、早停规则、计算资源报告或最终判定规则。
+
+## 九、实施纪律
+
+- 本次只实施这一项算法改动，不捆绑分块 KV、增量读写、热点淘汰或多用户系统的工作。
+- 不更改模型计算图、采样概率、tokenizer、DSpine 逻辑或训练参数。
+- 若实际状态 API 在所需位置无法产出可完整恢复的 target/draft 状态，应如实记录具体 API、函数、位置和失败现象，不允许把不完整 blob 当作快照写入磁盘。
+- 不要求重新运行基线训练；对照基于同配置、同请求、相同服务端开关关闭的原有推理路径完成。

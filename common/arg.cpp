@@ -1832,6 +1832,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_PREFIX_MAX_INDEX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-prefix-materialize"},
+        {"--no-cache-prefix-materialize"},
+        "capture an eligible common prefix as its own disk snapshot by stopping the prefill batch at its exact end "
+        "(default: disabled; requires --cache-disk and --cache-prefix-discovery)",
+        [](common_params & params, bool value) {
+            params.cache_prefix_materialize = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_MATERIALIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

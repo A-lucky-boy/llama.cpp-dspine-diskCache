@@ -33,6 +33,8 @@ add_library(${TARGET} STATIC
     server-disk-cache-match.h
     server-disk-cache-quota.cpp
     server-disk-cache-quota.h
+    server-prefix-materialize.cpp
+    server-prefix-materialize.h
 )
 
 if (BUILD_SHARED_LIBS)

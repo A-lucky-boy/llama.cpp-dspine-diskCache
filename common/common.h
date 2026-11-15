@@ -678,6 +678,13 @@ struct common_params {
     int32_t     cache_prefix_max_candidates = 256;   // --cache-prefix-max-candidates
     int32_t     cache_prefix_max_index_mib  = 64;    // --cache-prefix-max-index-mib
 
+    // materialize an eligible common prefix into its own disk snapshot: when the
+    // next request prefills through a prefix the directory has marked eligible,
+    // stop the prefill batch exactly at its end and export the complete sequence
+    // state there. off by default - it adds a batch split and a state export to
+    // the request path
+    bool        cache_prefix_materialize    = false; // --cache-prefix-materialize
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";

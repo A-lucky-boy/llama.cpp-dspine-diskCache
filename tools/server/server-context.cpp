@@ -351,6 +351,20 @@ struct server_slot {
     // task; guards against serializing the same state twice
     size_t boundary_captured = 0;
 
+    // optional plan to materialize a common prefix into its own disk snapshot.
+    // request-scoped: armed when the request starts and cleared when the slot is
+    // handed to a new task, so it can never fire against a different request
+    struct prefix_materialize_plan {
+        bool     armed         = false;
+        size_t   prefix_tokens = 0;
+        // the task this plan belongs to. a slot is reused across requests, and an
+        // unfinished plan from the previous one must not run
+        uint64_t task_id       = 0;
+        bool     done          = false;
+    };
+
+    prefix_materialize_plan materialize;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -2063,11 +2077,235 @@ private:
         }
     }
 
-    // account for one request's prompt tokens: every token is counted exactly
-    // once, either as reused from the slot, the RAM tier or the disk tier, or as
-    // prefilled. n_past is the value that survived every guard (checkpoints,
-    // media boundaries, forced re-evaluation of the last token), so it is the
-    // real avoided work - not the candidate lcp the lookup reported
+    // cumulative materialization outcomes. kept apart from the reuse counters on
+    // purpose: scheduling or exporting is not a cache hit, and only a real disk
+    // commit makes a prefix reusable
+    struct materialize_counters {
+        uint64_t scheduled = 0;
+        uint64_t exported  = 0;
+        uint64_t skipped   = 0;
+    } counters_materialize;
+
+    // pick the common prefix this request should materialize. metadata only: it
+    // reads the directory and stores a plan on the slot, nothing is captured here
+    void plan_prefix_materialize(server_slot & slot, int64_t n_past) {
+        if (!params_base.cache_prefix_materialize || !prefix_index || !prompt_cache || !prompt_cache->disk ||
+                !slot.task || slot.prompt.tokens.empty()) {
+            return;
+        }
+
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->is_stateless() ||
+                !slot.task->params.cache_prompt) {
+            return;
+        }
+
+        // one plan per request: a re-entry into the prompt path must not re-arm
+        if (slot.materialize.armed || slot.materialize.done) {
+            return;
+        }
+
+        // the directory compares token ids and media identities, so the request's
+        // own view is what gets queried - read-only, it never grows the intern table
+        const server_tokens & task_tokens = slot.task->tokens;
+
+        const auto media_indices      = task_tokens.media_chunk_indices();
+        const auto media_token_counts = task_tokens.media_chunk_token_counts();
+
+        std::vector<std::string> media_ids;
+        media_ids.reserve(media_indices.size());
+        for (const uint32_t idx : media_indices) {
+            media_ids.push_back(task_tokens.media_chunk_id(idx));
+        }
+
+        const auto cands = prefix_index->candidates(task_tokens.get_tokens(),
+                media_indices, media_token_counts, media_ids);
+
+        std::vector<disk_cache_materialize_candidate> view;
+        view.reserve(cands.size());
+
+        for (const auto & c : cands) {
+            // only a prefix that went through the directory's own gate is a
+            // capture target; `observed` and `unavailable` are not
+            disk_cache_materialize_candidate v;
+            v.prefix_tokens = c.prefix_tokens;
+            v.observations  = c.observations;
+            v.persisted     = c.state == prefix_state::persisted;
+            v.eligible      = c.state == prefix_state::eligible;
+            view.push_back(v);
+        }
+
+        disk_cache_materialize_request req;
+        req.enabled        = true;
+        // the disk tier's own minimum, not the directory's observation threshold.
+        // same parameter the disk tier is constructed with
+        req.min_tokens     = (size_t) std::max(0, params_base.cache_disk_min_tokens);
+        req.n_input_tokens = slot.task->tokens.size();
+        req.n_past         = n_past;
+
+        if (!media_indices.empty()) {
+            req.has_media         = true;
+            req.media_chunk_start  = media_indices.front();
+            req.media_chunk_end    = media_indices.back() + media_token_counts.back();
+        }
+
+        disk_cache_materialize_skip skipped = disk_cache_materialize_skip::none;
+        const auto plan = disk_cache_plan_materialize(req, view, skipped);
+
+        // the KV already sits exactly on the boundary: capture from the state as
+        // it is. claiming the boundary by cutting a batch would leave this
+        // iteration with nothing to add, and an empty batch aborts the server
+        if (plan.capture && n_past >= 0 && (size_t) n_past == plan.prefix_tokens) {
+            slot.materialize.armed         = true;
+            slot.materialize.prefix_tokens = plan.prefix_tokens;
+            slot.materialize.task_id       = slot.task->id;
+            slot.materialize.done          = false;
+
+            counters_materialize.scheduled++;
+
+            if (params_base.cache_stats) {
+                SLT_INF(slot, "cache_stats: materialize = scheduled at n_past, prefix = %zu tokens\n",
+                        plan.prefix_tokens);
+            }
+
+            // prompt.tokens was just truncated to n_past, so it holds exactly the
+            // prefix and the memory holds exactly its KV
+            materialize_prefix(slot);
+            return;
+        }
+
+        if (!plan.capture) {
+            // the reason is kept for --cache-stats: a candidate is not a hit, and
+            // neither is a refusal
+            if (params_base.cache_stats) {
+                SLT_INF(slot, "cache_stats: materialize = skipped (%s), n_past = %lld\n",
+                        disk_cache_materialize_skip_name(skipped), (long long) n_past);
+            }
+            slot.materialize.done = true; // decided once per request
+            return;
+        }
+
+        slot.materialize.armed         = true;
+        slot.materialize.prefix_tokens = plan.prefix_tokens;
+        slot.materialize.task_id       = slot.task->id;
+        slot.materialize.done          = false;
+
+        counters_materialize.scheduled++;
+
+        if (params_base.cache_stats) {
+            SLT_INF(slot, "cache_stats: materialize = scheduled, prefix = %zu tokens, n_past = %lld\n",
+                    plan.prefix_tokens, (long long) n_past);
+        }
+    }
+
+    // export the complete sequence state at the planned prefix boundary.
+    //
+    // called from post_decode, after llama_process() and
+    // common_speculative_process() have both returned for this batch, so the
+    // target and the draft context describe exactly the same positions. The
+    // batch was cut so that it ends at the planned prefix, which is what makes
+    // the exported state belong to that prefix instead of to a longer request.
+    void materialize_prefix(server_slot & slot) {
+        if (!slot.materialize.armed || slot.materialize.done || !slot.task) {
+            return;
+        }
+
+        // the slot may have been handed to a different request since the plan was
+        // armed: the stored task id is the guard
+        if (slot.materialize.task_id != slot.task->id) {
+            slot.materialize = server_slot::prefix_materialize_plan();
+            return;
+        }
+
+        const size_t K = slot.materialize.prefix_tokens;
+
+        // wait for the batch that ends exactly at the boundary. the loop in the
+        // caller stops filling at K, so the KV reaches K and not beyond; any
+        // earlier batch simply has not arrived yet and must not be treated as a
+        // failure - the next one will come
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max < 0 || (size_t) pos_max + 1 < K) {
+            return;
+        }
+
+        // the KV never moved past K: the batch was cut there. a position beyond it
+        // would mean the snapshot no longer describes the prefix
+        if ((size_t) pos_max + 1 > K) {
+            SLT_WRN(slot, "cache_stats: materialize = skipped (memory moved past %zu to %d)\n",
+                    K, (int) pos_max + 1);
+            slot.materialize.done = true;
+            counters_materialize.skipped++;
+            return;
+        }
+
+        // the token view must have exactly the prefix, no more: a snapshot that
+        // claims tokens whose KV is not there cannot be restored
+        if (slot.prompt.tokens.size() < K) {
+            SLT_WRN(slot, "cache_stats: materialize = skipped (prompt has %zu < %zu tokens)\n",
+                    slot.prompt.tokens.size(), K);
+            slot.materialize.done = true;
+            return;
+        }
+
+        if (ctx_dft) {
+            // the draft context must describe the same prefix. a mismatch means
+            // the two contexts are not in step, and a snapshot from them would be
+            // inconsistent
+            const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
+            if (dft_pos_max < 0 || (size_t) dft_pos_max + 1 < K) {
+                SLT_WRN(slot, "cache_stats: materialize = skipped (draft holds %d < %zu)\n", (int) dft_pos_max, K);
+                slot.materialize.done = true;
+                return;
+            }
+        }
+
+        server_prompt snapshot;
+        snapshot.tokens = slot.prompt.tokens.clone();
+        snapshot.tokens.keep_first(K);
+
+        // a checkpoint past the prefix describes state this entry cannot reproduce
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            if (ckpt->pos_max <= (llama_pos) K) {
+                snapshot.checkpoints.push_back(ckpt);
+            }
+        }
+
+        // export from the live contexts and hand the object straight to the disk
+        // tier. the RAM tier is deliberately bypassed: its own size policy answers
+        // "should this session keep the state in memory", which is a different
+        // question from "is this prefix worth its own disk object"
+        server_prompt_cache_state captured;
+
+        if (!prompt_cache->materialize(snapshot, ctx_tgt, ctx_dft, slot.id, captured)) {
+            slot.materialize.done = true;
+            counters_materialize.skipped++;
+
+            if (params_base.cache_stats) {
+                SLT_WRN(slot, "cache_stats: materialize = skipped (state export refused), prefix = %zu tokens\n", K);
+            }
+            return;
+        }
+
+        // the disk tier applies its own identity, dedup, read-cost guard, quota
+        // transaction and commit eligibility. an entry it refuses simply never
+        // becomes reusable
+        prompt_cache->disk->store(std::move(captured));
+
+        const bool ok = true;
+
+        slot.materialize.done = true;
+
+        if (params_base.cache_stats) {
+            SLT_INF(slot, "cache_stats: materialize = %s, prefix = %zu tokens\n",
+                    ok ? "exported" : "export_failed", K);
+        }
+
+        if (ok) {
+            counters_materialize.exported++;
+        } else {
+            counters_materialize.skipped++;
+        }
+    }
+
     // publish the request's immutable prefix metadata to the optional directory.
     // metadata only: nothing is serialized, nothing is restored, and a candidate
     // is never counted as a cache hit.
@@ -2276,6 +2514,7 @@ private:
             // is being assigned, prompt_load() below fills it when it runs
             ret->cache_restore = prompt_cache_restore_info();
             ret->boundary_captured = 0;
+            ret->materialize = server_slot::prefix_materialize_plan();
 
             update_cache = update_cache && prompt_cache;
 
@@ -3620,6 +3859,12 @@ private:
                         res->cache_prefix = prefix_index->stats();
                     }
 
+                    // scheduling and export are not cache hits: they describe this
+                    // process's own attempts, never a reuse
+                    res->n_materialize_scheduled = counters_materialize.scheduled;
+                    res->n_materialize_exported  = counters_materialize.exported;
+                    res->n_materialize_skipped   = counters_materialize.skipped;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -4823,6 +5068,11 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // n_past is settled here, so this is the first point where
+                        // it is known whether the planned boundary is still ahead
+                        // of the KV or exactly on it
+                        plan_prefix_materialize(slot, n_past);
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4959,6 +5209,16 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        // a planned prefix capture must observe the state at exactly
+                        // its end: stop this batch there instead of running past it.
+                        // the next iteration resumes the prefill from the same
+                        // position, so nothing is skipped and nothing is re-run
+                        if (slot.materialize.armed && !slot.materialize.done &&
+                                slot.materialize.task_id == slot.task->id &&
+                                slot.prompt.n_tokens() >= slot.materialize.prefix_tokens) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -5261,6 +5521,39 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+        }
+
+        // a planned prefix capture is exported here: the target batch has been
+        // decoded and, when speculative decoding is on, the draft context has just
+        // been brought up to the same positions. this is the point in the request
+        // where both contexts are known to describe the same prefix
+        //
+        // only ordinary mid-prompt batches reach this code: a batch that finished
+        // the prompt switches the slot to DONE_PROMPT, which runs its own
+        // input-boundary capture
+        for (auto & slot : slots) {
+            if (!slot.materialize.armed || slot.materialize.done) {
+                continue;
+            }
+
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                // the prompt reached its end in this batch, so the state has moved
+                // past the planned boundary. exporting now would produce a snapshot
+                // of a longer prefix, so the plan is dropped instead
+                if (slot.state == SLOT_STATE_DONE_PROMPT &&
+                        slot.materialize.prefix_tokens <= slot.prompt.n_tokens()) {
+                    slot.materialize.done = true;
+                    counters_materialize.skipped++;
+
+                    if (params_base.cache_stats) {
+                        SLT_INF(slot, "cache_stats: materialize = skipped (prompt ended past %zu)\n",
+                                slot.materialize.prefix_tokens);
+                    }
+                }
+                continue;
+            }
+
+            materialize_prefix(slot);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

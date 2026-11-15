@@ -1653,3 +1653,152 @@ limit = 800 MiB
   - **"同名快照先失效、后回滚失败"的时序**：需要同一路径先 `notify_invalidated` 再在同一事务内回滚失败，构造依赖前者。规划 §4.3 要求的"最新事件不把 quarantined 路径复活"由提交资格判定在源头上保证（该路径根本不会进入 `notify_committed`），未单独构造时序用例
   - **测试用删除故障注入钩子**：规划 §4.4 建议增加"仅测试用的确定性删除故障注入"。本轮未实现——它需要引入测试专用代码路径（编译期开关或运行期钩子），而现有单测已能在纯元数据层覆盖全部五个事务结局、端到端也已用真实句柄占用覆盖 TTL/LRU 与配额复核两条路径。是否值得为此在生产源码中留一个钩子，建议在下一轮单独判断，本轮不擅自扩大改动面
   - 真实媒体 prompt、多 slot、Linux、中断路径：本轮范围外
+
+# 2026-11-16 01-05 - Change Record（test1_3：公共前缀主动物化 + 前置整理）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-15 23-38 - test1_3` 实施**公共前缀主动捕获与独立 KV 快照持久化**。基线 HEAD `147001c`，上一轮修复提交 `1ab6528`。本轮包含两部分：规划 §2 要求的源码一致性整理，以及主体功能。
+
+### 一、前置整理（规划 §2.2 要求，与功能改动分开记录）
+
+- **消除重复的提交资格判定**：`worker()` 末尾原先直接用 `is_reusable_entry(cur)`，而 `disk_cache_commit_eligible()` 只被单测调用。现改为先构造 `commit_view` 并调用 `disk_cache_commit_eligible()` 作唯一判定，命中后再取条目记录——运行时代码与单测使用同一函数。
+- **修复日志换行**：`stays accounted for but is not usable, not publishing a persisted reference@NL@` 中残留的字面量 `@NL@` 已替换为真正的换行符。这是上一轮我改用按行替换时漏掉的一处，`grep -c "@NL@"` 现为 0。
+
+### 二、主体功能
+
+链路：多请求共享前缀 A → 目录标记 `eligible` → 后续请求 prefill 经过 A 结束时精确停批 → 两处上下文同步后导出完整状态 → 磁盘层正常写队列落盘 → 真实提交后目录登记 `persisted` → 重启后按 `source=disk` 复用。
+
+## 修改文件
+
+### tools/server/server-prefix-materialize.h / .cpp（新增）
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/server-prefix-materialize.h、tools/server/server-prefix-materialize.cpp
+- 修改位置：新模块全文
+- 具体变更：
+  - `disk_cache_materialize_candidate { prefix_tokens, observations, eligible, persisted }`：候选的只读视图
+  - `disk_cache_materialize_request`：请求侧已知信息（是否启用、磁盘层最小 token、输入长度、`n_past`、媒体块区间）
+  - `disk_cache_materialize_skip`：八种拒绝原因，各有可打印名
+  - `disk_cache_plan_materialize()`：按固定次序筛选——必须 `eligible`、必须尚无 `persisted`、必须达到**磁盘层**最小 token（与目录的观察阈值相互独立）、必须落在本次输入内、结尾不得位于媒体块内部、不得已被 KV 越过；通过者取**最长**一个
+- 修改原因：规划 §3.2 的候选选择规则需要独立可测；该模块不取锁、不碰文件
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-context.cpp
+- 修改后路径：同名文件
+- 修改位置：`server_slot::prefix_materialize_plan`（新增成员）、`materialize_counters`（新增）、`plan_prefix_materialize()`（新增）、`materialize_prefix()`（新增）、主 prefill 填充循环、`post_decode()`、`get_available_slot()`、metrics 采集
+- 具体变更：
+  - **slot 计划**：`{ armed, prefix_tokens, task_id, done }`，在 `get_available_slot()` 中随 `cache_restore` 一并重置。`task_id` 防止 slot 复用后执行旧计划
+  - **计划**：`plan_prefix_materialize(slot, n_past)` 在 `n_past` 落定后调用，查询只读 `candidates()`（不增加 `observe` 次数），按上述规则定出 K，写入 slot 计划
+  - **批次截断**：填充循环开头若计划已 armed 且 `slot.prompt.n_tokens() >= K` 则 `break`，使本批恰好结束于 K；下一轮从同一位置继续
+  - **`n_past == K` 的直接捕获**：KV 恰好停在边界时不再 arm 截断，而是立即捕获。原因见下"本轮自查发现的缺陷"
+  - **捕获**：`post_decode()` 中，`llama_process()` 与 `common_speculative_process()` 都返回之后、且 slot 仍为 `PROCESSING_PROMPT` 时调用 `materialize_prefix()`。该校验 `pos_max + 1 == K`（等于才导出，越过则记 skipped）、`slot.prompt.tokens.size() >= K`、草稿上下文同样到达 K；checkpoint 只保留 `pos_max <= K`
+  - **不误判未到的批次**：`pos_max + 1 < K` 时直接 return 等下一批，不记 skipped、不置 done
+  - **指标**：`counters_materialize { scheduled, exported, skipped }`，在 metrics 任务中采集为 `res->n_materialize_*`
+- 修改原因：规划 §3.2、§3.3、§5.2
+
+### tools/server/server-task.h / .cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h、tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h、server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`server_prompt_cache::materialize()`（新增）、`server_task_result_metrics` 新字段、`counter_info` 指标注册、`worker()` 提交通知
+- 具体变更：
+  - **`materialize()`**：按规划 §3.4 增加独立于 RAM 驻留策略的导出路径。先 `get_size_ext` 取两处上下文大小，分配缓冲，`get_data_ext` 写入并**校验写入字节数与预估一致**（不一致即失败，不产生不完整对象），产出 `server_prompt_cache_state` 交给调用方入磁盘队列
+  - 提交资格判定统一到 `disk_cache_commit_eligible()`（见前置整理）
+  - 新增 `cache_prefix_materialize_scheduled_total` / `_exported_total` / `_skipped_total`
+- 修改原因：规划 §3.4 明确要求绕过普通 RAM 长前缀去重，规划 §6 要求四层统计互不冒充
+
+### common/common.h、common/arg.cpp
+
+- 修改类型：修改
+- 修改前路径：common/common.h、common/arg.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（common 相关在备份目录）
+- 修改后路径：同名文件
+- 修改位置：`cache_prefix_materialize` 字段、`--cache-prefix-materialize` 参数
+- 具体变更：新增默认 **false** 的布尔参数，注册 `--cache-prefix-materialize` / `--no-cache-prefix-materialize`，带 `LLAMA_ARG_CACHE_PREFIX_MATERIALIZE` 环境变量
+- 修改原因：规划 §3.2 要求默认关闭；§4 要求可在关闭态完全不影响原路径
+
+### tools/server/tests/unit/test_prefix_materialize.cpp（新增）
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/tests/unit/test_prefix_materialize.cpp
+- 修改位置：新文件，15 组检查
+- 具体变更：覆盖关闭态、无候选、最长者胜出、磁盘最小长度与目录阈值相互独立、短候选不阻塞长候选、已 persisted 跳过、`observed` 不算候选、`eligible` 优先于 `observed`、超出输入长度、媒体块边界三点（块内拒绝 / 恰在块起点 / 恰在块终点）、已越过边界、`n_past == K` 允许、零长度忽略、共享前缀真实场景、拒绝原因名互不相同
+- 修改原因：规划 §4、§8.2
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：指标表、行为边界；projectSummary §3.1 不变量表
+- 具体变更：补三个 `cache_prefix_materialize_*` 指标；写明主动物化、RAM 策略不阻挡独立磁盘对象、四层计数不互冒充
+- 修改原因：规划 §4、§8.5
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real），本轮共 8 次
+- 检查结果：通过，`0 FAILED`。中途两次为环境原因（残留 `llama-server.exe` 占用 `llama-server-impl.dll`，`LNK1104`），停进程后重建成功。`--version` 为 `0.9.0-dev (build 27, commit 147001c)`
+
+- 已执行检查：四套独立单测
+- 检查结果：通过。`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`。候选择单测首轮曾有两处失败（`observed` 候选被误分类为 `already_persisted`，原因是遍历中 `saw_persisted_only` 对 `observed` 条目未置位），已核对语义后修正分类逻辑
+
+- 已执行检查：**端到端核心链路**（`test-run/logs/fix7-m4.log` / `fix7-m5.log`，`--cache-prefix-materialize`，`--cache-ram 512`，`--cache-disk-min-tokens 256`，单 slot，三请求共享 3000 字前缀后各接不同后缀）
+- 检查结果：通过，完整链路贯通：
+
+  ```
+  plan_prefix_: materialize = skipped (no_candidates), n_past = 1476         # 第 2 请求
+  plan_prefix_: materialize = scheduled, prefix = 2102 tokens, n_past = 1476  # 第 3 请求
+  materialize_: materialize = exported, prefix = 2102 tokens
+  worker: disk cache: stored 2102 tokens, 538.51 MiB in 512.51 ms
+  metrics: scheduled 1 / exported 1 / cache_disk_entries 1 / persisted_refs 1
+  磁盘文件: pc-bf495e2785d51ca5.bin, 564668394 B
+  ```
+
+  这是**绕过 RAM 容量准入**的独立对象：状态 538.51 MiB > `--cache-ram 512`，旧路径下 `alloc()` 会直接返回 nullptr（首次尝试的日志为 `prompt state size 538.501 MiB exceeds cache size limit 512.000 MiB, skipping` + `export_failed`）
+
+- 已执行检查：**重启后按磁盘真实恢复**（`test-run/logs/fix7-m4r.log`，完全相同模型/上下文配置重启）
+- 检查结果：通过。
+
+  ```
+  cache_scan_end: 1 entries (manifest 1, stale index records 0), 538.51 MiB
+  prefix discovery: ... 1 snapshot(s) registered
+  cache_stats: prompt = 2540, reused_slot = 0, reused_ram = 0, reused_disk = 1478, prefill = 1062,
+               source = disk, candidate_lcp = 2101, restored = 2101, entry_tokens = 2102,
+               read_bytes = 564668394, restore_us = 329856
+  ```
+
+  `read_bytes` 与文件大小 564668394 B 精确一致；`source = disk` 且 `reused_disk = 1478 > 0`，是真实复用而非目录候选数。恒等式 `0 + 0 + 1478 + 1062 = 2540` 成立
+
+- 已执行检查：**开启/关闭态输出一致性**（`fix7-off.log` vs `fix7-m5.log`，同一组 4 个请求）
+- 检查结果：通过。逐字节一致：`f283d36a836120c4`、`9bceec30889f8bda`、`ad661337d3aa8896`、`b9febb26949711a2`。关闭态 `materialize_scheduled/exported/skipped` 全为 0、`cache_disk_entries 0`
+
+- 已执行检查：**关闭态标准回归**（`fix7-reg.log`，未加 `--cache-prefix-materialize`，`--cache-prefix-discovery` + `--cache-boundary-capture both`）
+- 检查结果：通过。`1385/0`、`4/1381`、`215/1381` 与上一轮逐项相同，输出 sha 相同（`fd7c5bda…`、`03e0e517…`）；三个 materialize 指标均为 0，`cache_prefix_persisted_refs 1`——默认关闭时原路径完全不变
+
+- 已执行检查：**本轮自查发现的缺陷与修正**
+- 检查结果：**发现并修复了我自己实现中的一个真实缺陷**。`n_past == K` 时计划会 arm 批次截断，但填充循环第一轮即满足 `n_tokens >= K` 而 `break`，本批一个 token 都不加。空批次会使 `decode()` 打印 `no tokens to decode`，连续超过 3 次触发 `GGML_ABORT`——即请求会直接中止服务。修正为：`n_past == K` 时不 arm 截断，而是立即从当前状态捕获（这正是规划 §3.2 第 5 条"恰好停在捕获边界即可直接捕获"的要求）。修正后 `fix7-m5.log` 中第 5 个请求走该分支成功导出：`materialize = scheduled at n_past, prefix = 2101 tokens` → `exported`，输出与关闭态一致
+- 该缺陷属于我在实现中新引入、并在验证中自查发现，不是原代码问题
+
+- 已执行检查：恒等式抽查（`fix7-m5.log` 全程）
+- 检查结果：通过。`2468 = 1476 + 0 + 0 + 992`、`2506 = 1476 + 0 + 0 + 1030`、`2540 = 1478 + 0 + 0 + 1062`、`2512 = 2101 + 0 + 0 + 411`，全部成立
+
+- 已执行检查：清理
+- 检查结果：通过。测试缓存目录、临时编译脚本与可执行文件、`__pycache__`、根目录 `.obj` 均已删除；`test-run/` 为 1.2 MB。保留 `test-run/pmat.py`（共享前缀+不同后缀的探测脚本，与既有 `probe.py` 同类，属于复现脚本）
+
+- 未执行的检查及原因：
+  - **媒体输入的端到端**：测试机为纯文本，媒体分支（结尾落在媒体块内 → `skipped (media)`）只有单测覆盖。规划 §3.2 第 4 条要求"遇到 mtmd 嵌入块记录 skipped 并保留原推理路径"——代码路径已实现，但**未在真实多模态输入下运行过**
+  - **`--cache-prefix-materialize` 在未开启 `--cache-prefix-discovery` 或未开启磁盘层时的行为**：规划 §3.2 要求"清晰拒绝或说明该开关无效"。当前实现是 `plan_prefix_materialize()` 开头直接 return（因为 `!prefix_index || !prompt_cache->disk`），**不会给出任何显式提示**。这一点我没有实现规划要求的"清晰拒绝"，只做到了"不生效"
+  - **context shift / 任务取消 / decode 重试下的重复捕获**：捕获点已限定在 `PROCESSING_PROMPT` 且校验 `pos_max + 1 == K`，但规划 §8.3 要求逐一验证的这些异常时序未单独构造
+  - **checkpoint 超出 K 的端到端**：单测覆盖了截断逻辑，运行中未构造带 checkpoint 的模型（当前为纯文本 Qwen，`do_checkpoint` 路径未实测）
+  - **配额淘汰与短快照替代对物化对象的交互**：本轮未构造。物化对象走的是同一个 `store()` 与配额事务，前几轮已验证的准入/替代/隔离语义对它同样适用，但未针对该对象单独回归

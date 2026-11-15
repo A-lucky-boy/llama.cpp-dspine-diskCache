@@ -1797,6 +1797,18 @@ std::string server_task_result_metrics::to_metrics() {
             "cache_prefix_rejected_total",
             "Observations refused because nothing could be evicted",
             (double) cache_prefix.n_rejected
+        }, {
+            "cache_prefix_materialize_scheduled_total",
+            "Prefix captures planned; not yet a file on disk",
+            (double) n_materialize_scheduled
+        }, {
+            "cache_prefix_materialize_exported_total",
+            "Prefix captures whose complete state was exported",
+            (double) n_materialize_exported
+        }, {
+            "cache_prefix_materialize_skipped_total",
+            "Prefix captures that produced no state (refused, past the boundary, export failed)",
+            (double) n_materialize_skipped
         },
     };
 
@@ -4500,25 +4512,30 @@ void server_disk_cache::worker() {
                 commit_view.reserve(entries.size());
 
                 for (const auto & cur : entries) {
-                    if (cur.path != path) {
-                        continue;
+                    if (cur.path == path) {
+                        commit_view.push_back({ cur.path, cur.quarantined, !cur.tokens.empty() });
                     }
+                }
 
-                    commit_view.push_back({ cur.path, cur.quarantined, !cur.tokens.empty() });
-
-                    if (is_reusable_entry(cur)) {
-                        committed      = cur;
-                        have_committed = true;
+                // one predicate, shared with the unit tests: present, not
+                // quarantined, non-empty. the record to publish is this very entry
+                if (disk_cache_commit_eligible(commit_view, path)) {
+                    for (const auto & cur : entries) {
+                        if (cur.path == path && is_reusable_entry(cur)) {
+                            committed      = cur;
+                            have_committed = true;
+                            break;
+                        }
                     }
+                } else if (!commit_view.empty()) {
+                    // the path is here, but only as accounted bytes: state it
+                    // instead of silently looking like a committed snapshot
+                    SRV_WRN("disk cache: '%s' stays accounted for but is not usable, not publishing a persisted reference\n",
+                            path.c_str());
                 }
 
                 if (have_committed) {
                     notify_committed(committed);
-                } else if (!commit_view.empty()) {
-                    // the path is here, but only as accounted bytes: state it
-                    // instead of silently looking like a committed snapshot
-                    SRV_WRN("disk cache: '%s' stays accounted for but is not usable, not publishing a persisted reference@NL@",
-                            path.c_str());
                 }
             }
         }
@@ -4583,6 +4600,54 @@ void server_prompt_cache::flush_to_disk() {
     if (n_flushed > 0) {
         SRV_INF("disk cache: mirrored %zu prompt(s) from the RAM cache\n", n_flushed);
     }
+}
+
+bool server_prompt_cache::materialize(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+        int32_t id_slot, server_prompt_cache_state & out) {
+    // not gated on this tier's own size policy: a prefix may exceed the RAM
+    // budget and still be worth its own disk object. the disk tier owns the
+    // decision that matters here - identity, dedup, read-cost and quota
+    if (!disk || !ctx_tgt) {
+        return false;
+    }
+
+    if (prompt.tokens.size() == 0) {
+        return false;
+    }
+
+    const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+    out.prompt.tokens      = prompt.tokens.clone();
+    out.prompt.checkpoints = prompt.checkpoints;
+
+    out.data.main = std::make_shared<common_state_data>();
+    out.data.drft = std::make_shared<common_state_data>();
+
+    try {
+        out.data.main->resize(size_tgt);
+        out.data.drft->resize(size_dft);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("disk cache: cannot allocate %.2f MiB for a prefix snapshot: %s\n",
+                (size_tgt + size_dft)/(1024.0*1024.0), e.what());
+        return false;
+    }
+
+    // sizes are taken first and the written counts are checked against them: a
+    // short write would produce a file whose claimed token range has no complete
+    // state behind it
+    const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt,
+            out.data.main->data(), out.data.main->size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft,
+            out.data.drft->data(), out.data.drft->size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+    if (n_tgt != size_tgt || n_dft != size_dft) {
+        SRV_ERR("disk cache: incomplete prefix state (tgt %zu/%zu, dft %zu/%zu)\n",
+                n_tgt, size_tgt, n_dft, size_dft);
+        return false;
+    }
+
+    return true;
 }
 
 void server_prompt_cache::mirror_latest(size_t budget) {
