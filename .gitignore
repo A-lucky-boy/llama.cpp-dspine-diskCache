@@ -171,7 +171,18 @@ AGENTS.local.md
 # otherwise hide them
 !/build-cuda-shared.bat
 !/experiments/*.bat
+!/test-run/*.bat
 
 # Local pre-change backups (see the project workflow rules)
 /.backupChange/
+
+# Test harness scratch space. The scripts themselves are kept (they are the
+# reproduction harness for the cache work), but everything the runs produce is
+# local: raw logs (*.log is already ignored above), and the generated
+# continuations, which are derived from the local test corpus and must not be
+# published.
+/test-run/logs/out-*.txt
+/test-run/cache-*/
+/test-run/*.exe
+/test-run/hold*.py
 
