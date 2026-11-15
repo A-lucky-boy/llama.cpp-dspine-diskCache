@@ -21,11 +21,14 @@ The harness drives one long text corpus so that prompts of different lengths
 share a real prefix. It is **not** in the repository:
 
 ```bat
+set MODEL_DIR=D:\path\to\gguf\directory
 set LLAMA_TEST_CORPUS=D:\path\to\a\large\utf8\text.md
 set LLAMA_TEST_PORT=18090
 ```
 
-Model paths are passed on the server command line, not stored here.
+`MODEL_DIR` must hold the target and draft gguf files the batch scripts reference.
+No machine-specific path is hard-coded: `ROOT` is derived from the script
+location and `MODEL_DIR` defaults to `<repo>\models`.
 
 ## Scripts
 
