@@ -617,6 +617,16 @@ struct server_task_result_error : server_task_result {
     virtual json to_json() override;
 };
 
+// what actually happened to an entry file. only `removed` and `already_missing`
+// mean the bytes are gone, so only those may reclaim quota
+enum class disk_cache_remove_status {
+    removed,
+    already_missing,
+    failed,   // sharing violation, permissions, ... - the file is still there
+};
+
+const char * disk_cache_remove_status_name(disk_cache_remove_status status);
+
 // why a lookup did not reuse any tokens. the names go into the --cache-stats
 // log line and the /metrics label set, so only append new values
 enum class cache_reject_reason : uint8_t {
@@ -666,7 +676,10 @@ struct disk_cache_counters {
     uint64_t n_enqueue_queued       = 0;
     uint64_t n_enqueue_dedup        = 0; // already stored, already queued or covered by a longer entry
     uint64_t n_enqueue_rejected     = 0; // over the size limit or the queue budget
+    uint64_t n_remove_failed        = 0; // files that could not be deleted, cumulative
+    uint64_t n_quarantined          = 0; // entries currently excluded from lookups
     uint64_t n_entries              = 0;
+    uint64_t n_bytes                = 0; // accounted disk usage (total_size)
     uint64_t n_queue_entries        = 0;
     uint64_t n_queue_bytes          = 0;
 };
@@ -819,6 +832,11 @@ struct server_disk_cache_entry {
     // value with the one in the file header and re-computes the CRC over the
     // bytes it actually read
     uint64_t     packed_crc = 0;
+
+    // a file that could not be deleted (sharing violation, permissions) stays on
+    // disk and keeps occupying its bytes, so its quota is not reclaimed; it is
+    // excluded from lookups instead of being reported as freed
+    bool         quarantined = false;
 };
 
 // result of reading one entry file. the caller must not write any KV state into
@@ -897,11 +915,15 @@ struct server_disk_cache {
     // snapshots that already exist on disk without touching the cache internals
     std::vector<server_disk_cache_entry> entries_snapshot() const;
 
-    // optional hooks for the prefix directory. `on_entry_committed` runs after a
-    // write has been committed (file in place, manifest updated); both may run
-    // on the writer thread and must not touch disk-cache state
-    std::function<void(const server_disk_cache_entry &)> on_entry_committed;
-    std::function<void(const std::string &)>            on_entry_invalidated;
+    // optional hooks for the prefix directory. both are delivered **while the
+    // cache lock is held**, in the same critical section that changed `entries`
+    // and `total_size`, which makes the commit/invalidate order the physical
+    // order - there is no second, asynchronous delivery path. the prefix index
+    // never calls back into the cache, so there is no lock inversion.
+    // the second argument is a monotone event epoch: a commit older than a
+    // withdrawal of the same path is rejected by the index
+    std::function<void(const server_disk_cache_entry &, uint64_t)> on_entry_committed;
+    std::function<void(const std::string &, uint64_t)>            on_entry_invalidated;
 
     // counters written from the lookup path and the writer thread; the sizes of
     // `entries` and `queue` are sampled separately under the lock
@@ -934,6 +956,9 @@ struct server_disk_cache {
     std::deque<server_disk_cache_pending> queue;
     size_t                  queue_bytes = 0;
 
+    // monotone sequence of entry state changes, handed to the prefix directory
+    uint64_t                event_epoch = 0;
+
     // hashes of entries that are queued or being written, so store() and
     // mirror() do not enqueue the same prompt twice
     std::unordered_set<uint64_t> inflight;
@@ -941,6 +966,16 @@ struct server_disk_cache {
 private:
     // delete a broken entry (file + index + manifest); must not be called with mtx held
     void drop_entry(const std::string & path);
+
+    // the single deletion primitive: reports whether the bytes are really gone.
+    // it does not touch `entries`, `total_size` or the manifest
+    disk_cache_remove_status remove_file(const std::string & path) const;
+    // keep a file that could not be deleted out of the lookup path without
+    // pretending its bytes were freed; mtx must be held
+    void quarantine_entry(server_disk_cache_entry & e, const char * why);
+    // notify the prefix directory; mtx must be held
+    void notify_committed(const server_disk_cache_entry & e);
+    void notify_invalidated(const std::string & path);
 
     bool write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out);
     // read, validate and decode one entry file. every checksum and the

@@ -288,6 +288,9 @@ Disabled by default (`--cache-prefix-discovery`). When enabled it keeps a **read
 | `llamacpp:cache_disk_restore_seconds_total` | read + restore time |
 | `llamacpp:cache_disk_entries` / `_queue_entries` / `_queue_bytes` | entries and pending queue |
 | `llamacpp:cache_disk_manifest_fallback_total` | starts that could not trust the index and rescanned |
+| `llamacpp:cache_disk_bytes` | accounted disk usage, **including** entries that could not be deleted |
+| `llamacpp:cache_disk_quarantined` | entries kept on disk after a failed deletion, excluded from lookups |
+| `llamacpp:cache_disk_remove_failed_total` | failed deletion attempts |
 | `llamacpp:cache_prefix_requests_total` | requests published to the directory |
 | `llamacpp:cache_prefix_candidates_total` | candidates reported (cumulative) |
 | `llamacpp:cache_prefix_observed_total` / `_eligible_total` | cumulative transitions into `observed` / `eligible` |
@@ -302,6 +305,7 @@ Do not mix the three quantities: `candidate_lcp` is the prefix a candidate share
 
 - The CUDA backend only supports layer split (`-sm layer`); `-sm row` is rejected at model load.
 - With an active non-aLoRA adapter the shared cache does not write for that slot; the slot's own incremental continuation still works.
+- A failed deletion (antivirus, unreleased handle) never reclaims quota: the entry is quarantined - still counted in `cache_disk_bytes`, still listed in `entries`, no longer offered to a lookup or to eviction; a later TTL/quota pass retries once the handle is gone.
 - The prefix directory targets **a single user and a single instance**: no tenant isolation, no cross-user quota, no cross-user sharing.
 - The directory observes the input boundary only; a longer snapshot that covers a prefix does not mark it `persisted` (conservative), although the disk LCP lookup may still serve it.
 - Packed metadata has its own CRC since v8: the writer stores it in the entry header, the reader verifies it before **any** state is written, and the startup index record is bound to it. When the index cannot be trusted the reader falls back to per-file header validation instead of skipping the checks.

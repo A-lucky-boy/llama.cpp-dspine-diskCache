@@ -49,6 +49,20 @@
 - 磁盘条目只在**写入完成且清单提交后**才对读者与前缀目录可见。
 - 前缀目录只提供元数据，不参与候选选择；`load()` 仍是唯一的恢复入口。
 
+### 3.1 生命周期与资源不变量
+
+| 不变量 | 实现方式 |
+|---|---|
+| 条目删除与记账只认文件系统事实 | 唯一删除原语 `remove_file()` 返回 `removed / already_missing / failed`；只有前两种才从 `total_size` 扣除 |
+| 删除失败不得继续当可恢复条目 | 失败条目标记为 `quarantined`：仍计入配额、仍留在 `entries`，但 `load()` 的候选选择与 `enforce_limit()` 的淘汰对象都跳过它；前缀目录同步撤销其物理引用 |
+| 配额不会因失败而无界失真 | 隔离条目按实际字节继续计入 `cache_disk_bytes`；句柄释放后下一次 sweep 重试并真实扣除 |
+| 淘汰循环必然终止 | `evict_one()` 仅在真正移除节点时返回 true；`enforce_limit()` 跳过已隔离条目，无可删对象时记录一次并退出 |
+| 提交/失效通知顺序 = 物理顺序 | 前缀目录回调**在磁盘锁内、与 `entries`/`total_size` 变更同一临界区**同步交付，不使用第二套异步通道；索引从不回调磁盘层，因此无锁反转 |
+| 迟到的提交不能复活已删除的快照 | 磁盘层每次状态变更递增单调 `event_epoch`；索引为已撤销路径保留 tombstone，拒绝 epoch 不更新的提交 |
+| 索引输入必须自洽 | media 三元组长度、区间、重叠、空 ID 任一不合法即整条观察被拒（`invalid_media`），不降级为"仅 token"路径；媒体身份 = 块 ID + token 数 |
+| 只读查询不改变索引 | `candidates()` 只为已有身份解析编号，未知身份映射到不可匹配的哨兵值，不增长驻留表 |
+| 索引内存有界且可回收 | `approx_bytes()` 覆盖节点、媒体表、快照表、tombstone、观察去重表；节点数与字节双约束，只淘汰无引用叶子 |
+
 ---
 
 ## 4. 缓存格式与完整性
@@ -83,6 +97,8 @@
 | `--cache-prefix-observations N` | 2 | 目录 `eligible` 观察次数门槛 |
 | `--cache-prefix-max-candidates N` | 256 | 目录节点上限 |
 | `--cache-prefix-max-index-mib N` | 64 | 目录内存预算 |
+
+磁盘层的删除与隔离不新增开关：它是既有语义的修正。相关观测指标为 `cache_disk_bytes`（账面占用，含不可删除条目）、`cache_disk_quarantined`、`cache_disk_remove_failed_total`。
 
 ---
 
@@ -124,6 +140,8 @@ candidate_lcp >= restored >= reused       # 依次被闸门削减
 5. 写入抑制 `DISK_CACHE_MAX_PREFIX_LAG_TOKENS=4096` 只挡小增量；超过仍会重写整条条目。
 6. 前缀目录只观察输入边界；覆盖生成尾部的快照不把更短前缀标为 `persisted`（保守语义）。
 7. 未部署到生产目录；`output/` 为当前构建产物。
+8. 删除失败是常态而非异常：Windows 上杀软扫描或未释放句柄都会让 `fs::remove` 失败。此时条目被隔离、配额照实保留、引用撤销；句柄释放后由下一次 sweep/TTL 重试回收，不会静默少报占用。
+9. 前缀目录不持久化：重启后由已校验磁盘条目重建引用（epoch 从 0 起算），不写额外索引文件；tombstone 只作用于进程生命周期。
 
 ---
 

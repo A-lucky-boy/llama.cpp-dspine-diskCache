@@ -12,9 +12,19 @@
 // chunk differs at some position therefore stops matching exactly at the first
 // token of that chunk, which is the boundary the planning document requires.
 //
+// Every input is validated before use: a media array whose three parts disagree,
+// or a chunk that is empty, out of range or overlapping its predecessor, makes
+// the whole observation invalid. There is no "token path only" fallback - that
+// would let two different images share a prefix.
+//
+// Read-only queries resolve media identities without inserting them; an identity
+// that was never observed maps to k_media_unknown, which no stored unit can hold.
+//
 // `nodes` only grows while entries are alive: dead entries are skipped and
 // compacted periodically. Every entry point takes `mtx`; no method touches a
-// llama_context, a slot or a disk file.
+// llama_context, a slot or a disk file, and none calls back into the disk tier -
+// which is why the disk tier may deliver its notifications while holding its own
+// lock without a lock inversion.
 //
 
 const char * prefix_state_name(prefix_state state) {
@@ -28,11 +38,32 @@ const char * prefix_state_name(prefix_state state) {
     return "unknown";
 }
 
+const char * prefix_input_status_name(prefix_input_status status) {
+    switch (status) {
+        case prefix_input_status::ok:            return "ok";
+        case prefix_input_status::invalid_media: return "invalid_media";
+        case prefix_input_status::capacity:      return "capacity";
+    }
+
+    return "unknown";
+}
+
 server_prefix_index::server_prefix_index(const std::string & config_sig, const prefix_index_options & opt)
     : config_sig(config_sig), opt(opt) {
     node root;
     root.parent = -1;
     nodes.push_back(std::move(root));
+}
+
+std::string server_prefix_index::media_key(const std::string & id, size_t token_count) {
+    // '#' cannot appear in the placeholder ids produced by the mtmd path, and the
+    // length is appended so that (id, count) pairs stay distinct
+    return id + "#" + std::to_string(token_count);
+}
+
+uint32_t server_prefix_index::lookup_media(const std::string & id) const {
+    const auto it = media_intern.find(id);
+    return it == media_intern.end() ? 0 : it->second;
 }
 
 uint32_t server_prefix_index::intern_media(const std::string & id) const {
@@ -48,36 +79,58 @@ uint32_t server_prefix_index::intern_media(const std::string & id) const {
     return ref;
 }
 
-std::vector<server_prefix_index::unit> server_prefix_index::to_units(const llama_tokens & tokens,
+bool server_prefix_index::to_units(const llama_tokens & tokens,
         const std::vector<uint32_t> & media_indices,
         const std::vector<uint32_t> & media_token_counts,
         const std::vector<std::string> & media_ids,
+        bool allow_intern,
+        std::vector<unit> & seq,
         std::vector<size_t> & media_starts) const {
-    std::vector<unit> seq(tokens.size(), unit(0, 0));
+    seq.assign(tokens.size(), unit(0, 0));
+    media_starts.clear();
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         seq[i].first = tokens[i];
     }
 
-    media_starts.clear();
-
+    // fail closed: the three media arrays must describe the same chunks
     if (media_indices.size() != media_token_counts.size() || media_indices.size() != media_ids.size()) {
-        return seq; // inconsistent metadata: identity is unknown, token path only
+        return false;
     }
+
+    size_t previous_end = 0;
 
     for (size_t i = 0; i < media_indices.size(); ++i) {
         const size_t start = media_indices[i];
         const size_t count = media_token_counts[i];
 
-        if (count == 0 || start >= tokens.size() || count > tokens.size() - start || media_ids[i].empty()) {
-            continue;
+        // empty id, zero length, out of range, or overlapping the previous chunk
+        if (media_ids[i].empty() || count == 0 || start < previous_end ||
+                start >= tokens.size() || count > tokens.size() - start) {
+            return false;
         }
 
-        seq[start].second = intern_media(media_ids[i]);
+        // the identity is the chunk id *and* its token count: the same id with a
+        // different length occupies a different KV range, so it must not share
+        const std::string key = media_key(media_ids[i], count);
+
+        uint32_t ref = 0;
+
+        if (allow_intern) {
+            ref = intern_media(key);
+        } else {
+            ref = lookup_media(key);
+            if (ref == 0) {
+                ref = k_media_unknown;
+            }
+        }
+
+        seq[start].second = ref;
         media_starts.push_back(start);
+        previous_end = start + count;
     }
 
-    return seq;
+    return true;
 }
 
 int32_t server_prefix_index::walk(const std::vector<unit> & seq, std::vector<int32_t> & path,
@@ -228,6 +281,12 @@ void server_prefix_index::insert(const std::vector<unit> & seq, bool count_obser
     }
 }
 
+prefix_state server_prefix_index::state_for(size_t prefix_tokens, uint32_t observations) const {
+    return (prefix_tokens >= opt.min_tokens && observations >= opt.min_observations)
+        ? prefix_state::eligible
+        : prefix_state::observed;
+}
+
 void server_prefix_index::refresh_state(int32_t idx) {
     node & n = nodes[idx];
 
@@ -239,9 +298,7 @@ void server_prefix_index::refresh_state(int32_t idx) {
         // the prefix is still known, but the snapshot it pointed at is gone
         next = prefix_state::unavailable;
     } else {
-        next = (n.tokens_end >= opt.min_tokens && n.observations >= opt.min_observations)
-            ? prefix_state::eligible
-            : prefix_state::observed;
+        next = state_for(n.tokens_end, n.observations);
     }
 
     // cumulative transition counter: a node that stays eligible is not counted
@@ -252,6 +309,14 @@ void server_prefix_index::refresh_state(int32_t idx) {
     }
 
     n.state = next;
+}
+
+size_t server_prefix_index::alive_nodes() const {
+    size_t res = 0;
+    for (const auto & n : nodes) {
+        res += n.alive ? 1 : 0;
+    }
+    return res;
 }
 
 size_t server_prefix_index::approx_bytes() const {
@@ -270,11 +335,29 @@ size_t server_prefix_index::approx_bytes() const {
     for (const auto & m : media_names) {
         res += sizeof(std::string) + m.size();
     }
+    for (const auto & kv : media_intern) {
+        res += sizeof(kv) + kv.first.size() + kv.first.capacity();
+    }
+
+    for (const auto & kv : snapshots) {
+        res += sizeof(kv) + kv.first.size();
+    }
+
+    for (const auto & kv : tombstones) {
+        res += sizeof(kv) + kv.first.size();
+    }
+
+    res += seen_requests.size() * (sizeof(uint64_t) + 2 * sizeof(void *));
+    res += seen_order.capacity() * sizeof(uint64_t);
 
     return res;
 }
 
-void server_prefix_index::evict_one() {
+bool server_prefix_index::over_limits() const {
+    return alive_nodes() > opt.max_candidates || approx_bytes() > opt.max_index_bytes;
+}
+
+bool server_prefix_index::evict_one() {
     int32_t best = -1;
 
     for (size_t i = 1; i < nodes.size(); ++i) {
@@ -290,8 +373,7 @@ void server_prefix_index::evict_one() {
     }
 
     if (best < 0) {
-        counters.n_rejected++;
-        return;
+        return false; // nothing droppable; the caller counts the refusal once
     }
 
     if (nodes[best].parent >= 0) {
@@ -303,23 +385,19 @@ void server_prefix_index::evict_one() {
     nodes[best].seg.shrink_to_fit();
     nodes[best].children.clear();
     counters.n_evicted++;
+
+    return true;
 }
 
 void server_prefix_index::note_capacity() {
-    for (;;) {
-        size_t alive = 0;
-        for (const auto & n : nodes) {
-            alive += n.alive ? 1 : 0;
-        }
-
-        if (alive <= opt.max_candidates && approx_bytes() <= opt.max_index_bytes) {
+    // terminates: evict_one() only reports success when a node was really
+    // removed, so a directory whose remaining leaves are all protected by a
+    // physical reference stops after a single refusal instead of counting
+    // "rejected" as progress and looping forever
+    while (over_limits()) {
+        if (!evict_one()) {
+            counters.n_rejected++;
             return;
-        }
-
-        const uint64_t before = counters.n_evicted + counters.n_rejected;
-        evict_one();
-        if (counters.n_evicted + counters.n_rejected == before) {
-            return; // everything left is either the root or a persisted node
         }
     }
 }
@@ -360,19 +438,51 @@ void server_prefix_index::compact() {
     nodes = std::move(kept);
 }
 
+void server_prefix_index::remember_tombstone(const std::string & path, uint64_t epoch) {
+    const auto it = tombstones.find(path);
+    if (it != tombstones.end()) {
+        it->second = std::max(it->second, epoch);
+        return;
+    }
+
+    if (tombstone_order.size() >= k_tombstones_max) {
+        tombstones.erase(tombstone_order.front());
+        tombstone_order.pop_front();
+    }
+
+    tombstones.emplace(path, epoch);
+    tombstone_order.push_back(path);
+}
+
+uint64_t server_prefix_index::tombstone_epoch(const std::string & path) const {
+    const auto it = tombstones.find(path);
+    return it == tombstones.end() ? 0 : it->second;
+}
+
 // clamp a candidate to the start of a media chunk it would end inside: a prefix
 // that stops in the middle of an image or an audio chunk is not a usable
-// boundary
-static void clamp_candidates(std::vector<prefix_candidate> & res, const std::vector<size_t> & media_starts,
-        const std::vector<uint32_t> & media_token_counts) {
+// boundary. a clamped candidate no longer matches the end point of the snapshot
+// it may have pointed at, so its physical reference is dropped and its state is
+// recomputed from the shortened length
+void server_prefix_index::clamp_candidates(std::vector<prefix_candidate> & res,
+        const std::vector<size_t> & media_starts,
+        const std::vector<uint32_t> & media_token_counts) const {
     for (auto & c : res) {
+        bool clamped = false;
+
         for (size_t i = 0; i < media_starts.size() && i < media_token_counts.size(); ++i) {
             const size_t start = media_starts[i];
             const size_t end   = start + media_token_counts[i];
             if (c.prefix_tokens > start && c.prefix_tokens < end) {
                 c.prefix_tokens = start;
+                clamped = true;
                 break;
             }
+        }
+
+        if (clamped) {
+            c.snapshot_path.clear();
+            c.state = state_for(c.prefix_tokens, c.observations);
         }
     }
 
@@ -389,17 +499,45 @@ static void clamp_candidates(std::vector<prefix_candidate> & res, const std::vec
     }), res.end());
 }
 
-std::vector<prefix_candidate> server_prefix_index::observe(const prefix_observation & event) {
+prefix_observation_result server_prefix_index::observe(const prefix_observation & event) {
     std::lock_guard<std::mutex> lock(mtx);
 
+    prefix_observation_result result;
+
     if (event.tokens.empty()) {
-        return {};
+        return result;
+    }
+
+    // validate before touching anything: a malformed observation must not create
+    // nodes, intern identities or consume a request id
+    std::vector<unit> seq;
+    std::vector<size_t> media_starts;
+
+    // budget the identities this observation would add *before* interning them,
+    // so a stream of new images cannot grow the table past the index budget
+    size_t projected = approx_bytes();
+    for (const auto & id : event.media_ids) {
+        if (!id.empty() && media_intern.find(id) == media_intern.end()) {
+            projected += id.size() + sizeof(std::string) + 64;
+        }
+    }
+    if (projected > opt.max_index_bytes) {
+        counters.n_rejected++;
+        result.status = prefix_input_status::capacity;
+        return result;
+    }
+
+    if (!to_units(event.tokens, event.media_indices, event.media_token_counts, event.media_ids,
+                /*allow_intern=*/true, seq, media_starts)) {
+        counters.n_input_rejected++;
+        result.status = prefix_input_status::invalid_media;
+        return result;
     }
 
     // the input and the output boundary of one request are one observation
     if (event.request_id != 0) {
         if (seen_requests.count(event.request_id) != 0) {
-            return {};
+            return result;
         }
 
         if (seen_order.size() < 4096) {
@@ -415,13 +553,7 @@ std::vector<prefix_candidate> server_prefix_index::observe(const prefix_observat
 
     counters.n_requests++;
 
-    std::vector<size_t> media_starts;
-    const std::vector<unit> seq = to_units(event.tokens, event.media_indices, event.media_token_counts,
-            event.media_ids, media_starts);
-
     // candidates first: the request must not be compared with itself
-    std::vector<prefix_candidate> res;
-
     {
         std::vector<int32_t> path;
         size_t   partial     = 0;
@@ -437,7 +569,7 @@ std::vector<prefix_candidate> server_prefix_index::observe(const prefix_observat
             c.state         = n.state;
             c.snapshot_path = n.snapshot_path;
 
-            res.push_back(std::move(c));
+            result.candidates.push_back(std::move(c));
         }
 
         // a prefix that ends inside an edge has no node and no snapshot: report
@@ -446,22 +578,20 @@ std::vector<prefix_candidate> server_prefix_index::observe(const prefix_observat
             prefix_candidate c;
             c.prefix_tokens = partial;
             c.observations  = partial_obs;
-            c.state         = (partial >= opt.min_tokens && partial_obs >= opt.min_observations)
-                ? prefix_state::eligible
-                : prefix_state::observed;
-            res.push_back(std::move(c));
+            c.state         = state_for(partial, partial_obs);
+            result.candidates.push_back(std::move(c));
         }
 
-        clamp_candidates(res, media_starts, event.media_token_counts);
+        clamp_candidates(result.candidates, media_starts, event.media_token_counts);
     }
 
     insert(seq, true);
     note_capacity();
     compact();
 
-    counters.n_candidates += res.size();
+    counters.n_candidates += result.candidates.size();
 
-    return res;
+    return result;
 }
 
 std::vector<prefix_candidate> server_prefix_index::candidates(const llama_tokens & tokens,
@@ -476,8 +606,15 @@ std::vector<prefix_candidate> server_prefix_index::candidates(const llama_tokens
         return res;
     }
 
+    std::vector<unit> seq;
     std::vector<size_t> media_starts;
-    const std::vector<unit> seq = to_units(tokens, media_indices, media_token_counts, media_ids, media_starts);
+
+    // read-only: an identity that was never observed maps to k_media_unknown and
+    // matches nothing, and the intern table does not grow
+    if (!to_units(tokens, media_indices, media_token_counts, media_ids,
+                /*allow_intern=*/false, seq, media_starts)) {
+        return res;
+    }
 
     std::vector<int32_t> path;
     size_t   partial     = 0;
@@ -499,9 +636,7 @@ std::vector<prefix_candidate> server_prefix_index::candidates(const llama_tokens
         prefix_candidate c;
         c.prefix_tokens = partial;
         c.observations  = partial_obs;
-        c.state         = (partial >= opt.min_tokens && partial_obs >= opt.min_observations)
-            ? prefix_state::eligible
-            : prefix_state::observed;
+        c.state         = state_for(partial, partial_obs);
         res.push_back(std::move(c));
     }
 
@@ -510,7 +645,7 @@ std::vector<prefix_candidate> server_prefix_index::candidates(const llama_tokens
     return res;
 }
 
-void server_prefix_index::on_snapshot_committed(const std::string & path, const llama_tokens & tokens,
+void server_prefix_index::on_snapshot_committed(const std::string & path, uint64_t epoch, const llama_tokens & tokens,
         const std::vector<uint32_t> & media_indices,
         const std::vector<uint32_t> & media_token_counts,
         const std::vector<std::string> & media_ids) {
@@ -520,14 +655,24 @@ void server_prefix_index::on_snapshot_committed(const std::string & path, const 
 
     std::lock_guard<std::mutex> lock(mtx);
 
+    // a commit that is older than a withdrawal of the same path describes a file
+    // that no longer exists: ignore it instead of reviving a persisted ref
+    if (epoch != 0 && epoch <= tombstone_epoch(path)) {
+        return;
+    }
+
+    std::vector<unit> seq;
     std::vector<size_t> media_starts;
-    const std::vector<unit> seq = to_units(tokens, media_indices, media_token_counts, media_ids, media_starts);
+
+    if (!to_units(tokens, media_indices, media_token_counts, media_ids,
+                /*allow_intern=*/true, seq, media_starts)) {
+        counters.n_input_rejected++;
+        return;
+    }
 
     // a snapshot is attached to the node whose prefix it matches exactly: the
     // snapshot of A+B never marks A as persisted
     insert(seq, false);
-    note_capacity();
-    compact();
 
     std::vector<int32_t> path_nodes;
     walk(seq, path_nodes);
@@ -541,22 +686,33 @@ void server_prefix_index::on_snapshot_committed(const std::string & path, const 
         return;
     }
 
-    nodes[idx].snapshot_path    = path;
-    nodes[idx].ref_invalidated  = false;
+    // attach the reference *before* the capacity pass: a referenced node is never
+    // evicted, and running note_capacity() first could drop the node this commit
+    // is about to protect
+    nodes[idx].snapshot_path   = path;
+    nodes[idx].ref_invalidated = false;
     refresh_state(idx);
 
     snapshot_ref ref;
     ref.tokens = seq.size();
     ref.node   = idx;
+    ref.epoch  = epoch;
     snapshots[path] = ref;
+
+    note_capacity();
+    compact();
 }
 
-void server_prefix_index::on_snapshot_invalidated(const std::string & path) {
+void server_prefix_index::on_snapshot_invalidated(const std::string & path, uint64_t epoch) {
     if (path.empty()) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(mtx);
+
+    // remember the withdrawal even when this process never saw the commit: a
+    // late commit event must not be able to attach it afterwards
+    remember_tombstone(path, epoch);
 
     const auto it = snapshots.find(path);
     if (it == snapshots.end()) {
@@ -596,6 +752,7 @@ prefix_index_stats server_prefix_index::stats() const {
     }
 
     out.n_snapshots = snapshots.size();
+    out.n_media_ids = media_names.size();
     out.bytes       = approx_bytes();
 
     return out;

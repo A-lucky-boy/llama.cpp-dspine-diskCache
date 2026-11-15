@@ -933,3 +933,139 @@ GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `
   - 中断/超时/断流路径的观察与引用清理：本机测试均为正常完成
   - Linux/POSIX 构建：本机为 Windows/MSVC；本次未引入平台相关 API
   - 目录长期内存与 GC 压力：仅以 5 节点的小规模验证，未做长跑统计
+
+# 2026-11-15 20-22 - Change Record（test1_2 修复轮：终止性 / 删除账本 / 引用时序 / 索引输入）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-15 19-51 - test1_2` 修复轮要求，处理五类已确认缺陷（A 容量控制不终止、B 删除失败仍扣配额、C 提交/失效通知顺序、D 索引输入完整性与资源控制、E 媒体钳制后的引用不一致）。本轮**不改变**磁盘条目 v8、清单 v3、KV 恢复路径、采样与 `n_past` 计算，不新增缓存开关；所有修改集中在元数据有效性、删除记账与通知顺序。
+
+基线：`8325ae4`（上一轮阶段 3），本轮结束时 HEAD 为本记录对应的提交。
+
+## 修改文件
+
+### tools/server/server-prefix-index.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-prefix-index.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-prefix-index.h
+- 修改后路径：tools/server/server-prefix-index.h
+- 修改位置：`prefix_input_status`、`prefix_observation_result`、`prefix_index_stats`、私有成员与 helper 声明
+- 具体变更：
+  - 新增 `prefix_input_status { ok, invalid_media, capacity }` 与其 `_name()`；`observe()` 改为返回 `prefix_observation_result{status, candidates}`
+  - `to_units()` 改为返回 `bool` 并接受 `allow_intern`；新增 `media_key(id, token_count)`（媒体身份 = 块 ID + token 数）、`lookup_media()`（只读）、`intern_media()` 改为 const（表为 mutable 追加式）
+  - `on_snapshot_committed/invalidated` 增加 `uint64_t epoch`；新增 tombstone 表（上限 512）与 `remember_tombstone/tombstone_epoch`
+  - `evict_one()` 改为返回 bool；新增 `over_limits()`、`state_for()`、`alive_nodes()`、`clamp_candidates()`
+  - `prefix_index_stats` 新增 `n_media_ids / n_input_rejected`，并明确 `n_rejected` 为"每次观察至多一次"的容量拒绝
+- 修改原因：规划 §一 的 A/D/E 与 §三 第 1、4 步
+
+### tools/server/server-prefix-index.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-prefix-index.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-prefix-index.cpp
+- 修改后路径：tools/server/server-prefix-index.cpp
+- 修改位置：全文相关函数
+- 具体变更：
+  - **A 终止性**：`note_capacity()` 改为 `while (over_limits()) { if (!evict_one()) { n_rejected++; return; } }`；`evict_one()` 只在真实移除节点时返回 true，内部不再增加拒绝计数——旧实现把"拒绝"当作进展，遇到全部叶子都被物理引用保护时会无限循环
+  - **D 输入校验**：媒体三元组长度不一致、空 ID、零长度、越界、与前一块重叠，任一成立即整条观察被拒（`invalid_media`），不再降级为"仅 token 路径"；拒绝不创建节点、不消耗 request id
+  - **D 只读性**：`candidates()` 走 `allow_intern=false`，未知身份映射为 `k_media_unknown`（永不与已存单元相等），驻留表不增长
+  - **D 预算**：观察前按 `approx_bytes() + Σ(新身份字节)` 预判，超预算直接返回 `capacity`，不产生副作用；`approx_bytes()` 覆盖节点、媒体名与 map、快照表、tombstone、观察去重表
+  - **D 媒体身份**：身份键改为 `id#count`，同一 ID 不同 token 数的块不再互相匹配（由单元测试发现）
+  - **E 钳制一致性**：`clamp_candidates()` 在缩短候选后清空 `snapshot_path` 并按新长度重算 `state`，被钳制的前缀不再声称与快照精确对应
+  - **C 顺序**：`on_snapshot_committed()` 先挂载引用再调用 `note_capacity()`/`compact()`——旧顺序可能先把即将被引用的节点淘汰掉（由单元测试发现）；`on_snapshot_invalidated()` 对未知路径也记录 tombstone，并拒绝 `epoch` 不更新的提交
+- 修改原因：规划 §一 A/C/D/E，§三 第 1、3、4 步
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：tools/server/server-task.h
+- 修改位置：`disk_cache_remove_status`、`server_disk_cache_entry`、`disk_cache_counters`、回调声明、私有 helper 与 `event_epoch`
+- 具体变更：新增删除结果枚举与 `_name()`；条目增加 `quarantined`；计数器增加 `n_remove_failed / n_quarantined / n_bytes`；回调签名加 `uint64_t epoch` 并注明"在磁盘锁内交付、只有一条通道"；新增 `remove_file/quarantine_entry/notify_committed/notify_invalidated` 声明与 `event_epoch`
+- 修改原因：规划 §一 B/C、§二
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：tools/server/server-task.cpp
+- 修改位置：`remove_file()`（新增）、`quarantine_entry()`（新增）、`notify_*()`（新增）、`drop_entry()`、`sweep_expired()`、`enforce_limit()`、`drop_prefixes()`、`dedup_prefixes()`、`worker()`、`load()` 的候选循环、`stats()`、`to_metrics()`
+- 具体变更：
+  - **B 统一删除**：新增唯一删除原语 `remove_file()`，返回 `removed / already_missing / failed`，失败时记录 OS 原因并累加 `n_remove_failed`；四条清理路径全部改为结果驱动，只有前两种才 `total_size -=`，失败时不再虚假扣减
+  - **B 隔离**：失败条目 `quarantined = true`，继续计入 `cache_disk_bytes`，但 `load()` 候选循环与 `enforce_limit()` 的淘汰对象选择都跳过它；`drop_prefixes()/dedup_prefixes()` 删除失败时**保留**短条目（文件仍在、仍可恢复，不通知失效）
+  - **B 有界淘汰**：`enforce_limit()` 不再用 `min_element` 反复选中同一失败对象，改为"跳过已隔离条目"的选择，无可删对象时输出一次超额告警并退出
+  - **C 顺序**：所有提交/失效通知移入磁盘锁内的同一临界区，`notify_*()` 统一分配 `++event_epoch`；删除了旧的"锁外通知 + 无锁查找"路径
+  - **指标**：新增 `cache_disk_bytes`（账面占用）、`cache_disk_quarantined`、`cache_disk_remove_failed_total`
+- 修改原因：规划 §一 B/C，§三 第 2、3 步
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-context.cpp
+- 修改后路径：tools/server/server-context.cpp
+- 修改位置：目录初始化处的回调注册与启动登记、`observe_prefix()`
+- 具体变更：启动登记跳过 `quarantined` 条目并以 `epoch = 0` 注册；回调 lambda 增加 `epoch` 形参并注明交付语义；`observe_prefix()` 适配 `prefix_observation_result`，被拒时在 `--cache-stats` 下打印 `prefix observation refused (<reason>)`
+- 修改原因：规划 §一 C，§三 第 3 步
+
+### tools/server/tests/unit/test_cache_prefix_index.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_cache_prefix_index.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/tests/unit/test_cache_prefix_index.cpp
+- 修改后路径：tools/server/tests/unit/test_cache_prefix_index.cpp
+- 修改位置：全文
+- 具体变更：适配新 API（`observe()` 返回结构体、快照事件带 epoch）；新增 6 组测试——只读媒体查询（未知身份不增长驻留表且不误共享）、非法媒体（长度不一致/重叠/越界/空 ID）、媒体预算拒绝、事件逆序（迟到提交被拒）、容量终止性（全引用保护时函数返回且拒绝计数有界）、压缩后引用仍可解析（`compact()` 重映射）、媒体块边界性质（候选不得落在块内部、非精确端点不得保留引用）
+- 修改原因：规划 §二（tests/unit）与 §六 检查清单
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（README 沿用上一轮备份；projectSummary.md 在备份目录中）
+- 修改后路径：同前
+- 修改位置：指标表、行为边界；projectSummary 新增 §3.1 生命周期与资源不变量、§5 指标说明、§8 边界条目
+- 具体变更：补充三个磁盘指标与"删除失败不扣配额"的语义；projectSummary 写入删除/引用/索引输入的不变量表
+- 修改原因：规划 §二（projectSummary.md）、§六.3
+
+## 验证记录
+
+- 已执行检查：CUDA 构建 3 次（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real）
+- 检查结果：通过，`0 FAILED`；`--version` 为 `0.9.0-dev (build 11)`
+
+- 已执行检查：独立自检 `tools/server/tests/unit/test_cache_prefix_index.cpp`（cl 直接编译，不加载模型）13 组
+- 检查结果：**先失败后通过**，且失败暴露了两个真实缺陷：
+  - 媒体身份只用块 ID，导致"同一 ID、不同 token 数"的两个块互相匹配（相等 token 数才应相等）→ 身份改为 `id#count`
+  - `on_snapshot_committed()` 先 `note_capacity()` 再挂引用，容量预算为 1 时会把即将被引用的节点先淘汰掉，导致 `persisted` 永远为 0 → 改为先挂引用再执行容量检查
+  修正后 13 组全部通过（`all prefix-index checks passed`）
+
+- 已执行检查：删除失败注入（`test-run/logs/del-run.log`，`--cache-disk-ttl 2`，用 Python 持有 `.bin` 句柄使 `fs::remove` 失败）
+- 检查结果：通过。
+  - `remove_file: failed to remove '...pc-746c343f7e6504e6.bin': The process cannot access the file because it is being used by another process.`
+  - `quarantine_entry: '...' expired but could not be removed, keeping 505.97 MiB accounted for and excluding it from lookups`
+  - 指标：`cache_disk_entries 2 / cache_disk_bytes 1.64203e+09（= 505.97 + 1059.99 MiB）/ cache_disk_quarantined 1 / cache_disk_remove_failed_total 1`，配额未被虚假扣减
+  - 释放句柄后下一次写入触发 sweep：`dropping '...pc-746c...': expired after 65 s idle (505.97 MiB)`，随后 `cache_disk_entries 1 / cache_disk_bytes 7.00719e+08 / quarantine 0`，账目恢复到真实占用
+
+- 已执行检查：前缀目录在删除失败下的引用一致性（同一次运行）
+- 检查结果：通过。指标 `cache_prefix_invalidated_refs_total 2 / cache_prefix_unavailable 2 / snapshots 1`——被隔离与被删除的条目都在同一时刻撤回了引用，最终只剩存活条目的引用
+
+- 已执行检查：修复后回归（`test-run/logs/fix-run1.log`，发现开启，双卡 `-ts 38,62`，语料 `E:\小说\正文.md`）
+- 检查结果：通过。`F1 prompt_n=1385 cache_n=0`、`F2 4/1381`、`F3 215/1381`，与修复前逐项相同；输出 sha 相同（`fd7c5bda…`、`03e0e517…`）；发现结果不变（0 → 1 候选 `best_prefix=1385 observed` → `eligible`）；`cache_prefix_rejected_total 0`、`n_input_rejected` 未增长
+
+- 已执行检查：关闭开关对照（`logs/fix-run2.log`，`--no-cache-prefix-discovery`）
+- 检查结果：通过。`prefix_tokens` 日志 0 行、启动无 `prefix discovery` 行、全部 `cache_prefix_*` 为 0；三次请求的 `prompt_n/cache_n` 与 sha 与开启时逐一相同
+
+- 已执行检查：强杀重启（`logs/fix-run3.log`）
+- 检查结果：通过。`prefix discovery: enabled, ... 1 snapshot(s) registered`；`cache_prefix_nodes 2 / persisted_refs 1 / snapshots 1`，未新增磁盘索引文件
+
+- 已执行检查：`git status`、临时文件清理
+- 检查结果：通过。三个测试缓存目录（约 3.2 GiB）、临时编译脚本、测试 exe、构建日志与根目录 `.obj` 已删除；`test-run/` 仅剩 692 KB 脚本与日志
+
+- 未执行的检查及原因：
+  - **磁盘层的提交/失效交错复现**：本轮把通知改为"磁盘锁内同一临界区同步交付"，该交错在实现上已不可能发生；验证方式为 (a) 静态证明（索引从不回调磁盘层 → 无锁反转、无锁外窗口）与 (b) 索引侧的确定性逆序用例（`test_event_order`）。没有构造"真实磁盘层迟到提交"的端到端用例，因为构造它需要人为注入非同步通道
+  - **`clamp_candidates()` 的端到端触发**：媒体身份含 token 数且输入经过区间/重叠校验后，节点边界不可能落在同一媒体块内部，因此该钳制在当前实现中是防御性路径，只能由单元测试的"边界性质"断言覆盖
+  - 多 slot（`-np > 1`）、多用户：本轮明确不实现
+  - Linux/POSIX 构建：未执行；本次改动未引入平台相关 API（`std::filesystem::remove` 与既有代码一致）

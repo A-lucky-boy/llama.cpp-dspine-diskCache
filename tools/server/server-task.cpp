@@ -1714,6 +1714,18 @@ std::string server_task_result_metrics::to_metrics() {
             "Number of entries in the on-disk prompt cache",
             (double) cache_disk.n_entries
         }, {
+            "cache_disk_bytes",
+            "Disk usage accounted for, including entries that could not be deleted",
+            (double) cache_disk.n_bytes
+        }, {
+            "cache_disk_quarantined",
+            "Entries kept on disk after a failed deletion, excluded from lookups",
+            (double) cache_disk.n_quarantined
+        }, {
+            "cache_disk_remove_failed_total",
+            "Entry files that could not be deleted",
+            (double) cache_disk.n_remove_failed
+        }, {
             "cache_disk_queue_entries",
             "Number of disk cache writes waiting for the writer",
             (double) cache_disk.n_queue_entries
@@ -1914,6 +1926,16 @@ json server_task_result_apply_lora::to_json() {
 //   drft[size_drft]
 //   checkpoint blobs, in table order: spec, tgt, dft
 //
+
+const char * disk_cache_remove_status_name(disk_cache_remove_status status) {
+    switch (status) {
+        case disk_cache_remove_status::removed:         return "removed";
+        case disk_cache_remove_status::already_missing: return "already_missing";
+        case disk_cache_remove_status::failed:          return "failed";
+    }
+
+    return "unknown";
+}
 
 const char * cache_reject_reason_name(cache_reject_reason reason) {
     switch (reason) {
@@ -2363,6 +2385,57 @@ size_t server_disk_cache::size() const {
     return total_size;
 }
 
+disk_cache_remove_status server_disk_cache::remove_file(const std::string & path) const {
+    // the one place that deletes entry files. only a confirmed removal (or a file
+    // that is already gone) may be followed by reclaiming quota - treating a
+    // sharing violation as success silently under-reports disk usage, which then
+    // lets enforce_limit over-fill the directory
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+
+    if (!ec) {
+        return disk_cache_remove_status::removed;
+    }
+
+    if (ec == std::errc::no_such_file_or_directory) {
+        return disk_cache_remove_status::already_missing;
+    }
+
+    // the error code is the fact; the counter is not part of the const entry set
+    const_cast<server_disk_cache *>(this)->counters.n_remove_failed++;
+
+    SRV_WRN("disk cache: failed to remove '%s': %s\n", path.c_str(), ec.message().c_str());
+
+    return disk_cache_remove_status::failed;
+}
+
+void server_disk_cache::quarantine_entry(server_disk_cache_entry & e, const char * why) {
+    if (e.quarantined) {
+        return;
+    }
+
+    e.quarantined = true;
+
+    SRV_WRN("disk cache: '%s' %s, keeping %.2f MiB accounted for and excluding it from lookups\n",
+            e.path.c_str(), why, e.size_file/(1024.0*1024.0));
+}
+
+void server_disk_cache::notify_committed(const server_disk_cache_entry & e) {
+    if (!on_entry_committed) {
+        return;
+    }
+
+    on_entry_committed(e, ++event_epoch);
+}
+
+void server_disk_cache::notify_invalidated(const std::string & path) {
+    if (!on_entry_invalidated) {
+        return;
+    }
+
+    on_entry_invalidated(path, ++event_epoch);
+}
+
 std::vector<server_disk_cache_entry> server_disk_cache::entries_snapshot() const {
     std::lock_guard<std::mutex> lock(mtx);
     return entries;
@@ -2377,7 +2450,12 @@ disk_cache_counters server_disk_cache::stats() const {
     disk_cache_counters out = counters;
 
     out.n_entries       = entries.size();
+    out.n_bytes         = total_size;
     out.n_queue_entries = queue.size();
+
+    for (const auto & e : entries) {
+        out.n_quarantined += e.quarantined ? 1 : 0;
+    }
     out.n_queue_bytes   = queue_bytes;
 
     return out;
@@ -3154,45 +3232,29 @@ bool server_disk_cache::touch_entry(const server_disk_cache_entry & e) {
 // the file, drop it from the index and persist the manifest. must not be
 // called with mtx held
 void server_disk_cache::drop_entry(const std::string & path) {
-    // the prefix directory only keeps metadata: notify it after the entry is
-    // gone, without holding the cache lock
-    struct notify_guard {
-        server_disk_cache & self;
-        const std::string & path;
-        ~notify_guard() {
-            if (self.on_entry_invalidated) {
-                self.on_entry_invalidated(path);
-            }
-        }
-    } notify { *this, path };
-
     std::lock_guard<std::mutex> lock(mtx);
 
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-
-    // only reclaim the quota when the file is actually gone: on Windows the
-    // most common remove failure is a sharing violation (Defender scanning,
-    // unreleased handle) - the file still occupies its gigabytes, so counting
-    // it as freed would let enforce_limit underestimate usage and the
-    // directory could silently exceed --cache-disk-max until the next restart
-    // scan. the orphan file is picked up by the startup scan and dropped as a
-    // bad-header entry. the index entry is removed either way, so a poisoned
-    // entry cannot loop
-    const bool removed = !ec || ec == std::errc::no_such_file_or_directory;
+    const disk_cache_remove_status status = remove_file(path);
 
     for (auto it = entries.begin(); it != entries.end(); ++it) {
-        if (it->path == path) {
-            if (removed) {
-                total_size -= std::min(total_size, it->size_file);
-            } else {
-                SRV_WRN("disk cache: could not remove '%s' (%s), not reclaiming %.2f MiB\n",
-                        path.c_str(), ec.message().c_str(), it->size_file/(1024.0*1024.0));
-            }
-            entries.erase(it);
-            break;
+        if (it->path != path) {
+            continue;
         }
+
+        if (status == disk_cache_remove_status::failed) {
+            // the bytes are still on disk: keep them accounted for, but the entry
+            // failed validation, so it must not be offered to a lookup again
+            quarantine_entry(*it, "could not be removed");
+        } else {
+            total_size -= std::min(total_size, it->size_file);
+            entries.erase(it);
+        }
+        break;
     }
+
+    // the entry is unusable either way (it failed its checksum or could not be
+    // read), so its physical reference is withdrawn even when it stays on disk
+    notify_invalidated(path);
 
     // the entry set changed - persist the startup index
     save_manifest();
@@ -3246,14 +3308,20 @@ void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vecto
 
             if (media_ok) {
                 const size_t size_file = std::min(total_size, it->size_file);
-                std::error_code ec;
-                fs::remove(it->path, ec);
+
+                if (remove_file(it->path) == disk_cache_remove_status::failed) {
+                    // the short snapshot is still on disk and still restorable:
+                    // keep it, keep its quota and keep its physical reference
+                    SRV_WRN("disk cache: could not remove the superseded prefix '%s', keeping it\n",
+                            it->path.c_str());
+                    ++it;
+                    continue;
+                }
+
                 SRV_INF("disk cache: dropping '%s': prefix of a stored prompt, %zu tokens, %.2f MiB\n",
                         it->path.c_str(), old_ids.size(), size_file/(1024.0*1024.0));
                 total_size -= size_file;
-                if (on_entry_invalidated) {
-                    on_entry_invalidated(it->path);
-                }
+                notify_invalidated(it->path);
                 it = entries.erase(it);
             } else {
                 ++it;
@@ -3316,12 +3384,18 @@ void server_disk_cache::dedup_prefixes() {
 
             const size_t shorter_idx = a_in_b ? i : j;
             if (!drop[shorter_idx]) {
-                std::error_code ec;
-                fs::remove(entries[shorter_idx].path, ec);
+                if (remove_file(entries[shorter_idx].path) == disk_cache_remove_status::failed) {
+                    // still on disk and still restorable: leave it in place and do
+                    // not pretend the bytes were freed
+                    SRV_WRN("disk cache: could not remove the superseded prefix '%s', keeping it\n",
+                            entries[shorter_idx].path.c_str());
+                    continue;
+                }
                 SRV_INF("disk cache: dropping '%s': prefix of a stored prompt, %zu tokens, %.2f MiB\n",
                         entries[shorter_idx].path.c_str(), entries[shorter_idx].tokens.size(),
                         entries[shorter_idx].size_file/(1024.0*1024.0));
                 total_size -= std::min(total_size, entries[shorter_idx].size_file);
+                notify_invalidated(entries[shorter_idx].path);
                 drop[shorter_idx] = true;
             }
         }
@@ -3378,7 +3452,7 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
         SRV_TRC("disk cache: lookup for %zu tokens, %zu entries, min %zu tokens\n", tokens.size(), entries.size(), min_tokens);
 
         for (const auto & e : entries) {
-            if (std::find(skip.begin(), skip.end(), e.path) != skip.end()) {
+            if (e.quarantined || std::find(skip.begin(), skip.end(), e.path) != skip.end()) {
                 continue;
             }
 
@@ -3871,16 +3945,22 @@ void server_disk_cache::sweep_expired() {
 
     for (auto it = entries.begin(); it != entries.end(); ) {
         if (now - it->last_used > ttl_seconds) {
+            const disk_cache_remove_status status = remove_file(it->path);
+
+            if (status == disk_cache_remove_status::failed) {
+                // expired, but the bytes are still there: keep the quota honest
+                // and stop offering it to a lookup
+                quarantine_entry(*it, "expired but could not be removed");
+                notify_invalidated(it->path);
+                ++it;
+                continue;
+            }
+
             SRV_INF("disk cache: dropping '%s': expired after %lld s idle (%.2f MiB)\n",
                     it->path.c_str(), (long long) (now - it->last_used), it->size_file/(1024.0*1024.0));
 
-            std::error_code ec;
-            fs::remove(it->path, ec);
-
             total_size -= std::min(total_size, it->size_file);
-            if (on_entry_invalidated) {
-                on_entry_invalidated(it->path);
-            }
+            notify_invalidated(it->path);
             it = entries.erase(it);
         } else {
             ++it;
@@ -3894,22 +3974,41 @@ void server_disk_cache::enforce_limit() {
     // mtx must be held
     sweep_expired();
 
+    // entries that could not be deleted are quarantined and skipped for the rest
+    // of this pass: picking the same unremovable file again would loop forever
     while (limit_size > 0 && total_size > limit_size && !entries.empty()) {
-        auto it = std::min_element(entries.begin(), entries.end(),
-                [](const server_disk_cache_entry & a, const server_disk_cache_entry & b) {
-                    return a.last_used < b.last_used;
-                });
+        auto it = entries.end();
 
-        std::error_code ec;
-        fs::remove(it->path, ec);
+        for (auto cur = entries.begin(); cur != entries.end(); ++cur) {
+            if (cur->quarantined) {
+                continue;
+            }
+            if (it == entries.end() || cur->last_used < it->last_used) {
+                it = cur;
+            }
+        }
+
+        if (it == entries.end()) {
+            // nothing droppable left (everything is quarantined): stop instead of
+            // spinning, and leave the over-quota state visible in the log
+            SRV_WRN("disk cache: over the %.2f MiB limit but no removable entry left (%.2f MiB used)\n",
+                    limit_size/(1024.0*1024.0), total_size/(1024.0*1024.0));
+            break;
+        }
+
+        const disk_cache_remove_status status = remove_file(it->path);
+
+        if (status == disk_cache_remove_status::failed) {
+            quarantine_entry(*it, "over quota but could not be removed");
+            notify_invalidated(it->path);
+            continue;
+        }
 
         SRV_WRN("disk cache: limit reached, removing '%s' (%.2f MiB)\n",
                 it->path.c_str(), it->size_file/(1024.0*1024.0));
 
         total_size -= std::min(total_size, it->size_file);
-        if (on_entry_invalidated) {
-            on_entry_invalidated(it->path);
-        }
+        notify_invalidated(it->path);
         entries.erase(it);
     }
 }
@@ -3968,9 +4067,6 @@ void server_disk_cache::worker() {
 
         const bool ok = write_entry(pending, path, size_file);
 
-        server_disk_cache_entry committed;
-        bool have_committed = false;
-
         {
             std::lock_guard<std::mutex> lock(mtx);
 
@@ -3978,6 +4074,9 @@ void server_disk_cache::worker() {
             inflight.erase(hash);
 
             if (ok) {
+                server_disk_cache_entry committed;
+                bool                    have_committed = false;
+
                 server_disk_cache_entry e;
                 e.path      = path;
                 e.hash      = hash;
@@ -4008,7 +4107,10 @@ void server_disk_cache::worker() {
                 // only now is the file committed and discoverable. drop_prefixes
                 // and enforce_limit above may have removed it again (a shorter
                 // prefix or a quota eviction), so look it up instead of assuming
-                // it is the last entry
+                // it is the last entry. the notification is delivered here, inside
+                // the lock and in the same critical section that changed the entry
+                // set, so it can never arrive after a later withdrawal of the
+                // same path
                 for (const auto & e : entries) {
                     if (e.path == path) {
                         committed = e;
@@ -4016,15 +4118,15 @@ void server_disk_cache::worker() {
                         break;
                     }
                 }
+
+                if (have_committed) {
+                    notify_committed(committed);
+                }
             }
         }
 
         if (ok) {
             counters.n_write_bytes += size_file;
-
-            if (have_committed && on_entry_committed) {
-                on_entry_committed(committed);
-            }
 
             SRV_INF("disk cache: stored %zu tokens, %.2f MiB in %.2f ms\n",
                     n_tokens, size_file/(1024.0*1024.0), (ggml_time_us() - t_start)/1000.0);

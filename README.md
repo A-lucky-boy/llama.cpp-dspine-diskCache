@@ -288,6 +288,9 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `llamacpp:cache_disk_restore_seconds_total` | 读盘 + 状态恢复耗时 |
 | `llamacpp:cache_disk_entries` / `_queue_entries` / `_queue_bytes` | 条目数与待写队列 |
 | `llamacpp:cache_disk_manifest_fallback_total` | 清单不可信、回退全量扫描的次数 |
+| `llamacpp:cache_disk_bytes` | 账面磁盘占用，**包含**删除失败的隔离条目 |
+| `llamacpp:cache_disk_quarantined` | 删除失败后仍留在盘上、已排除出查找的条目数 |
+| `llamacpp:cache_disk_remove_failed_total` | 删除失败的累计次数 |
 | `llamacpp:cache_prefix_requests_total` | 已发布观察的请求数 |
 | `llamacpp:cache_prefix_candidates_total` | 返回给调用方的候选前缀数（累计） |
 | `llamacpp:cache_prefix_observed_total` / `_eligible_total` | 进入 `observed` / `eligible` 的累计次数 |
@@ -302,6 +305,7 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 
 - CUDA 后端只支持按层切分（`-sm layer`）；`-sm row` 在模型加载阶段即被拒绝。
 - 生效的非 aLoRA 适配器下，共享缓存对该 slot 不写入；slot 自身的增量续算仍可用。
+- 删除失败（杀软占用、未释放句柄）不会扣减配额：条目被隔离——仍计入 `cache_disk_bytes`、仍留在 `entries`，但不再参与查找与淘汰排序；句柄释放后由下一次 TTL/配额检查重试回收。
 - 公共前缀目录面向**单用户、单实例**：不做租户隔离、不做跨用户配额，也不参与跨用户共享。
 - 目录只观察输入边界；比请求更长的快照覆盖该前缀时，该前缀不会被标为 `persisted`（保守语义），但磁盘 LCP 查找仍可命中它。
 - packed 元数据自 v8 起有独立 CRC：写侧写入条目头，读侧在**任何**状态写入之前校验，并与启动清单记录绑定；清单不可信时回退逐文件头校验，不会因为清单存在就跳过验证。

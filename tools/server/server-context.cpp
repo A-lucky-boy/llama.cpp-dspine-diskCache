@@ -1768,17 +1768,27 @@ private:
                 // from the start; the directory only records metadata, the
                 // restore path still validates every entry on its own
                 if (prompt_cache->disk) {
+                    // entries that already exist are registered with epoch 0: they
+                    // were committed before this process started, and no
+                    // withdrawal of the same path can be known yet
                     for (const auto & e : prompt_cache->disk->entries_snapshot()) {
-                        prefix_index->on_snapshot_committed(e.path, e.tokens, e.media_indices,
+                        if (e.quarantined) {
+                            continue;
+                        }
+                        prefix_index->on_snapshot_committed(e.path, 0, e.tokens, e.media_indices,
                                 e.media_token_counts, e.media_ids);
                     }
 
-                    prompt_cache->disk->on_entry_committed = [this](const server_disk_cache_entry & e) {
-                        prefix_index->on_snapshot_committed(e.path, e.tokens, e.media_indices,
+                    // both callbacks are delivered by the disk tier while it holds
+                    // its own lock, in the same critical section that changed the
+                    // entry set, so the prefix directory sees the physical order.
+                    // the index never calls back into the disk tier
+                    prompt_cache->disk->on_entry_committed = [this](const server_disk_cache_entry & e, uint64_t epoch) {
+                        prefix_index->on_snapshot_committed(e.path, epoch, e.tokens, e.media_indices,
                                 e.media_token_counts, e.media_ids);
                     };
-                    prompt_cache->disk->on_entry_invalidated = [this](const std::string & path) {
-                        prefix_index->on_snapshot_invalidated(path);
+                    prompt_cache->disk->on_entry_invalidated = [this](const std::string & path, uint64_t epoch) {
+                        prefix_index->on_snapshot_invalidated(path, epoch);
                     };
                 }
 
@@ -2099,11 +2109,18 @@ private:
 
         const size_t n_tokens = obs.tokens.size();
 
-        const auto candidates = prefix_index->observe(obs);
+        const prefix_observation_result observed = prefix_index->observe(obs);
+
+        if (observed.status != prefix_input_status::ok && params_base.cache_stats) {
+            SLT_WRN(slot, "cache_stats: prefix observation refused (%s), %zu tokens\n",
+                    prefix_input_status_name(observed.status), n_tokens);
+        }
 
         if (!params_base.cache_stats) {
             return;
         }
+
+        const auto & candidates = observed.candidates;
 
         size_t       best_tokens = 0;
         size_t       best_persisted = 0;
