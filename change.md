@@ -1034,7 +1034,7 @@ GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `
 ## 验证记录
 
 - 已执行检查：CUDA 构建 3 次（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real）
-- 检查结果：通过，`0 FAILED`；`--version` 为 `0.9.0-dev (build 11)`
+- 检查结果：通过，`0 FAILED`；`--version` 为 `0.9.0-dev (build 10)`（构建时的 HEAD 为 `342fd7d`，本轮提交为 `57d9fce`）
 
 - 已执行检查：独立自检 `tools/server/tests/unit/test_cache_prefix_index.cpp`（cl 直接编译，不加载模型）13 组
 - 检查结果：**先失败后通过**，且失败暴露了两个真实缺陷：

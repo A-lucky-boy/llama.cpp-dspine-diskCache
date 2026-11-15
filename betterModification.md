@@ -652,3 +652,222 @@ prefix_index_stats stats() const;
 5. **回归与文档**：完善单用户请求序列测试、资源边界测试；实际实现细节写入 `change.md`，总体结构写入 `projectSummary.md`。
 
 **本次实验的实施终点**是安全、可核查的公共前缀候选目录及其与已有完整快照之间的正确关联。**不包含**“将 `A+B` 的完整 opaque KV 文件直接拆出 `A` 的物理 KV 块”，不包含新的缓存物理格式，也不包含独立的按块写入/读取路径。后续是否实施物理增量 KV，应由底层状态导出、恢复语义的只读技术审查单独确认。
+
+---
+
+# 2026-11-15 19-51 - test1_2
+
+## 一、当前实验的代码审查修复补充
+
+**本记录仅用于修复当前算法实现中已发现的正确性、生命周期与资源边界问题，不创建新的实验方向，不实施分块 KV、不调整缓存命中率策略，也不开展独立公共前缀物理化。** 此处与前文属于同一实验的延续修复，原有实验设计记录全部保留。
+
+**项目约束**：单用户、单实例、单 slot（`-np 1`）；但磁盘 writer 与推理线程仍有并发。必须保留已有 `server_prompt_cache`、`server_disk_cache`、完整状态快照 v8、manifest v3、target/draft 状态和媒体/LoRA 兼容守卫；默认关闭公共前缀目录时必须保留既有推理语义。源码问题修复优先，不允许在本轮同时实现新的磁盘分块、任意 token 前缀状态导出、主动前缀捕获或新的成本感知淘汰算法。
+
+### 1.1 代码版本与核查依据
+
+核查对象：
+
+- 最新仓库 `A-lucky-boy/llama.cpp-dspine-diskCache` 的 `main`，本次检索到的 HEAD 为 `342fd7d4178e75b348682c19e70d64dda618b5db`（实验记录文档提交）。
+- 最近功能提交：`8325ae4f463c940f67413b691a3362c39b91a334`，其父提交为 `01d5686333b520f4913631bb69646211819ebe1d`。
+- 本次首先阅读仓库 `change.md` 最后的 `2026-11-15 19-35` 记录，并对照 `projectSummary.md` 和 `tools/server/server-prefix-index.*`、`tools/server/server-task.*`、`tools/server/server-context.cpp` 的实现。
+- GitHub 对比 `01d5686..8325ae4`：新建约 602 行前缀索引实现及 173 行头文件；`server-task.cpp` 增加缓存条目提交/失效回调，`server-context.cpp` 增加公共前缀观察和启动时物理引用登记；基线状态恢复与 KV 格式未改变。
+- 更早的本项目 baseline 为 `eb7681889f44304d2bd5b3e41572f5530af91a1d`，此后的两次功能提交实现了统计/边界捕获与公共前缀目录。**后续修复时须用这两个锁定提交比较增量差异，不得用新版本直接替代 baseline 而省略对照。**
+
+代码地址：
+
+- `https://github.com/A-lucky-boy/llama.cpp-dspine-diskCache/blob/8325ae4f463c940f67413b691a3362c39b91a334/tools/server/server-prefix-index.cpp`
+- `https://github.com/A-lucky-boy/llama.cpp-dspine-diskCache/blob/8325ae4f463c940f67413b691a3362c39b91a334/tools/server/server-task.cpp`
+- `https://github.com/A-lucky-boy/llama.cpp-dspine-diskCache/blob/8325ae4f463c940f67413b691a3362c39b91a334/tools/server/server-context.cpp`
+
+### 1.2 优先修复的问题与代码证据
+
+**错误 A（已确认，阻断）：容量超限时可能无法退出的循环。**
+
+- 位置：`tools/server/server-prefix-index.cpp` 中 `server_prefix_index::evict_one()`（约 277 行）、`server_prefix_index::note_capacity()`（约 308 行）。
+- 现状：当无可淘汰的叶节点时，`evict_one()` 执行 `counters.n_rejected++` 后返回；`note_capacity()` 用 `n_evicted + n_rejected` 是否改变来判定“能否继续”。拒绝计数同样发生变化，因此 `for (;;)` 继续执行，容量条件仍不满足时产生无限循环。
+- 可达条件：配置的节点数或索引内存上限低于根节点加上所有受物理引用保护的节点所需空间，或者已被保护的节点路径和驻留媒体元数据造成实际内存预算越界。在单用户环境中仍可触发，不能因正常短测试通过而忽略。
+- 修复要求：使 `evict_one()` 返回**是否真的删除一个节点**（`bool` / 枚举），只以“真实释放节点”作为 `note_capacity()` 循环的继续依据；仅在不能释放时增加一次拒绝/预算超限事件，立即返回。将“超过 soft budget、但受持久引用保护”明确记录，而不是把受保护节点强删或继续无限循环。
+- 不能以 `n_rejected`、日志数变化或时间判断是否取得淘汰进展；严格确保每轮减少活节点数或退出。
+
+建议伪代码：
+
+```cpp
+bool server_prefix_index::evict_one() {
+    const int32_t victim = find_evictable_leaf();
+    if (victim < 0) return false;
+    detach_and_retire(victim);
+    counters.n_evicted++;
+    return true;
+}
+
+void server_prefix_index::note_capacity() {
+    while (over_node_limit() || over_memory_limit()) {
+        if (!evict_one()) {
+            counters.n_rejected++;
+            return; // no progress possible: retained physical refs are protected
+        }
+    }
+}
+```
+
+**错误 B（已确认，阻断）：删除失败仍扣减磁盘配额。**
+
+- 位置：`tools/server/server-task.cpp` 的 `server_disk_cache::drop_prefixes()`（约 3222 行）、`dedup_prefixes()`（约 3265 行）、`sweep_expired()`（约 3862 行）、`enforce_limit()`（约 3891 行）。
+- 现状：这些分支对 `std::filesystem::remove(path, ec)` 设置 `error_code`，但未依赖删除结果，随后继续扣减 `total_size` 或从索引删除文件。相反，`drop_entry()` 已经考虑了删除失败不扣额度。四条路径存在不一致。
+- 修复要求：统一封装安全删除与记账，区分“文件已删除”“路径已不存在”“因共享冲突/权限等失败且文件仍存在”，只有确认已释放物理文件时才扣除实际占用。日志包含原因和路径标识；处理不能删除的条目时应明确保留空间占用或将其隔离并记录账面占用，避免继续作为可恢复条目使用和配额无界失真。
+- `enforce_limit()` 需要对删除失败条目执行有界跳过/延后重试，不能反复选中同一个失败对象形成另一种循环；不得为了填平容量差额而错误删除受引用保护的其他对象。
+- 若 `drop_prefixes()` 因文件占用而删除失败，不应无条件宣布短快照已被成功清理；是否保留短前缀属于后续缓存策略研究，此次只修正文件系统事实与统计语义。
+- 保留 manifest 的原子更新、磁盘写队列、签名和 CRC 检查逻辑；禁止因删除失败而对不完整状态进行恢复。
+
+**风险 C（需按交错时序验证，可能造成错误 `persisted`）：提交与失效回调顺序。**
+
+- 位置：`tools/server/server-task.cpp` 的 `server_disk_cache::worker()`（约 3917–4030 行）、`drop_entry()`（约 3156 行）以及其他失效路径；索引的 `on_snapshot_committed` / `on_snapshot_invalidated` 位于 `server-prefix-index.cpp` 约 513 / 554 行。
+- 现状：worker 在锁内验证条目仍存在并复制 `committed`，释放磁盘锁后才调用 `on_entry_committed`。`drop_entry()` 在释放锁后调用失效回调。若删除发生在 worker 释放锁和通知之间，两个通知的到达顺序可能与物理状态变化顺序不一致。
+- 修复动作：建立明确的**提交/失效事件顺序不变量**。可选实现为 (a) 对所有索引通知统一在磁盘锁保护的状态变更序列中同步触发，同时证明索引绝不反向获取磁盘锁；或 (b) 在磁盘锁内分配单调 epoch、记录有序事件，以单一串行分发器交付，前缀目录拒绝比当前引用更旧的事件。最终只选一种，避免同步/异步两套途径并行。
+- 不得简单把 `on_entry_committed` 放到锁外后再做一次无锁 `entries` 查找；也不得让回调内部再调用 `entries_snapshot()` 形成锁反转。切换回调策略时同时审查析构先后顺序，防止目录析构后后台 writer 仍触发闭包。
+- 记录一个可控交错测试：提交完成但尚未通知 → 同路径失效 → 迟到提交通知。测试过程中真实磁盘条目已不存在时，目录不得最终把它登记为 `persisted`。
+
+**风险 D（索引元数据完整性与资源控制）：无效 media / 索引驻留开销。**
+
+- 位置：`server-prefix-index.cpp` 的 `to_units()`（约 51 行）、`intern_media()`（约 38 行）、`candidates()`（约 467 行）、`approx_bytes()`（约 257 行）。
+- 现状：media 三组数组长度不一致时，`to_units()` 直接返回未携带媒体身份的 token 序列；未认识的 media ID 会在只读 `candidates()` 中被插入驻留表；内存预算估算没有完整计入所有容器的占用，且只读候选查询不会主动执行预算处理。
+- 修复要求：media 元数据不合法时 fail-closed，不能降级成纯 token 目录查询；`candidates()` 只查已有媒体身份，未知身份应得不到错误共享且不增长驻留表；`observe()` 的媒体驻留必须受索引容量预算约束。`approx_bytes()` 至少覆盖 media 字符串及 map、观测去重表、快照引用表与主节点表的大宗内存。现有下限/上限选项和默认关闭语义不变。
+- 对截断媒体块、重复/重叠 chunk 索引、空媒体 ID、超出 token 长度的范围建立可控失败路径。**这些候选错误不会直接绕过现有 Disk KV 校验，但不能因为只作用于观察层就容忍错误的 `eligible/persisted` 元数据。**
+
+**风险 E（查找候选状态与前缀端点的一致性）：媒体钳制。**
+
+- 位置：`server-prefix-index.cpp` 的 `clamp_candidates()`（约 365 行）。
+- 现状：如果候选终点被钳制到媒体块起点，`prefix_tokens` 被缩短，但 `state` 和 `snapshot_path` 原样保留；如果原候选为 `persisted`，缩短的前缀不再与物理快照的精确端点一致。
+- 修复要求：一旦候选边界发生变化，必须重新计算所对应端点的合法状态和物理引用，或清除 `snapshot_path` 并降为仅可观测候选。不得将较短的钳制前缀继续宣称为原快照的精确可恢复前缀。
+
+## 二、预期修改文件
+
+| 文件 | 修改目标 |
+|---|---|
+| `tools/server/server-prefix-index.h` | 为淘汰操作定义明确返回语义；如选择事件 epoch 方案则增加引用版本；将无效 media 拒绝作为明确 API 结果 |
+| `tools/server/server-prefix-index.cpp` | 修复 `note_capacity/evict_one` 的终止性，完善索引预算，修复 `to_units/intern_media/candidates` 的只读性及 `clamp_candidates` 的状态一致性，接入有序快照引用事件 |
+| `tools/server/server-task.h` | 抽象统一条目删除结果与回调顺序所需的事件元数据；无必要不得新增盘层格式字段 |
+| `tools/server/server-task.cpp` | 统一删除失败语义与 quota 记账；落实条目提交/删除通知的线性化点，检查 `worker/drop_entry/drop_prefixes/dedup_prefixes/sweep_expired/enforce_limit` |
+| `tools/server/server-context.cpp` | 核对索引/磁盘层对象生命周期，保持构造/析构和回调注销次序；只有在需要适配新事件接口时修改 |
+| `tools/server/tests/unit/test_cache_prefix_index.cpp` | 扩充容量不可淘汰、只读媒体查询、格式错误媒体、候选状态修正、事件逆序等纯 CPU 测试 |
+| `tools/server/tests/unit/` 或 `test-run/` | 增加跨文件删除失败注入、后台提交/失效交错、实际磁盘空间计数的回归脚本 |
+| `change.md` | 逐文件记录实际修复动作、版本差异和验证事实 |
+| `projectSummary.md` | 更新全项目的生命周期与资源不变量；不放本轮实验结果报告 |
+
+保持 `common/common.h`、`common/arg.cpp`、CMake、新增缓存开关及磁盘条目 v8 / manifest v3 **不变**，除非修复的 ABI/接口改动确实需要同步；任何变动都必须解释其必要性。
+
+## 三、实施顺序（严格按现有正确性修复划分）
+
+### 第 1 步：容量控制终止性
+
+1. 锁定 HEAD，备份当前索引模块并记录 baseline 的原有代码路径（baseline 无当前 radix-tree 索引）。
+2. `evict_one()` 仅以真实删除作为“成功”，不能把拒绝计数当作执行进度；修正 `note_capacity()`。
+3. 构造“仅存在持久化引用且超出 node/byte 预算”场景；函数必须返回，索引节点仍可用于后续查询，文件引用不得被强行驱逐。
+4. 对不同的容量限制与节点生命周期执行边界回归，核查活节点计数和已引用节点不变量。
+
+### 第 2 步：删除返回值与配额账本
+
+1. 建立 `remove_result`（或复用现有结果类型）区分 `removed/already_missing/failed`；统一 `total_size` 修改入口。
+2. 将所有删除路径改为以结果驱动索引及 manifest 更新，出现删除失败必须解释条目是否仍可查询、是否计入物理容量、是否进入后续清理队列。
+3. 验证同一文件反复尝试删除、Windows 共享冲突、文件提前消失、无法更新 manifest 等边界，不允许 silent quota mismatch。
+4. 保留当前文件格式、恢复校验与 CRC 行为，不增加新缓存对象格式。
+
+### 第 3 步：物理引用通知顺序
+
+1. 在盘层锁保护下定义提交与失效的唯一排序点。分析 `worker()`、`drop_entry()`、`drop_prefixes()`、`sweep_expired()`、`enforce_limit()` 以及关机/初始化回调注册的全链路。
+2. 完成有序事件派发，回调不得在错误时序下把已经删除的条目重新标记为 `persisted`。
+3. 增加确定性并发交错测试；仅覆盖磁盘 worker 与推理线程这两类实际运行中的并发，不新增多用户/多 slot 功能。
+4. 确保 `entries_snapshot()` 的返回内容、manifest 可见条目与目录最终物理引用可对应。
+
+### 第 4 步：索引输入、媒体边界和内存约束
+
+1. 对 `to_units()` 增加输入合法性检查和失败返回，媒体数组不一致、区间越界/重叠等不能 silently fallback 为无媒体序列。
+2. 只读目录查找不新增 `media_intern` 条目；新增身份时必须满足内存预算或采取安全的拒绝路径。
+3. 修正 `clamp_candidates()`：调整端点后重新验证 `persisted` 的精确对应关系，否则清空引用。
+4. 核对 `approx_bytes()` 覆盖主要驻留对象；不允许小容量参数下出现无界增长、死循环或永久保留无引用垃圾。
+5. 检查 `insert/compact` 在父/子节点和快照引用重映射时没有悬挂索引；必要时增补单元测试。
+
+### 第 5 步：单用户回归、变更与总结
+
+1. 执行不加载模型的前缀索引单元测试：精确分叉、请求去重、媒体不一致、容量保护、候选钳制、引用失效、并发交错。
+2. 使用当前真实模型配置执行单用户、单 slot 请求序列，核查冷启动、RAM/slot/Disk 真实复用、重启后的可恢复性、文件损坏安全回退与文本数值一致性。
+3. 使用 `--no-cache-prefix-discovery` 完成改造开关关闭态对照；不因修复元数据/磁盘删除而改变模型计算、`n_past` 或采样路径。
+4. 将实际变更、发生的错误及修复事实写入 `change.md`；全项目架构与已落地能力更新到 `projectSummary.md`。
+
+## 四、预期数据流变更
+
+**当前已存在的数据流：**
+
+```text
+用户单请求 → tokenizer → slot/RAM/Disk 真实复用 → prefill/generate
+          → 输入边界的不可变观察 → prefix index
+后台 writer → 完整快照写入 → manifest → 物理条目提交通知 → prefix index
+条目删除/TTL/配额淘汰 → 失效通知 → prefix index
+```
+
+**本轮修复后的要求：**
+
+```text
+prefix.observe / candidates
+  → media 输入校验 → 只读/有界身份查找 → LCP 候选
+  → 物理引用与前缀端点复核 → 有界状态更新 → 返回
+
+prefix.note_capacity
+  → 检查上限 → 尝试真实淘汰
+  ├─ 成功释放一个节点 → 继续检查
+  └─ 无可删节点 → 记录拒绝并返回（不无限循环）
+
+writer / deletion
+  → 在 disk lock 内定义条目状态变更与通知顺序
+  → 根据真实文件删除结果修改 bytes/index/manifest
+  → 前缀目录按有序事件更新 persisted/unavailable
+```
+
+**训练流水线**：不涉及训练，模型参数与训练过程不变。**推理流水线**：保留真实缓存查找和 KV 恢复路径，仅修改元数据的有效性、物理引用顺序与删除/配额错误处理。不能把候选 LCP 转成实际 reused token，不得新增未经支持的部分状态导出操作。
+
+## 五、与现有实现的兼容性
+
+1. **关闭态**：`--no-cache-prefix-discovery` 不应初始化新的前缀索引，真实 KV 复用、推理输出和日志中的实际 token 分解口径保持一致。通用磁盘删除语义修复可以影响异常情况下的磁盘账本，但不得改变健康路径的输出。
+2. **格式**：继续使用 v8 完整状态快照和 v3 manifest；不动头部 offset、CRC64、签名、target/draft blob 和 checkpoint 数据。
+3. **模型**：保持 target Qwen 与 DSpine draft 的独立序列状态校验；不修改投机解码接入、温度/采样、GPU 层分配及 `--kv-unified` 行为。
+4. **单用户**：不实现用户 ID、多租户 namespace、不同用户 cache 共享、多 slot 抢占调度；worker 与推理线程仍必须严格同步。
+5. **资源**：容量预算中索引元数据不等于磁盘占用；磁盘删除失败不能错误降低实际占用；目录节点数与驻留媒体身份数应各自可约束。
+6. **回退**：若修复引入新事件接口，任何无法确认的物理引用应降为未持久化元数据；真正恢复只能走现有经过 CRC 验证的 `server_disk_cache::load()`。
+
+## 六、验证检查清单
+
+### 6.1 版本与 baseline
+
+- [ ] 确认 `change.md` 最新记录、当前 HEAD 和本轮拟修改文件一致。
+- [ ] 对照锁定 baseline 的选槽/缓存恢复路径，检查修复没有引入不必要的 KV 修改。
+- [ ] 检查提交差异仅涉及现有缺陷相关逻辑，无新的性能优化策略混入。
+
+### 6.2 确定的错误修复
+
+- [ ] `note_capacity()` 在超过上限且所有剩余叶节点都受物理引用保护时能正常返回，不增殖无限拒绝事件。
+- [ ] `evict_one()` 的返回值只表示实际节点淘汰，不把拒绝视为成功。
+- [ ] `drop_prefixes()`、`dedup_prefixes()`、`sweep_expired()`、`enforce_limit()` 在删除失败时不虚假扣减磁盘字节。
+- [ ] 清理失败、配额仍超限时不会在同一不可删条目上形成无限循环。
+
+### 6.3 生命周期及输入数据
+
+- [ ] 物理条目已经删除后，较晚执行的提交回调不能恢复其 `persisted` 状态。
+- [ ] 回调释放与析构顺序不会产生对已销毁 `prefix_index` 的访问。
+- [ ] 无效媒体数组、媒体位置重叠、媒体块内部截断、未知媒体 ID 不会形成假等价或错误的持久化引用。
+- [ ] `candidates()` 只读查询不无界增加媒体驻留表；内存预算检查覆盖主要索引内存。
+- [ ] 候选长度被钳制后不保留与原长度不匹配的 `snapshot_path`。
+- [ ] 引用在 compact、删除、TTL、重启重建后仍可对齐正确物理文件。
+
+### 6.4 单用户回归
+
+- [ ] `-np 1` 下的重复请求和分叉共享候选在关闭/开启索引时均保持原有生成语义。
+- [ ] 实际复用 token 分解仍满足 `prompt = reused_slot + reused_ram + reused_disk + prefill`。
+- [ ] 未持久化的 `observed/eligible` 不被算入真实命中；CRC 失败不会产生虚假 `persisted`。
+- [ ] 强杀后重启由已验证磁盘条目恢复目录引用，未写入不可信的额外磁盘索引文件。
+- [ ] 文件删除失败、损坏、异常通知与关闭索引的组合均能安全退回正确 prefill。
+
+## 七、交接边界
+
+本补充仅授权**修复现有目录的终止性、索引输入一致性、物理引用时序，以及磁盘删除/空间账本问题**。不授权修改 KV 物理序列化格式、不授权直接切分 opaque state、不授权为提高表面命中数放松 `io_cost`/媒体/CRC 约束。
+
+本轮完成后，开发人员需要提供：更新的 `change.md`、实际修复 commit、单用户回归日志及更新后的 `projectSummary.md`，供下一次源码审查使用；这项交接要求不构成新的性能实验规划。
