@@ -68,6 +68,26 @@ disk_cache_quota_plan disk_cache_plan_quota(const std::vector<disk_cache_quota_i
     return plan;
 }
 
+bool disk_cache_commit_eligible(const std::vector<disk_cache_commit_candidate> & entries,
+        const std::string & path) {
+    for (const auto & e : entries) {
+        if (e.path != path) {
+            continue;
+        }
+
+        // a quarantined entry is accounted bytes, not a cache hit: telling the
+        // prefix directory about it would create a physical reference that
+        // neither load() nor a restart would ever honour
+        if (e.quarantined || !e.has_tokens) {
+            continue;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 std::vector<bool> disk_cache_replacements_safe(const std::vector<disk_cache_replacement_dep> & deps,
         const std::vector<disk_cache_quota_item> & items) {
     std::vector<bool> res;

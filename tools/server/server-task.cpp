@@ -4489,16 +4489,36 @@ void server_disk_cache::worker() {
                 // delivered here, inside the lock and in the same critical section
                 // that changed the entry set, so it can never arrive after a later
                 // withdrawal of the same path
-                for (const auto & e : entries) {
-                    if (e.path == path) {
-                        committed = e;
+                //
+                // "still in entries" is not the question, though: a rejected write
+                // whose rollback failed is kept for accounting only and must never
+                // reach the prefix directory, or the directory would hold a
+                // persisted reference to a snapshot load() refuses to use - one
+                // that also vanishes on restart, since startup registration skips
+                // quarantined entries
+                std::vector<disk_cache_commit_candidate> commit_view;
+                commit_view.reserve(entries.size());
+
+                for (const auto & cur : entries) {
+                    if (cur.path != path) {
+                        continue;
+                    }
+
+                    commit_view.push_back({ cur.path, cur.quarantined, !cur.tokens.empty() });
+
+                    if (is_reusable_entry(cur)) {
+                        committed      = cur;
                         have_committed = true;
-                        break;
                     }
                 }
 
                 if (have_committed) {
                     notify_committed(committed);
+                } else if (!commit_view.empty()) {
+                    // the path is here, but only as accounted bytes: state it
+                    // instead of silently looking like a committed snapshot
+                    SRV_WRN("disk cache: '%s' stays accounted for but is not usable, not publishing a persisted reference@NL@",
+                            path.c_str());
                 }
             }
         }

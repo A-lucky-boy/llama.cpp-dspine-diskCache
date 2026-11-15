@@ -1597,3 +1597,185 @@ bool is_protected(const server_disk_cache_entry & entry,
 3. 按“稳定保护身份 → 回滚删除记账 → 物理回收后复核 → 单元与单用户回归 → 更新 `change.md` / `projectSummary.md`”的顺序实施。
 4. 现有唯一物理删除函数 `remove_file()`、锁内 `notify_*` 和单调 `event_epoch` 语义不得破坏。
 5. 当前方向保留；本文件只记已有实现的缺陷修复规划，不写预想收益数值、早停要求、计算报告或最终优劣判定，也不在本节规划新的 KV 分块实验。
+
+---
+
+# 2026-11-15 23-17 - test1_2
+
+## 一、本轮定位与既有代码核查
+
+本轮属于现有磁盘提示缓存的**状态一致性修复**，继续沿用原有 `test1_2`；不开始新的缓存算法实验，不修改文件格式，也不把没有完成真实 KV 恢复的“逻辑前缀”记为磁盘命中。
+
+实施前核对依据：
+
+- 仓库：`A-lucky-boy/llama.cpp-dspine-diskCache`。
+- 审查时远端 HEAD：`c5d403d24d0812618f2ef9ac8bafd76fb4f3356a`（交付说明文档提交）。
+- 最新代码修复提交：`059e267b1d81a10b06d0ea88c1368ae1887101c2`。
+- 已首先检查远端 `change.md` 的 `2026-11-15 23-15 - Change Record`，并逐项核对上传报告《2026-11-15-handover-v3-quota-transaction.md》与 GitHub 最新 `server-task.cpp`、`server-context.cpp`、`server-prefix-index.cpp`。
+- 已与改造前 baseline 提交 `eb7681889f44304d2bd5b3e41572f5530af91a1d` 对比。baseline 无新增的 `server_prefix_index` 物理引用回调，当前问题由新增磁盘回滚隔离生命周期与前缀目录提交通知的组合产生，不涉及原模型的计算或采样逻辑。
+- 上轮修复的路径键保护集、`plan.fits` 与物理回收复核、回滚失败登记 `quarantined` 等实现已经存在；现有测试说明主路径成立。但发现新的**明确控制流不变量违背**，下述缺陷须在继续算法开发前修复。
+
+实验人员着手修改时，仍须读取实际工作树最新 `change.md`、`projectSummary.md`、`git status --short`、`git rev-parse HEAD`，将对应源码与上述审查版本及原始 baseline 再比对。若已有后续代码已修复相同问题，应先确认状态，避免重复修改。
+
+## 二、已定位问题：隔离条目可能被通知为 `persisted`
+
+### 2.1 精确问题位置
+
+文件：`tools/server/server-task.cpp`，`server_disk_cache::worker()` 的回滚/隔离分支与结尾“提交通知”分支；相关接收方为：
+
+- `tools/server/server-context.cpp` 的 `on_entry_committed` 回调；
+- `tools/server/server-prefix-index.cpp` 的 `on_snapshot_committed()`。
+
+最新 `worker()` 已支持：
+
+1. `!plan.fits` 且 `remove_file(path)` 失败时，执行 `quarantine_entry(e, ...)`、`total_size += size_file`、`entries.push_back(std::move(e))`；
+2. `plan.fits` 但物理回收后仍超配额、`superseded == 0`、回滚删除失败时，对已入 `entries` 的新条目调用 `quarantine_entry(cur, ...)`。
+
+这两种情况下，**条目保留在 `entries` 仅意味着要对实际磁盘占用记账，不代表快照可恢复**。
+
+然而 `worker()` 当前末尾只以 `e.path == path` 判定：
+
+```cpp
+for (const auto & e : entries) {
+    if (e.path == path) {
+        committed = e;
+        have_committed = true;
+        break;
+    }
+}
+if (have_committed) {
+    notify_committed(committed);
+}
+```
+
+因此两个回滚失败分支都可能把 `quarantined=true` 的条目交给 `notify_committed()`。`server_prefix_index::on_snapshot_committed()` 按精确 token/media 身份建立快照物理引用并刷新为 `persisted`，没有收到 `quarantined` 状态；与此同时 `server_disk_cache::load()` 会排除该条目。
+
+**错误结果是目录中出现无法被真实磁盘层恢复的 `persisted` 引用。** 当前源码可静态证明该路径，尚无本机故障注入的动态复现记录，不得在 `change.md` 写成“已实测”。
+
+### 2.2 修改原则
+
+- `entries` 中存在：仅代表**有文件或账面占用**。
+- `quarantined`：代表**不可作为可恢复候选**，即使文件仍占用空间。
+- `persisted`：只能来自经过本次提交事务确认的、**仍存活且可供查找**的磁盘条目；不是“任一同路径条目存在”的同义词。
+- `notify_committed()` 应只用于此次事务真正入库的有效条目；被拒绝而仅为记账保留的条目不得触发提交事件。
+- 原有启动登记 `server-context.cpp` 已跳过 `e.quarantined`。必须让运行时通知采用同一资格判定；不能出现“运行期间 persisted，重启后消失”的虚假状态。
+- 不为此增加第二个异步通知通道。沿用磁盘锁内同步回调及原有单调 `event_epoch`。
+
+## 三、预期修改文件
+
+| 文件 | 预期修改位置 | 修改内容 |
+|---|---|---|
+| `tools/server/server-task.cpp` | `server_disk_cache::worker()` 末尾通知资格判断 | 将“同路径存在”改为“同路径且 `is_reusable_entry()` 为真”；明确拒绝态、隔离态和有效入库态 |
+| `tools/server/server-task.cpp` | `!plan.fits` 回滚失败、`total_size > limit_size` 回滚失败分支 | 确认两分支均不会向前缀目录发布提交；保留真实账本 |
+| `tools/server/server-task.cpp` | `notify_committed()` / `notify_invalidated()` 附近 | 仅在有助于防止未来误用时加最小断言或诊断日志；不得改变事件顺序和锁语义 |
+| `tools/server/server-task.h` | 可选：提交资格辅助函数/测试钩子声明 | 仅当为了避免逻辑重复或可测试性确有必要时修改 |
+| `tools/server/tests/unit/` | 新增/扩展针对提交资格的测试 | 覆盖有效提交、两种回滚失败、回滚成功、配额超额但有效存活 |
+| `test-run/` | 磁盘层与前缀目录联动回归脚本 | 注入回滚删除失败，核查 `entries`/统计/前缀物理引用的一致性 |
+| `change.md` | 追加实际代码修改记录 | 明确“静态发现”与“动态验证”的证据范围 |
+| `projectSummary.md` | 已实现的不变量章节 | 修复完成之后补充“隔离条目绝不产生持久化引用”的现状描述 |
+
+不要求修改 `src/llama-context.cpp`、训练脚本、模型权重、target/draft 推理路径或任何网络/API 权限控制。
+
+## 四、具体算法与状态流
+
+### 4.1 提交通知必须取“有效提交”而不是“账面存在”
+
+伪代码仅展示逻辑约束，实际实现沿用现有结构及命名：
+
+```cpp
+// mtx held: after quota / rollback / replacement / save_manifest
+bool has_usable_commit = false;
+server_disk_cache_entry committed;
+
+for (const auto & cur : entries) {
+    if (cur.path != path) {
+        continue;
+    }
+
+    // non-reusable entries are accounted bytes, not cache hits or persisted refs
+    if (!is_reusable_entry(cur)) {
+        continue;
+    }
+
+    committed = cur;
+    has_usable_commit = true;
+    break;
+}
+
+if (has_usable_commit) {
+    notify_committed(committed);
+}
+```
+
+如后续代码已引入显式 `admitted` 或事务结果枚举，优先在最终状态确认为有效后发出提交事件。不得用原 `plan.fits`、`write_entry()` 的 `ok`、`path_owned`、文件存在或 `total_size` 的任意单一条件代替“条目可供恢复”的最终判断。
+
+### 4.2 五个必须区分的事务结局
+
+| 最终状态 | `entries` | `total_size` | `load()` 候选 | `on_entry_committed` |
+|---|---|---|---|---|
+| 新快照成功入库且有效 | 包含非隔离条目 | 计入 | 允许按原校验查找 | **应发送** |
+| `!plan.fits`、新文件回滚成功 | 不包含新条目 | 不计入新文件 | 不可用 | **不得发送** |
+| `!plan.fits`、回滚删除失败 | 包含隔离条目 | 计入残留文件 | 不可用 | **不得发送** |
+| `plan.fits`，物理回收后超额、无替代删除、回滚成功 | 不包含新条目 | 核减新文件 | 不可用 | **不得发送** |
+| 同上但回滚失败 | 包含隔离条目 | 保留真实字节 | 不可用 | **不得发送** |
+
+另需覆盖“新条目已替代短快照且被保护保留，虽仍存在不可回收的超额字节但本身未隔离”的状态；在当前既有语义下，它仍属于**有效缓存条目**，不能误把所有超配额条目排除于 `persisted`。
+
+### 4.3 回调接收端与通知顺序
+
+`server-context.cpp` 目前以：
+
+```text
+server_disk_cache::on_entry_committed
+    → server_prefix_index::on_snapshot_committed
+    → 精确路径登记、refresh_state() → persisted
+```
+
+处理物理引用。该回调不能被要求猜测磁盘条目的隔离状态；**发送方**负责只传递可用条目。
+
+如果此前同名文件因隔离、回收或数据损坏已经发送失效，保持该 `notify_invalidated(path)` 的原路径；新一轮回滚失败不能以较新的 commit epoch 把失效引用“复活”。
+
+### 4.4 可测试性与故障注入
+
+直接靠 Windows 外部句柄在回滚瞬间抢占文件名不稳定。因此建议在测试构建中增加最小、仅测试用的确定性删除故障注入，局限于**指定缓存路径与指定事务分支**。不得在生产构建默认开启；不得让测试钩子改变 `remove_file()` 在正常模式下的语义。
+
+至少完成两层检查：
+
+1. 纯元数据/单元测试：验证最终 `entries` 状态 → 允许提交事件的布尔资格，确保隔离条目永远为 false。
+2. 磁盘层 + 前缀目录集成测试：当回滚失败且 `quarantined=true` 时，真实磁盘账本包含该文件，但前缀目录没有该文件的 `persisted` 引用；文件回收后记录数与真实路径一致。无需加载大模型即可构造磁盘文件与回调的最小集成夹具；对真实推理路径仍做一次正常回归。
+
+单用户本机 API 不需要网络鉴权测试、多用户隔离测试、租户配额设计或多 Slot 调度设计；保留对内存、文件与 KV 恢复正确性的验证。
+
+## 五、推理流水线影响与兼容性
+
+- **推理前处理、tokenize、prefill、采样及 draft/target 计算**：不变。
+- **磁盘缓存有效性**：保留 `is_reusable_entry()`、CRC64、全 token/media 身份校验、`768 KiB/token` 成本守卫和实际 `load()` 的校验逻辑。
+- **条目格式**：继续使用缓存文件 v8、manifest v3；无需迁移已有文件。
+- **后台写入**：仍由单个 worker 负责持久化；保持前台与磁盘线程间已有锁及事件时序。
+- **配额**：quarantined 文件仍占用 `total_size`；不得为了消除错误 `persisted` 状态而直接移除已占用字节。
+- **前缀目录**：只修改物理引用登记的资格，不提高观察次数，不改变 `eligible` 判定，不虚增 `reused_disk`。
+- **功能关闭态**：`--no-cache-prefix-discovery` 继续保持原磁盘层行为；修复通知资格不应改变模型输出或正常快照的保留行为。
+- **不添加多用户/公网 API 安全机制**：本项目仅考虑本机单用户、`-np 1`。
+- **不在本次修改中实施新的主动前缀捕获、分块 KV 或序列化格式变更**。发现本问题后，须先完成本轮修复，再单独规划新的算法实验。
+
+## 六、验证检查清单
+
+- [ ] 核对实际工作树的 `change.md`、`projectSummary.md`、提交 SHA、baseline 差异与本次文件影响范围。
+- [ ] 审查 `worker()` 所有回滚、隔离和 quota 分支，不允许单凭“路径仍在 `entries`”发出成功通知。
+- [ ] 模拟 `!plan.fits` 且回滚删除失败：`total_size` 包含新文件，`entries` 有 quarantined，`load()` 排除该条目，前缀目录 `persisted_refs`/`snapshots` 不增加。
+- [ ] 模拟物理回收未兑现、`superseded == 0` 且回滚删除失败：重复上述资格验证，并核查 `n_rollback_failed` / `n_quota_unreclaimed` 的真实递增位置。
+- [ ] 两种回滚删除成功的场景：无新条目、无新物理引用、账本核减真实已删除字节。
+- [ ] 有效入库：确实发送一次提交事件，`prefix_index` 精确路径与 token/media 匹配，真实缓存 `load()` 可按原路径恢复。
+- [ ] 有效新条目已替代短快照但仍因旧隔离文件无法完全回收配额：新条目仍可恢复，删除短条目的失效通知与新条目的提交通知次序一致。
+- [ ] 同名快照先失效、后发生回滚失败：最新事件不会把 quarantined 路径重新标为 persisted；必要时检查 `event_epoch` 和 tombstone。
+- [ ] 以单元测试或集成测试覆盖“进程内 quarantined 路径不应作为 persisted；强杀重启后其状态也不应被错误登记”，禁止把本轮仅有静态检查的情形记录为已完成动态复现。
+- [ ] 已有磁盘配额 19 组测试、媒体匹配测试、前缀索引测试继续执行；单用户 `-np 1` 的冷启动、重复请求、追加请求与重启回归正常。
+- [ ] `--cache-stats` 的 `candidate_lcp`、`restored`、`reused_disk` 与前缀目录 `persisted` 分别按真实语义统计；不能将物理文件存在等同于成功恢复。
+- [ ] 不更改 v8/v3、CRC、签名、`768 KiB/token`、4096-token lag、模型计算与采样路径。
+- [ ] 实施完成后更新 `change.md` 的实际修改日志；`projectSummary.md` 仅写已落地的总体状态。
+
+## 七、记录要求
+
+本文件仅记录本轮代码修复规划与算法修改日志，不编写性能收益设想、早停要求、计算报告或最终判定规则。保留现有实验设计记录，不覆盖历史章节。
+
+本次修复是推进后续单用户公共前缀物理缓存的先决步骤，不在本节规划新的实验代码。完成后，应重新审查 `change.md` 与 baseline 差异，再决定是否进入下一个独立实验。

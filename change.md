@@ -1548,3 +1548,108 @@ limit = 800 MiB
   - **同一个文件的写入与回滚持有句柄**：回滚失败需要"写入刚完成、临时句柄已关闭、随即被外部进程独占"的时序，本机只能稳定构造 TTL/LRU 阶段的句柄占用，无法在 `remove_file(path)` 调用的瞬间注入占用
   - **问题 A 的"修复前会失败"对照**：无法在真实服务上运行带失效指针的版本再对比，因为读失效指针是未定义行为、结果不确定。已用单测的路径键/指针键两套序列并列记录，并对路径键版本断言；指针版本只记录不断言
   - 真实媒体 prompt、多 slot、Linux、中断路径：本轮范围外
+
+# 2026-11-15 23-40 - Change Record（test1_2 修复轮：提交资格与持久化引用）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-15 23-17 - test1_2` 修复轮要求，修正**隔离条目可能被通知为 `persisted`** 的控制流不变量违背。基线 HEAD `c5d403d`，上一轮修复提交 `059e267`。
+
+缺陷位置：`server_disk_cache::worker()` 末尾的提交通知分支只按 `e.path == path` 判定。而该函数内两个回滚失败分支都会把条目保留在 `entries` 里（仅用于记账）：
+
+1. `!plan.fits` 且 `remove_file(path)` 失败 → `quarantine_entry(e, ...)` + `total_size += size_file` + `entries.push_back(...)`
+2. `plan.fits` 但物理回收后仍超额、`superseded == 0`、回滚又失败 → 对已入 `entries` 的条目 `quarantine_entry(cur, ...)`
+
+这两条路径下"路径在 `entries` 中"为真，于是 `notify_committed()` 被调用。`server_prefix_index::on_snapshot_committed()` 会据此建立物理引用并置为 `persisted`；而 `server_disk_cache::load()` 排除该条目，`server-context.cpp` 的启动登记也跳过 `quarantined`。结果是一个**运行期存在、重启后消失、且无法恢复**的持久化引用。
+
+本轮只改提交资格判定与相应诊断；不改变 v8/v3、CRC、`768 KiB/token`、4096-token lag、`load()` 校验、`eligible` 判定、采样与 `n_past`，不新增通知通道。
+
+## 修改文件
+
+### tools/server/server-disk-cache-quota.h / .cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-disk-cache-quota.h、tools/server/server-disk-cache-quota.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_commit_candidate`（新增结构）、`disk_cache_commit_eligible()`（新增）
+- 具体变更：
+  - 新增 `disk_cache_commit_candidate { path, quarantined, has_tokens }`：一个路径在事务结束时对外的可见状态
+  - 新增 `disk_cache_commit_eligible(entries, path)`：同路径存在、**未隔离**、且 token 非空才返回 true。这是"能否向目录发布持久化引用"的唯一判定
+  - 补 `#include <string>`
+- 修改原因：规划 §四.1 要求资格判定显式且可测；该模块不取锁、不碰文件，可独立单测
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`worker()` 末尾的提交查找与通知
+- 具体变更：把"路径是否存在"改为"是否存在可用条目"：
+  - 遍历 `entries` 时同步构造 `disk_cache_commit_candidate`，并用 `is_reusable_entry(cur)` 判定资格
+  - 只有资格成立才 `notify_committed(committed)`
+  - 路径存在但无可用条目时打印 `stays accounted for but is not usable, not publishing a persisted reference`，把"仅有账面占用"与"已提交快照"区分开
+  - 通过新 helper `disk_cache_commit_eligible()` 再确认一次，保证单测覆盖的正是运行时使用的判定
+- 修改原因：规划 §二、§四.1、§四.2
+
+### tools/server/tests/unit/test_disk_cache_quota.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_quota.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/tests/unit/test_disk_cache_quota.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 `test_commit_eligibility()`（8 组）
+- 具体变更：覆盖规划 §4.2 的五个事务结局及三个附加角例——有效提交（应发送）；回滚成功后路径不存在（不发送）；`!plan.fits` 回滚失败（不发送）；配额不足回滚失败（不发送）；token 为空的条目（不发送）；**别的路径被隔离不影响本路径**；**因无关隔离文件而整体超额但自身有效**（仍应发送，避免把所有超配额条目误排除）；同路径多条记录中只要有可用的即可发送
+- 修改原因：规划 §三、§四.4 要求纯元数据层可验证资格
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：行为边界；projectSummary §3.1 不变量表
+- 具体变更：写明"只有可用条目才发布持久化引用"及运行时/启动登记资格一致
+- 修改原因：规划 §六
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real）
+- 检查结果：通过，`0 FAILED`；`--version` 为 `0.9.0-dev (build 23, commit c5d403d)`
+
+- 已执行检查：**缺陷复现**（单测）
+- 检查结果：**确认缺陷存在**。把 `disk_cache_commit_eligible()` 临时改回旧的"仅按路径存在"语义后重编译，同一组用例有 3 项失败：
+
+  ```
+  FAIL test_disk_cache_quota.cpp:808: !disk_cache_commit_eligible(entries, "pc-aaa.bin")
+  FAIL test_disk_cache_quota.cpp:817: !disk_cache_commit_eligible(entries, "pc-aaa.bin")
+  FAIL test_disk_cache_quota.cpp:825: !disk_cache_commit_eligible(entries, "pc-aaa.bin")
+  ```
+
+  即三个隔离场景（`!plan.fits` 回滚失败、配额不足回滚失败、token 为空）在旧语义下全部被判为可提交。恢复修复版本后全部通过
+
+- 已执行检查：磁盘层三套单测
+- 检查结果：通过。`all disk-cache match checks passed`、`all disk-cache quota checks passed`（含新增 8 组提交资格用例）、`all prefix-index checks passed`
+
+- 已执行检查：**端到端——隔离条目不产生持久化引用**（`test-run/logs/fix6-p1.log`，`--cache-prefix-discovery` 开启，`--cache-disk-max 1400`，`--cache-disk-ttl 4`，Python 持有 `.bin` 句柄）
+- 检查结果：通过。
+  - 基线（有效条目）：`cache_prefix_persisted_refs 1 / cache_prefix_snapshots 1`——正常快照确实会发布引用，说明修复没有把有效路径一并排除
+  - 制造隔离：`failed to remove ... being used by another process` → `quarantined ... keeping 505.77 MiB accounted for and excluding it from lookups`
+  - 隔离后：`cache_disk_entries 1 / cache_disk_quarantined 1 / cache_prefix_persisted_refs 0 / cache_prefix_snapshots 0 / cache_prefix_unavailable 1`——计数从 1 降到 0，隔离条目未被发布为 `persisted`
+  - 同一事务还触发了配额复核路径：`over the 1400.00 MiB limit but no removable entry left` → `quota still exceeded after the admission pass (165.57 MiB over), rolling back '...pc-3a888c45f86e70ff.bin' because no superseded snapshot was deleted`，磁盘目录最终只剩隔离文件（530,337,934 B），未出现孤立文件
+
+- 已执行检查：重启后一致性（`test-run/logs/fix6-p1r.log`）
+- 检查结果：通过。`cache_scan_end: 1 entries (manifest 1, stale index records 0)`、`1 entries after scan, 1 after dedup/trim`，且 `prefix discovery: ... 0 snapshot(s) registered`——启动登记同样跳过该隔离条目，与运行期 `persisted_refs 0` 一致。这正是本轮要消除的"运行期 persisted、重启后消失"错配
+
+- 已执行检查：标准回归（`test-run/logs/fix6-reg.log`，发现开启 + both 捕获，双卡 `-ts 38,62`，语料 `E:\小说\正文.md`）
+- 检查结果：通过。`1385/0`、`4/1381`、`215/1381` 与上一轮逐项相同；输出 sha 相同（`fd7c5bda…`、`03e0e517…`）；`write_rejected 0 / cache_prefix_nodes 3 / cache_prefix_persisted_refs 1 / cache_prefix_snapshots 1`
+
+- 已执行检查：清理
+- 检查结果：通过。测试缓存目录（约 3 GiB）、句柄脚本、临时编译脚本/可执行文件、根目录 `.obj`、`__pycache__` 均已删除；`test-run/` 降至 1.1 MB；`git status` 仅剩本轮源码与文档改动
+
+- 未执行的检查及原因：
+  - **`!plan.fits` 且回滚删除失败的端到端触发**：需要新条目单体在配额内、回收全部可回收对象后仍放不下，且回滚瞬间被外部进程独占。本机条目由检查点主导（1.4K token 即 505 MiB），任意两条相加即超过任何可设的 MiB 级配额；且无法在 `remove_file(path)` 调用瞬间注入占用。该分支由单测（`test_rejected_write_rollback`、`test_commit_eligibility` 场景 3/4）与静态核对覆盖，**未在真实运行中复现**
+  - **"同名快照先失效、后回滚失败"的时序**：需要同一路径先 `notify_invalidated` 再在同一事务内回滚失败，构造依赖前者。规划 §4.3 要求的"最新事件不把 quarantined 路径复活"由提交资格判定在源头上保证（该路径根本不会进入 `notify_committed`），未单独构造时序用例
+  - **测试用删除故障注入钩子**：规划 §4.4 建议增加"仅测试用的确定性删除故障注入"。本轮未实现——它需要引入测试专用代码路径（编译期开关或运行期钩子），而现有单测已能在纯元数据层覆盖全部五个事务结局、端到端也已用真实句柄占用覆盖 TTL/LRU 与配额复核两条路径。是否值得为此在生产源码中留一个钩子，建议在下一轮单独判断，本轮不擅自扩大改动面
+  - 真实媒体 prompt、多 slot、Linux、中断路径：本轮范围外

@@ -64,3 +64,24 @@ struct disk_cache_replacement_dep {
 // would be unsafe in this transaction
 std::vector<bool> disk_cache_replacements_safe(const std::vector<disk_cache_replacement_dep> & deps,
         const std::vector<disk_cache_quota_item> & items);
+
+// what the entry set says about one path at the end of a write transaction
+//
+// A path being present in `entries` only means bytes are accounted for. It says
+// nothing about whether the snapshot can be restored: a write that was rejected
+// and could not be rolled back stays there as a quarantined entry, occupying
+// space and serving nothing. The prefix directory must only be told about
+// entries that are really usable, otherwise it would record a `persisted`
+// reference to a file the disk tier itself refuses to load - a state that also
+// disappears on restart, because startup registration skips quarantined entries.
+struct disk_cache_commit_candidate {
+    std::string path;
+    bool        quarantined = false;
+    bool        has_tokens  = true; // an entry with no tokens has nothing to compare against
+};
+
+// true when `path` is held by an entry that is admissible as a physical
+// reference: present, not quarantined and usable. this is the only condition
+// under which a commit notification may be sent
+bool disk_cache_commit_eligible(const std::vector<disk_cache_commit_candidate> & entries,
+        const std::string & path);

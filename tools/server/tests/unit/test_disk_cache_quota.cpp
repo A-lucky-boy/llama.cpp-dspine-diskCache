@@ -773,6 +773,88 @@ void test_rejected_write_rollback() {
     CHECK_EQ(failed.write_bytes, 0); // still not a successful write
 }
 
+// ---------------------------------------------------------------------------
+// commit eligibility: which transaction outcomes may publish a persisted
+// reference to the prefix directory.
+//
+// "present in entries" only means the bytes are accounted for. a rejected write
+// whose rollback failed stays there as a quarantined entry, and telling the
+// directory about it would create a physical reference that load() refuses to
+// use - and that also disappears on restart, because startup registration skips
+// quarantined entries.
+// ---------------------------------------------------------------------------
+void test_commit_eligibility() {
+    // 1. a snapshot that really made it in: eligible
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-aaa.bin", /*quarantined=*/false, /*has_tokens=*/true },
+        };
+        CHECK(disk_cache_commit_eligible(entries, "pc-aaa.bin"));
+    }
+
+    // 2. rejected, rolled back: the path is gone entirely
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-other.bin", false, true },
+        };
+        CHECK(!disk_cache_commit_eligible(entries, "pc-aaa.bin"));
+    }
+
+    // 3. rejected, rollback failed: quarantined, must not be published
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-aaa.bin", /*quarantined=*/true, /*has_tokens=*/true },
+        };
+        CHECK(!disk_cache_commit_eligible(entries, "pc-aaa.bin"));
+    }
+
+    // 4. quota unmet after the physical pass, rollback failed: same answer
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-other.bin", true,  true  },
+            { "pc-aaa.bin",   true,  true  },
+        };
+        CHECK(!disk_cache_commit_eligible(entries, "pc-aaa.bin"));
+    }
+
+    // 5. an entry with no tokens has nothing to compare against
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-aaa.bin", false, /*has_tokens=*/false },
+        };
+        CHECK(!disk_cache_commit_eligible(entries, "pc-aaa.bin"));
+    }
+
+    // 6. a *different* path being quarantined does not block this one
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-quarantined.bin", true,  true },
+            { "pc-aaa.bin",         false, true },
+        };
+        CHECK(disk_cache_commit_eligible(entries, "pc-aaa.bin"));
+    }
+
+    // 7. the entry is valid even when the cache is over quota because of an
+    // unrelated quarantined file: over-quota is not the same as unusable
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-stuck.bin", true,  true }, // unremovable, still counted
+            { "pc-new.bin",   false, true }, // admitted and usable
+        };
+        CHECK(disk_cache_commit_eligible(entries, "pc-new.bin"));
+    }
+
+    // 8. only the usable record at a path makes it eligible, whatever order the
+    // duplicates appear in
+    {
+        const std::vector<disk_cache_commit_candidate> entries = {
+            { "pc-aaa.bin", true,  true },
+            { "pc-aaa.bin", false, true },
+        };
+        CHECK(disk_cache_commit_eligible(entries, "pc-aaa.bin"));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -795,6 +877,7 @@ int main() {
     test_protected_never_lru_victim();
     test_quarantined_and_protected_together();
     test_rejected_write_rollback();
+    test_commit_eligibility();
 
     if (g_failures == 0) {
         std::printf("all disk-cache quota checks passed\n");
