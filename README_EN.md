@@ -196,7 +196,7 @@ An entry is three parts, not one lump. Measured with the same configuration:
 Two things worth knowing:
 
 - The target is a hybrid architecture, so a single state carries about **151 MiB of fixed overhead** independent of context length. Short prefixes therefore cost more per token out of necessity — about 128 KiB/token for a 6K entry against 25 KiB/token at 123K. This is not a defect.
-- Real entries hold only 1–3 checkpoints, far below the `--n-ctx-checkpoints` cap of 32, so lowering that flag does not shrink entries.
+- The checkpoint count grows with the session rather than staying fixed: 1–3 for a short session, climbing to **31** (the `--n-ctx-checkpoints 32` cap) in a long one, at roughly 200 MiB each. That is how the 8.6 GiB entries in the production log come about, with checkpoints accounting for about 6 GiB of them. Lowering `--n-ctx-checkpoints` therefore does shrink entries considerably, at the cost of fewer usable restart points for a partial hit.
 
 On a mechanical disk the measured write throughput is 130–155 MiB/s and restore reads run at about 180 MiB/s: a 3 GiB entry takes about 20 s to write and 17 s to restore, against about 98 s for a full 123K-token prefill.
 
@@ -227,6 +227,7 @@ On a mechanical disk the measured write throughput is 130–155 MiB/s and restor
 - A forced kill does not run destructors; persistence depends on the idle mirror (60 s) or an eviction.
 - A restore always reads the whole entry file, so a long entry hit at a low ratio reads bytes it does not use; `DISK_CACHE_MAX_BYTES_PER_TOKEN` only catches the extreme cases.
 - Each growth step of a conversation produces a new entry; write suppression only absorbs small deltas, and a cumulative delta beyond 4096 tokens still triggers a rewrite.
+- Long sessions accumulate checkpoints until entries reach the 8 GiB range, and the pending queue is bounded by `--cache-disk-queue-max`. When a write (8 GiB ≈ 57 s) cannot keep up with the turn rate, the entry is dropped and the log records `write queue is full, skipping`. The production log shows 25 consecutive occurrences.
 
 ## 9. Where the code lives
 
@@ -246,6 +247,26 @@ On a mechanical disk the measured write throughput is 130–155 MiB/s and restor
 - `change.md` — per-change record with pre-change backup paths and verification results
 - `experienceHistory.md` — rejected approaches with evidence, confidence levels, debugging discipline
 - `experiments/` — benchmark scripts (`bench_decode.py`, `start-bench*.ps1`) and measurements (`RESULTS.md`, `RESULTS-OPT.md`)
+
+## 11. Ideas welcome
+
+Speeding up local dense-model inference is far from exhausted. On this two-GPU setup the time goes to three places, and an idea for any of them is welcome:
+
+| Stage | Measured today |
+|---|---|
+| Decode | 37–49 t/s, 55–73 ms per round; speculative decoding carries a fixed ~36 ms per round independent of context |
+| Prefill | about 1.3K t/s, roughly 98 s for a full 123K-token pass |
+| Disk cache | long sessions grow entries to 8.6 GiB (31 checkpoints) and saturate the write queue |
+
+If you have another idea for speeding up local dense-model deployment, **open an [issue](https://github.com/A-lucky-boy/llama.cpp-dspine-diskCache/issues) and I will try to implement it**. It does not have to fit an existing direction in this repository — a different kernel, quantization, scheduling scheme or cache policy is all fair game.
+
+To make an idea land faster, these help a lot:
+
+- where exactly to change: which kernel, which flag, which code path
+- expected gain and the reasoning behind it: a bandwidth model, a comparable implementation, a paper, or your own measurements elsewhere
+- whether it changes numerical results, and if so how you would estimate the accuracy cost
+
+The rule of thumb for this repository is that **ideas backed by measurements come first**. `change.md` and `experienceHistory.md` record what each round concluded, which directions were rejected and why — worth a skim before proposing, so we do not repeat work.
 
 ## License
 
