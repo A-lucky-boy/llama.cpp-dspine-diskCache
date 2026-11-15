@@ -105,7 +105,7 @@ stdout and stderr are written to separate logs; model loading and cache behaviou
 
 The split is fixed at `38,62`. The CUDA backend has no split-buffer support, so `-sm row` is rejected at model load; layer split is the only multi-GPU option. With 672 GB/s (4070 Ti SUPER) and 936 GB/s (3090) the bandwidth optimum is about 42/58, which is equivalent to `38,62`; 30/70 and 45/55 showed no gain.
 
-The draft model sits on CUDA0 rather than CUDA1: a 1.26 GiB draft sharing the 3090 with 62% of the target layers contends for the same HBM. Moving it to the 4070 Ti SUPER cuts per-round time by roughly 2–3% and frees 2.1 GiB on the 3090.
+The draft model sits on CUDA0 rather than CUDA1: a 1.26 GiB draft sharing the 3090 with 62% of the target layers contends for the same HBM. Moving it to the 4070 Ti SUPER cuts per-round time by 2–5% and frees 2.1 GiB on the 3090. The cost is a 1–2% slower prefill: the draft also processes the whole prompt during prefill to build its own KV, and the 4070 Ti SUPER has fewer SMs (66) than the 3090 (82), so that phase is compute-bound.
 
 ## 5. Decode performance
 
