@@ -291,6 +291,7 @@ Disabled by default (`--cache-prefix-discovery`). When enabled it keeps a **read
 | `llamacpp:cache_disk_bytes` | accounted disk usage, **including** entries that could not be deleted |
 | `llamacpp:cache_disk_quarantined` | entries kept on disk after a failed deletion, excluded from lookups |
 | `llamacpp:cache_disk_remove_failed_total` | failed deletion attempts |
+| `llamacpp:cache_disk_hash_collision_total` | writes refused because a hash/length hit had a different token/media identity |
 | `llamacpp:cache_prefix_requests_total` | requests published to the directory |
 | `llamacpp:cache_prefix_candidates_total` | candidates reported (cumulative) |
 | `llamacpp:cache_prefix_observed_total` / `_eligible_total` | cumulative transitions into `observed` / `eligible` |
@@ -305,6 +306,8 @@ Do not mix the three quantities: `candidate_lcp` is the prefix a candidate share
 
 - The CUDA backend only supports layer split (`-sm layer`); `-sm row` is rejected at model load.
 - With an active non-aLoRA adapter the shared cache does not write for that slot; the slot's own incremental continuation still works.
+- "An existing entry may replace a new one" has one definition: token prefix, **bidirectional** media identity over the shared range, and a file that still satisfies the `768 KiB/token` read-cost guard at that length. Write suppression, the background redundancy check and prefix dedup all use it, so "a longer entry exists" is by itself no reason to suppress or delete a shorter one.
+- The hash and the length only select a candidate; identity must match token by token and media triple by media triple. A hash collision is refused and logged, and the existing file is never overwritten.
 - A failed deletion (antivirus, unreleased handle) never reclaims quota: the entry is quarantined - still counted in `cache_disk_bytes`, still listed in `entries`, no longer offered to a lookup or to eviction; a later TTL/quota pass retries once the handle is gone.
 - The prefix directory targets **a single user and a single instance**: no tenant isolation, no cross-user quota, no cross-user sharing.
 - The directory observes the input boundary only; a longer snapshot that covers a prefix does not mark it `persisted` (conservative), although the disk LCP lookup may still serve it.

@@ -1069,3 +1069,130 @@ GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `
   - **`clamp_candidates()` 的端到端触发**：媒体身份含 token 数且输入经过区间/重叠校验后，节点边界不可能落在同一媒体块内部，因此该钳制在当前实现中是防御性路径，只能由单元测试的"边界性质"断言覆盖
   - 多 slot（`-np > 1`）、多用户：本轮明确不实现
   - Linux/POSIX 构建：未执行；本次改动未引入平台相关 API（`std::filesystem::remove` 与既有代码一致）
+
+# 2026-11-15 20-47 - Change Record（test1_2 修复轮：隔离条目与可替代性判定）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-15 20-31 - test1_2` 修复轮要求，修正磁盘缓存**写入抑制/冗余判断/前缀去重**三处与真实恢复条件不一致的判定。基线 HEAD `bc0c9c9`（`--version` 显示 `0.9.0-dev (build 13)`），上一修复提交 `57d9fce`。
+
+三个已确认缺陷：
+
+- **A 隔离条目仍阻止有效写入**：`quarantined` 只在 `load()` 的候选循环里被排除，`covered_cheaply()`、`store()`/`mirror()` 的精确去重、`worker()` 的冗余判断都没有过滤。结果同一条目可以"加载时不可用"却"写入时被认为已覆盖"。
+- **B 长条目未必能替代短条目**：`worker()`/`drop_prefixes()`/`dedup_prefixes()`/`covered_cheaply()` 只按纯 token 前缀关系判断冗余，忽略 `load()` 恢复前还要过的媒体身份、最小长度与 `size_file > lcp × 768 KiB` 成本守卫。真实案例：1226 MiB / 1596 token = 786 KiB/token，长条目对短请求是 `io_cost` 不可恢复，但短条目却被它当作"已覆盖"删掉。
+- **C hash + token 数不是身份**：`e.hash == hash && e.tokens.size() == …` 直接当"已保存"，既不看隔离状态也不核对 token/media 全量身份。
+
+本轮不改变 v8 条目格式、v3 清单、CRC 覆盖、配置签名、`load()` 的校验与恢复顺序、`768 KiB/token` 与 4096-token lag 两个常量、采样与 `n_past` 计算；不新增开关、不新增第二个通知通道。
+
+## 修改文件
+
+### tools/server/server-disk-cache-match.h / .cpp
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/server-disk-cache-match.h、tools/server/server-disk-cache-match.cpp
+- 修改位置：新模块全文
+- 具体变更：
+  - `disk_cache_prompt_identity`：非拥有指针形式的 token + media 三元组视图，附 `file_bytes`
+  - `disk_cache_match_prefix()`：三段判定——token LCP、**双向**媒体比较（A 的块必须在 B 同位置存在且长度/ID 相同，反之亦然）、媒体块内部边界钳制；媒体元数据数组长度不一致时返回 `usable_lcp = 0`（保守）
+  - `disk_cache_cost_ok()`：`file_bytes <= usable_lcp × DISK_CACHE_MAX_BYTES_PER_TOKEN`，常量从 `server-task.cpp` 的匿名命名空间移到这里，成为唯一出处
+  - `disk_cache_identity_equal()`：逐 token + 逐媒体三元组全等
+  - `disk_cache_classify_duplicate()`：hash/长度命中只作为候选筛选，身份不等一律返回 `none`（调用方据此拒绝写入，而不是判为去重或覆盖文件）
+  - `disk_cache_suppresses_write()`：媒体可兼容 + 共享长度 ≥ min_tokens + 尾部在 `max_prefix_lag_tokens` 内 + 成本守卫通过
+  - `disk_cache_can_replace()`：`shorter` 是 `longer` 的严格前缀、整个前缀媒体可兼容、且 `longer` 按该长度恢复仍满足成本守卫
+- 修改原因：规划 §1.3 / §1.4 / §3.1。判定与 `load()` 的确定性前置过滤一致，但不替代文件级校验
+
+### tools/server/CMakeLists.txt
+
+- 修改类型：修改
+- 修改前路径：tools/server/CMakeLists.txt
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/CMakeLists.txt（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`server-context` 源列表
+- 具体变更：加入 `server-disk-cache-match.cpp/.h`
+- 修改原因：注册新模块
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：包含、`disk_cache_counters`、`server_disk_cache` 私有段
+- 具体变更：引入 `server-disk-cache-match.h`；新增 `n_hash_collisions`；`covered_cheaply()` 形参改为 `const disk_cache_prompt_identity &`；新增 `identity_of()` 与 `is_reusable_entry()`；`drop_prefixes()` 增加 `pending_bytes`
+- 修改原因：把"候选是否有效/是否可替代"从各处内联判断收敛为单一接口
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：匿名命名空间常量、`identity_of()`/`is_reusable_entry()`（新增）、`covered_cheaply()`、`load()` 候选循环、`store()`、`mirror()`、`worker()`、`drop_prefixes()`、`dedup_prefixes()`、`to_metrics()`
+- 具体变更：
+  - **A**：`is_reusable_entry()` = `!quarantined && !tokens.empty()`；`covered_cheaply`、`store`/`mirror` 的去重循环、`worker` 的冗余循环、`drop_prefixes`/`dedup_prefixes`、`load` 候选统一先过这个判断
+  - **A 记账保持**：隔离条目仍留在 `entries` 与 `total_size`，不调用 `remove_file()`、不提前扣减、不恢复 `persisted`；被排除后新写入走原队列/预算路径（队列满时仍是 `n_enqueue_rejected`，不再伪称去重）
+  - **B**：`covered_cheaply()` 的判据换成 `disk_cache_suppresses_write()`（token+双向媒体+lag+成本守卫），删除了原先"带媒体的条目一律不参与"的粗糙跳过；`worker()` 的"更长就跳过"换成 `disk_cache_can_replace()`；`drop_prefixes()`/`dedup_prefixes()` 只在长条目确实可替代时才删除短条目，删除仍走 `remove_file()` + 成功后扣减 + `notify_invalidated`
+  - **B**：`drop_prefixes()` 新增 `pending_bytes` 形参，用待写状态体积近似待写文件体积参与成本守卫（文件头与 packed 部分相差 KiB 量级，相对 MiB 可忽略）
+  - **C**：`store`/`mirror` 的精确去重改为 `disk_cache_classify_duplicate()`；hash 冲突时 `n_hash_collisions++` 并 `SRV_ERR` 拒绝写入，不覆盖原文件
+  - `load()` 的内联 LCP + 三次媒体循环 + 内部钳制替换为 `disk_cache_match_prefix()`，行为等价（同一套规则），候选语义不变
+  - 删除已无引用的 `disk_cache_lcp()`；`DISK_CACHE_MAX_BYTES_PER_TOKEN` 改用头文件中的定义
+  - 指标新增 `cache_disk_hash_collision_total`
+- 修改原因：规划 §1.2–§1.4、§3.1–§3.2
+
+### tools/server/tests/unit/test_disk_cache_match.cpp
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/tests/unit/test_disk_cache_match.cpp
+- 修改位置：新文件（9 组检查）
+- 具体变更：纯 token 前缀；媒体身份（不同 ID、相同 ID 不同块长、一侧无媒体）；块内部边界钳制；成本守卫边界（含 1226 MiB / 1596 token 与 506 MiB / 1596 token 两个真实量级）；`can_replace` 的经济性/前缀性/最小长度；`can_replace` 的媒体分歧；`identity_equal`；`classify_duplicate` 的冲突分支；`suppresses_write` 的 lag、成本与媒体分歧
+- 修改原因：规划 §5.3/§5.4 要求可独立验证；该模块不依赖模型即可运行
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：指标表、§8 行为边界；projectSummary §3.1 不变量表、§5 说明、§8 边界
+- 具体变更：补 `cache_disk_hash_collision_total`；写明"可替代"的单一定义、"hash 不是身份"、"长条目未必能替代短条目（两者并存）"
+- 修改原因：规划 §二、§六
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real）
+- 检查结果：通过，`0 FAILED`；`--version` 为 `0.9.0-dev (build 13, commit bc0c9c9)`
+
+- 已执行检查：`tools/server/tests/unit/test_disk_cache_match.cpp`（cl 直接编译，不加载模型）
+- 检查结果：**先失败后通过**。首轮 2 项失败，均为用例构造问题而非实现错误：(1) 边界钳制用例的请求在前缀外已因 token 不同而分歧，"媒体钳制"没有真正生效，改为保留占位 token 的切片；(2) 媒体分歧用例的请求只有 500 token，落在 4096-token 容忍区间内，抑制本就成立，改为 6000 token 后夹具符合预期。修正后 9 组全部通过（`all disk-cache match checks passed`）
+
+- 已执行检查：隔离条目不再抑制写入（`test-run/logs/fix2-e1c.log`，`--cache-disk-ttl 2`，Python 持有 `.bin` 句柄）
+- 检查结果：通过。
+  - S1 写入 1385-token 条目（505.77 MiB）；S2（802 token）触发 `enforce_limit → sweep_expired`，删除失败并隔离：`failed to remove ... being used by another process` + `quarantined ... keeping 505.77 MiB accounted for and excluding it from lookups`
+  - S3（1456 token，与隔离条目共享 1385）在修复前会被 `covered_cheaply` 判为"已覆盖"而丢弃；本次实测 `stored 1456 tokens, 672.49 MiB`
+  - 指标：`cache_disk_entries 2 / cache_disk_bytes 1.23549e+09（= 505.77 + 672.49 MiB）/ cache_disk_quarantined 1 / enqueue_queued 3 / enqueue_dedup 0 / enqueue_rejected 0`——隔离条目仍占配额，新写入既没被伪称去重也没有突破预算
+
+- 已执行检查：短条目不被不可替代的长条目删除（`test-run/logs/fix2-e2.log`）
+- 检查结果：通过。先写 1385-token 条目（505.77 MiB），再写 6233-token 条目（1059.80 MiB）；日志中**没有** `prefix of a stored prompt` 删除记录，两个文件并存（530,337,934 B 与 1,111,276,454 B）。修复前该短条目会因纯 token 前缀关系被删除
+
+- 已执行检查：短条目仍然可服务（同上日志）
+- 检查结果：通过。随后同一 2000 字符请求：`source = disk, candidate_lcp = 1385, restored = 1385, entry_tokens = 1385, reused_disk = 1381, read_bytes = 530337934`——恢复自短条目（长条目 1059.80 MiB / 1385 = 783 KiB/token，超出 768 KiB 守卫）
+
+- 已执行检查：启动期去重不误删（`test-run/logs/fix2-startup.log`，重启于上一条的缓存目录）
+- 检查结果：通过。`2 entries after scan, 2 after dedup/trim`，两个文件都在；修复前启动期 `dedup_prefixes()` 会按纯前缀关系删掉短条目
+
+- 已执行检查：标准回归（`test-run/logs/fix2-reg.log`，发现开启 + both 捕获，双卡 `-ts 38,62`，语料 `E:\小说\正文.md`）
+- 检查结果：通过。`1385/0`、`4/1381`、`215/1381` 与上一轮逐项相同；输出 sha 相同（`fd7c5bda…`、`03e0e517…`）；合法写入抑制仍生效：`1603 tokens are covered up to a 4096-token tail by a stored entry, skipping a 678.05 MiB mirror`；`cache_disk_hash_collision_total 0`
+
+- 已执行检查：`git status`、临时产物清理
+- 检查结果：通过。测试缓存目录（约 4 GiB）、句柄脚本、临时编译脚本/可执行文件、构建日志与根目录 `.obj` 均已删除；`test-run/` 仅保留脚本与日志
+
+- 未执行的检查及原因：
+  - **媒体路径的端到端验证**：测试机加载的是纯文本 prompt，未启用 mmproj 输入，媒体分歧、块内部边界、不同块长等分支只由单元测试覆盖
+  - **真实 hash 冲突的端到端构造**：64 位 FNV 冲突无法在合理时间内构造，`classify_duplicate` 的冲突分支只有单元测试；端到端仅确认计数为 0
+  - 多 slot（`-np > 1`）与多用户：本轮明确不实现
+  - Linux/POSIX 构建：未执行；本轮未引入平台相关 API
+  - 取消/中断路径：未构造用例

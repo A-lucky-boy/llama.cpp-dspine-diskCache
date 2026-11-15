@@ -1726,6 +1726,10 @@ std::string server_task_result_metrics::to_metrics() {
             "Entry files that could not be deleted",
             (double) cache_disk.n_remove_failed
         }, {
+            "cache_disk_hash_collision_total",
+            "Writes refused because a hash/length hit had a different token/media identity",
+            (double) cache_disk.n_hash_collisions
+        }, {
             "cache_disk_queue_entries",
             "Number of disk cache writes waiting for the writer",
             (double) cache_disk.n_queue_entries
@@ -1991,12 +1995,9 @@ constexpr size_t DISK_CACHE_MIN_LOOKUP_TOKENS = 64;
 // --cache-disk-queue-max (common_params::cache_disk_queue_max_mib)
 constexpr size_t DISK_CACHE_QUEUE_MAX_ENTRIES = 8;
 
-// a restore always reads the whole entry file, so restoring a tiny shared
-// prefix out of a huge entry costs far more disk time than the prefill it
-// saves. the break-even point is roughly 1 MiB per restored token (a ~500 MB/s
-// disk reads ~2 s/GB while prefill runs ~2 k tok/s); skip restores above this
-// bytes-per-token cost
-constexpr size_t DISK_CACHE_MAX_BYTES_PER_TOKEN = 768ull*1024ull;
+// the cost guard itself (DISK_CACHE_MAX_BYTES_PER_TOKEN) lives in
+// server-disk-cache-match.h, so that load() and every write-suppression path
+// share one definition
 
 // replacing a stored entry rewrites the whole file, and an entry carries a
 // fixed-size state next to the KV payload: a 120k-token entry is ~2.7 GiB, i.e.
@@ -2117,17 +2118,6 @@ uint64_t disk_cache_hash(const llama_tokens & tokens, const std::vector<uint32_t
         }
     }
     return h;
-}
-
-size_t disk_cache_lcp(const llama_tokens & a, const llama_tokens & b) {
-    const size_t n = std::min(a.size(), b.size());
-
-    size_t i = 0;
-    while (i < n && a[i] == b[i]) {
-        ++i;
-    }
-
-    return i;
 }
 
 int64_t disk_cache_now() {
@@ -2383,6 +2373,22 @@ size_t server_disk_cache::n_entries() const {
 size_t server_disk_cache::size() const {
     std::lock_guard<std::mutex> lock(mtx);
     return total_size;
+}
+
+disk_cache_prompt_identity server_disk_cache::identity_of(const server_disk_cache_entry & e) {
+    disk_cache_prompt_identity id;
+    id.tokens             = &e.tokens;
+    id.media_indices      = &e.media_indices;
+    id.media_token_counts = &e.media_token_counts;
+    id.media_ids          = &e.media_ids;
+    id.file_bytes         = e.size_file;
+    return id;
+}
+
+bool server_disk_cache::is_reusable_entry(const server_disk_cache_entry & e) {
+    // a quarantined entry still occupies disk space but may not serve a lookup or
+    // stand in for a write; an entry without tokens has nothing to compare
+    return !e.quarantined && !e.tokens.empty();
 }
 
 disk_cache_remove_status server_disk_cache::remove_file(const std::string & path) const {
@@ -3260,21 +3266,18 @@ void server_disk_cache::drop_entry(const std::string & path) {
     save_manifest();
 }
 
-bool server_disk_cache::covered_cheaply(const llama_tokens & ids) const {
+bool server_disk_cache::covered_cheaply(const disk_cache_prompt_identity & wanted) const {
     // mtx must be held
     for (const auto & e : entries) {
-        // media placeholders are only comparable through the packed metadata, so
-        // an entry that carries images never stands in for another prompt
-        if (!e.media_indices.empty()) {
+        if (!is_reusable_entry(e)) {
+            // a quarantined entry must never be reported as "already covered":
+            // the write would be dropped while the lookup cannot use the entry
             continue;
         }
-        if (e.tokens.size() + DISK_CACHE_MAX_PREFIX_LAG_TOKENS < ids.size()) {
-            continue;
-        }
-        // an exact token prefix is not required: appending text can re-merge the
-        // tokens around the cut, and a restore truncates at the divergence point
-        // anyway, so what matters is that all but a short tail is already shared
-        if (disk_cache_lcp(e.tokens, ids) + DISK_CACHE_MAX_PREFIX_LAG_TOKENS >= ids.size()) {
+
+        // shared prefix over tokens *and* media, the tail tolerance, and the
+        // read-cost guard - the same deterministic pre-filters load() applies
+        if (disk_cache_suppresses_write(identity_of(e), wanted, min_tokens, DISK_CACHE_MAX_PREFIX_LAG_TOKENS)) {
             return true;
         }
     }
@@ -3282,53 +3285,43 @@ bool server_disk_cache::covered_cheaply(const llama_tokens & ids) const {
 }
 
 void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
-        const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids) {
-    namespace fs = std::filesystem;
-
+        const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids,
+        size_t pending_bytes) {
     // mtx must be held
+    disk_cache_prompt_identity longer;
+    longer.tokens             = &ids;
+    longer.media_indices      = &media_indices;
+    longer.media_token_counts = &media_token_counts;
+    longer.media_ids          = &media_ids;
+    longer.file_bytes         = pending_bytes;
+
     for (auto it = entries.begin(); it != entries.end(); ) {
-        const llama_tokens & old_ids = it->tokens;
-        if (old_ids.size() < ids.size() && disk_cache_lcp(old_ids, ids) == old_ids.size()) {
-            // the token sequence is a strict prefix, but the media placeholders
-            // could differ: every media chunk of the shorter entry must also be
-            // present in the longer one at the same position with the same id
-            bool media_ok = true;
-            for (size_t i = 0; i < it->media_indices.size() && media_ok; ++i) {
-                const uint32_t idx = it->media_indices[i];
-                const auto m = std::lower_bound(media_indices.begin(), media_indices.end(), idx);
-                if (m == media_indices.end() || *m != idx) {
-                    media_ok = false;
-                    break;
-                }
-                const size_t j = (size_t) (m - media_indices.begin());
-                if (it->media_token_counts[i] != media_token_counts[j] || it->media_ids[i] != media_ids[j]) {
-                    media_ok = false;
-                }
-            }
-
-            if (media_ok) {
-                const size_t size_file = std::min(total_size, it->size_file);
-
-                if (remove_file(it->path) == disk_cache_remove_status::failed) {
-                    // the short snapshot is still on disk and still restorable:
-                    // keep it, keep its quota and keep its physical reference
-                    SRV_WRN("disk cache: could not remove the superseded prefix '%s', keeping it\n",
-                            it->path.c_str());
-                    ++it;
-                    continue;
-                }
-
-                SRV_INF("disk cache: dropping '%s': prefix of a stored prompt, %zu tokens, %.2f MiB\n",
-                        it->path.c_str(), old_ids.size(), size_file/(1024.0*1024.0));
-                total_size -= size_file;
-                notify_invalidated(it->path);
-                it = entries.erase(it);
-            } else {
-                ++it;
-            }
-        } else {
+        // the shorter entry may only go when the longer one can really serve every
+        // request it served: media-compatible over that prefix, plus a file that
+        // passes the read-cost guard for that prefix length. a plain token prefix
+        // is not a substitute proof
+        if (!is_reusable_entry(*it) || !disk_cache_can_replace(longer, identity_of(*it), min_tokens)) {
             ++it;
+            continue;
         }
+
+        const llama_tokens & old_ids = it->tokens;
+        const size_t size_file = std::min(total_size, it->size_file);
+
+        if (remove_file(it->path) == disk_cache_remove_status::failed) {
+            // the short snapshot is still on disk and still restorable:
+            // keep it, keep its quota and keep its physical reference
+            SRV_WRN("disk cache: could not remove the superseded prefix '%s', keeping it\n",
+                    it->path.c_str());
+            ++it;
+            continue;
+        }
+
+        SRV_INF("disk cache: dropping '%s': prefix of a stored prompt, %zu tokens, %.2f MiB\n",
+                it->path.c_str(), old_ids.size(), size_file/(1024.0*1024.0));
+        total_size -= size_file;
+        notify_invalidated(it->path);
+        it = entries.erase(it);
     }
 }
 
@@ -3353,34 +3346,19 @@ void server_disk_cache::dedup_prefixes() {
             }
             const auto & b = entries[j];
 
-            // a is a strict prefix of b (and b is not a prefix of a)
-            const bool a_in_b = a.tokens.size() < b.tokens.size() && disk_cache_lcp(a.tokens, b.tokens) == a.tokens.size();
-            const bool b_in_a = b.tokens.size() < a.tokens.size() && disk_cache_lcp(b.tokens, a.tokens) == b.tokens.size();
+            if (!is_reusable_entry(a) || !is_reusable_entry(b)) {
+                continue;
+            }
+
+            // the shorter one is only redundant when the longer one can really
+            // serve every request it served; the same predicate as drop_prefixes
+            const bool a_in_b = disk_cache_can_replace(identity_of(b), identity_of(a), min_tokens);
+            const bool b_in_a = disk_cache_can_replace(identity_of(a), identity_of(b), min_tokens);
             if (!a_in_b && !b_in_a) {
                 continue;
             }
 
-            // the shorter one is the redundant prefix; it must also have the
-            // media chunks of the longer one as a subset to be safely droppable
             const auto & shorter = a_in_b ? a : b;
-            const auto & longer  = a_in_b ? b : a;
-
-            bool media_ok = true;
-            for (size_t k = 0; k < shorter.media_indices.size() && media_ok; ++k) {
-                const uint32_t idx = shorter.media_indices[k];
-                const auto m = std::lower_bound(longer.media_indices.begin(), longer.media_indices.end(), idx);
-                if (m == longer.media_indices.end() || *m != idx) {
-                    media_ok = false;
-                    break;
-                }
-                const size_t p = (size_t) (m - longer.media_indices.begin());
-                if (shorter.media_token_counts[k] != longer.media_token_counts[p] || shorter.media_ids[k] != longer.media_ids[p]) {
-                    media_ok = false;
-                }
-            }
-            if (!media_ok) {
-                continue;
-            }
 
             const size_t shorter_idx = a_in_b ? i : j;
             if (!drop[shorter_idx]) {
@@ -3425,6 +3403,13 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
         SRV_TRC("%s", "disk cache: request prompt metadata could not be packed, skipping\n");
         return true;
     }
+
+    // the request's identity, shared by every candidate comparison below
+    disk_cache_prompt_identity request_identity;
+    request_identity.tokens             = &tokens;
+    request_identity.media_indices      = &media_indices;
+    request_identity.media_token_counts = &media_token_counts;
+    request_identity.media_ids          = &media_ids;
 
     counters.n_lookups++;
 
@@ -3473,61 +3458,13 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
                 continue;
             }
 
-            size_t lcp = disk_cache_lcp(e.tokens, tokens);
-
-            // the media checks below can only shorten the usable prefix: keep
-            // track of that so a media-limited candidate is not reported as a
-            // plain prefix miss
-            bool media_clamped = false;
-            auto clamp_lcp = [&](size_t value) {
-                if (value < lcp) {
-                    lcp = value;
-                    media_clamped = true;
-                }
-            };
-
-            if (e.media_indices.size() != e.media_token_counts.size() || e.media_indices.size() != e.media_ids.size()) {
-                SRV_TRC("disk cache:   - entry with length %7zu skipped: inconsistent media metadata\n", e_size);
-                note_reject(0, cache_reject_reason::media_mismatch);
-                continue;
-            }
-            for (size_t i = 0; i < e.media_indices.size(); ++i) {
-                const uint32_t idx = e.media_indices[i];
-                if ((size_t) idx >= lcp) {
-                    continue;
-                }
-                const auto it = std::lower_bound(media_indices.begin(), media_indices.end(), idx);
-                if (it == media_indices.end() || *it != idx) {
-                    clamp_lcp((size_t) idx);
-                    break;
-                }
-                const size_t j = (size_t) (it - media_indices.begin());
-                if (e.media_token_counts[i] != media_token_counts[j] || e.media_ids[i] != media_ids[j]) {
-                    clamp_lcp((size_t) idx);
-                    break;
-                }
-            }
-            for (size_t i = 0; i < media_indices.size(); ++i) {
-                const uint32_t idx = media_indices[i];
-                const auto it = std::lower_bound(e.media_indices.begin(), e.media_indices.end(), idx);
-                if (it == e.media_indices.end() || *it != idx) {
-                    clamp_lcp((size_t) idx);
-                    break;
-                }
-                const size_t j = (size_t) (it - e.media_indices.begin());
-                if (media_token_counts[i] != e.media_token_counts[j] || media_ids[i] != e.media_ids[j]) {
-                    clamp_lcp((size_t) idx);
-                    break;
-                }
-            }
-            for (size_t i = 0; i < e.media_indices.size(); ++i) {
-                const size_t start = e.media_indices[i];
-                const size_t end = start + e.media_token_counts[i];
-                if (lcp > start && lcp < end) {
-                    clamp_lcp(start);
-                    break;
-                }
-            }
+            // one shared metadata rule, also used by the write-suppression and
+            // prefix-dedup paths, so the two can never disagree about what
+            // "shares a prefix" means. it never replaces the file validation and
+            // the state restore below
+            const disk_cache_prefix_match match = disk_cache_match_prefix(identity_of(e), request_identity);
+            const size_t lcp             = match.usable_lcp;
+            const bool   media_clamped   = !match.media_compatible;
 
             SRV_TRC("disk cache:   - entry with length %7zu, lcp = %7zu, f_keep = %.3f\n",
                     e_size, lcp, float(lcp) / e_size);
@@ -3545,7 +3482,7 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
             // a restore always reads the whole entry file, so skip entries
             // where the bytes read per restored token clearly cost more disk
             // time than the prefill of the shared prefix would take
-            if (e.size_file > lcp * DISK_CACHE_MAX_BYTES_PER_TOKEN) {
+            if (!disk_cache_cost_ok(e.size_file, lcp)) {
                 SRV_TRC("disk cache:   - skipping entry with length %7zu: lcp %7zu would read %.2f MiB per token\n",
                         e_size, lcp, e.size_file/(1024.0*1024.0)/std::max<size_t>(1, lcp));
                 note_reject(lcp, cache_reject_reason::io_cost);
@@ -3796,15 +3733,39 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
 
     const uint64_t hash = disk_cache_hash(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
 
+    disk_cache_prompt_identity pending_identity;
+    pending_identity.tokens             = &pending.ids;
+    pending_identity.media_indices      = &pending.media_indices;
+    pending_identity.media_token_counts = &pending.media_token_counts;
+    pending_identity.media_ids          = &pending.media_ids;
+    pending_identity.file_bytes         = pending.bytes;
+
     {
         std::lock_guard<std::mutex> lock(mtx);
 
         for (const auto & e : entries) {
-            if (e.hash == hash && e.tokens.size() == pending.ids.size()) {
+            if (!is_reusable_entry(e)) {
+                continue; // a quarantined entry is not "already stored"
+            }
+
+            const bool same_hash_and_length = e.hash == hash && e.tokens.size() == pending.ids.size();
+            if (!same_hash_and_length) {
+                continue;
+            }
+
+            // the hash only selects the candidate: the identity decides. a hash
+            // collision with different metadata must not be counted as a
+            // duplicate, and the existing file must not be overwritten
+            if (disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
                 SRV_TRC("disk cache: %016" PRIx64 " is already stored, skipping\n", hash);
                 counters.n_enqueue_dedup++;
                 return;
             }
+
+            counters.n_hash_collisions++;
+            SRV_ERR("disk cache: %016" PRIx64 " collides with '%s' but the token/media identity differs, refusing the write\n",
+                    hash, e.path.c_str());
+            return;
         }
 
         if (inflight.count(hash)) {
@@ -3813,7 +3774,7 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
             return;
         }
 
-        if (covered_cheaply(pending.ids)) {
+        if (covered_cheaply(pending_identity)) {
             SRV_INF("disk cache: %zu tokens are covered up to a %zu-token tail by a stored entry, skipping a %.2f MiB write\n",
                     pending.ids.size(), DISK_CACHE_MAX_PREFIX_LAG_TOKENS, pending.bytes/(1024.0*1024.0));
             counters.n_enqueue_dedup++;
@@ -3885,22 +3846,43 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
 
     const uint64_t hash = disk_cache_hash(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
 
+    disk_cache_prompt_identity pending_identity;
+    pending_identity.tokens             = &pending.ids;
+    pending_identity.media_indices      = &pending.media_indices;
+    pending_identity.media_token_counts = &pending.media_token_counts;
+    pending_identity.media_ids          = &pending.media_ids;
+    pending_identity.file_bytes         = pending.bytes;
+
     {
         std::lock_guard<std::mutex> lock(mtx);
 
         // already written, or already waiting in the queue
         for (const auto & e : entries) {
-            if (e.hash == hash && e.tokens.size() == pending.ids.size()) {
+            if (!is_reusable_entry(e)) {
+                continue;
+            }
+
+            const bool same_hash_and_length = e.hash == hash && e.tokens.size() == pending.ids.size();
+            if (!same_hash_and_length) {
+                continue;
+            }
+
+            if (disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
                 counters.n_enqueue_dedup++;
                 return false;
             }
+
+            counters.n_hash_collisions++;
+            SRV_ERR("disk cache: %016" PRIx64 " collides with '%s' but the token/media identity differs, refusing the mirror\n",
+                    hash, e.path.c_str());
+            return false;
         }
         if (inflight.count(hash)) {
             counters.n_enqueue_dedup++;
             return false;
         }
 
-        if (covered_cheaply(pending.ids)) {
+        if (covered_cheaply(pending_identity)) {
             SRV_INF("disk cache: %zu tokens are covered up to a %zu-token tail by a stored entry, skipping a %.2f MiB mirror\n",
                     pending.ids.size(), DISK_CACHE_MAX_PREFIX_LAG_TOKENS, pending.bytes/(1024.0*1024.0));
             counters.n_enqueue_dedup++;
@@ -4042,15 +4024,26 @@ void server_disk_cache::worker() {
         std::string path;
         size_t size_file = 0;
 
-        // skip the write when a longer stored entry already has this prompt as
-        // a strict prefix: the longer one serves every lookup this one would,
-        // so writing it would only waste disk
+        // skip the write when a stored entry can actually replace this prompt:
+        // a longer entry whose shared prefix is media-compatible over the whole
+        // prompt *and* whose file stays within the read-cost guard. a plain token
+        // prefix is not enough - a huge entry cannot economically serve a short
+        // request, and a quarantined one cannot serve anything
         bool redundant = false;
         {
+            disk_cache_prompt_identity pending_identity;
+            pending_identity.tokens             = &pending.ids;
+            pending_identity.media_indices      = &pending.media_indices;
+            pending_identity.media_token_counts = &pending.media_token_counts;
+            pending_identity.media_ids          = &pending.media_ids;
+            pending_identity.file_bytes         = bytes;
+
             std::lock_guard<std::mutex> lock(mtx);
             for (const auto & e : entries) {
-                if (pending.ids.size() < e.tokens.size() &&
-                        disk_cache_lcp(pending.ids, e.tokens) == pending.ids.size()) {
+                if (!is_reusable_entry(e)) {
+                    continue;
+                }
+                if (disk_cache_can_replace(identity_of(e), pending_identity, min_tokens)) {
                     redundant = true;
                     break;
                 }
@@ -4097,7 +4090,8 @@ void server_disk_cache::worker() {
 
                 // this prompt subsumes any shorter stored prompt that is its
                 // prefix, so those files are dead weight - drop them
-                drop_prefixes(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
+                drop_prefixes(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids,
+                        bytes);
 
                 enforce_limit();
 

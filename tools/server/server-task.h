@@ -17,6 +17,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-disk-cache-match.h"
 #include "server-prefix-index.h"
 #include "mtmd-helper.h"
 
@@ -677,6 +678,7 @@ struct disk_cache_counters {
     uint64_t n_enqueue_dedup        = 0; // already stored, already queued or covered by a longer entry
     uint64_t n_enqueue_rejected     = 0; // over the size limit or the queue budget
     uint64_t n_remove_failed        = 0; // files that could not be deleted, cumulative
+    uint64_t n_hash_collisions      = 0; // hash/length hit with a different identity, cumulative
     uint64_t n_quarantined          = 0; // entries currently excluded from lookups
     uint64_t n_entries              = 0;
     uint64_t n_bytes                = 0; // accounted disk usage (total_size)
@@ -990,11 +992,20 @@ private:
     // (and whose media chunks are a subset of the given ones): the longer
     // entry serves any lookup the shorter one would
     void drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
-            const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids);
+            const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids,
+            size_t pending_bytes);
     // true when a stored entry already shares all but a short tail of the given
-    // prompt, so rewriting the entry would cost more than the prefill the longer
-    // prefix saves; mtx must be held
-    bool covered_cheaply(const llama_tokens & ids) const;
+    // prompt **and** could actually be restored for it (media-compatible over the
+    // shared prefix, cost guard satisfied), so rewriting would cost more than the
+    // prefill the longer prefix saves; mtx must be held
+    bool covered_cheaply(const disk_cache_prompt_identity & wanted) const;
+
+    // metadata view of one entry, for the substitution helpers
+    static disk_cache_prompt_identity identity_of(const server_disk_cache_entry & e);
+    // a candidate that may serve a lookup or stand in for a write: not
+    // quarantined and non-empty. it does not imply the file is intact - load()
+    // still validates it
+    static bool is_reusable_entry(const server_disk_cache_entry & e);
     // remove any stored entry that is a redundant prefix of another stored
     // entry (run once at startup, after scan)
     void dedup_prefixes();

@@ -62,6 +62,9 @@
 | 索引输入必须自洽 | media 三元组长度、区间、重叠、空 ID 任一不合法即整条观察被拒（`invalid_media`），不降级为"仅 token"路径；媒体身份 = 块 ID + token 数 |
 | 只读查询不改变索引 | `candidates()` 只为已有身份解析编号，未知身份映射到不可匹配的哨兵值，不增长驻留表 |
 | 索引内存有界且可回收 | `approx_bytes()` 覆盖节点、媒体表、快照表、tombstone、观察去重表；节点数与字节双约束，只淘汰无引用叶子 |
+| 「可替代」只有一个定义 | `server-disk-cache-match.*` 的纯元数据判定：token 前缀 + 共享范围内双向媒体一致 + 独立边界不落在媒体块内部 + 该条目按此长度读盘满足 `768 KiB/token`。写入抑制（`covered_cheaply`）、后台冗余（`worker`）、长短前缀去重（`drop_prefixes`/`dedup_prefixes`）与 `load()` 的候选过滤共用它 |
+| 隔离条目不参与任何替代判定 | `is_reusable_entry()` = 未隔离且非空；`covered_cheaply`、`store`/`mirror` 的精确去重、`worker` 冗余、两条去重路径与 `load()` 候选一律先过滤 |
+| hash 不是身份 | hash + token 长度只用于挑候选，身份要求逐 token 与媒体三元组（位置/长度/ID）全等；不一致按 hash 冲突拒绝写入并计数，绝不覆盖原文件 |
 
 ---
 
@@ -98,7 +101,7 @@
 | `--cache-prefix-max-candidates N` | 256 | 目录节点上限 |
 | `--cache-prefix-max-index-mib N` | 64 | 目录内存预算 |
 
-磁盘层的删除与隔离不新增开关：它是既有语义的修正。相关观测指标为 `cache_disk_bytes`（账面占用，含不可删除条目）、`cache_disk_quarantined`、`cache_disk_remove_failed_total`。
+磁盘层的删除、隔离与替代性判定不新增开关：它们是既有语义的修正。相关代码为 `server-disk-cache-match.h/.cpp`（纯元数据、可独立单测）与 `server_disk_cache` 的 `identity_of()/is_reusable_entry()/covered_cheaply()`。相关观测指标为 `cache_disk_bytes`（账面占用，含不可删除条目）、`cache_disk_quarantined`、`cache_disk_remove_failed_total`。
 
 ---
 
@@ -142,6 +145,7 @@ candidate_lcp >= restored >= reused       # 依次被闸门削减
 7. 未部署到生产目录；`output/` 为当前构建产物。
 8. 删除失败是常态而非异常：Windows 上杀软扫描或未释放句柄都会让 `fs::remove` 失败。此时条目被隔离、配额照实保留、引用撤销；句柄释放后由下一次 sweep/TTL 重试回收，不会静默少报占用。
 9. 前缀目录不持久化：重启后由已校验磁盘条目重建引用（epoch 从 0 起算），不写额外索引文件；tombstone 只作用于进程生命周期。
+10. 长条目未必能替代短条目：读盘成本守卫以「恢复该前缀要读多少字节」为判据，1 GiB 级条目对 1.4k token 请求就是 `io_cost`。因此短条目只在长条目确实经济可用时才被去重删除，否则两者共存（实测两者并存，短条目继续服务对应请求）。
 
 ---
 
