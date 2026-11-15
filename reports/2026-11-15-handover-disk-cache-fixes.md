@@ -163,9 +163,15 @@ FAIL test_disk_cache_match.cpp:208: m.usable_lcp == 4 (12 vs 4)
 
 ---
 
-## 7. 提交清单
+## 7. 提交清单与推送状态
+
+- 远程：`git@github.com:A-lucky-boy/llama.cpp-dspine-diskCache.git`，分支 `main`
+- 本轮推送：`6f9b0de..5bd7c84`，已于 2026-11-15 21:50 完成
+- 工作树在推送后为空（无未提交改动）
 
 ```text
+5bd7c84  docs(test-run): 补充 MODEL_DIR 环境变量说明
+55b2aac  chore(test-run): 提交复现脚本并隔离本地产物
 5627aed  fix: 双向媒体扫描、真实字节替代判断与路径所有权
 0c289e7  fix: 隔离条目与可替代性判定
 6f9b0de  docs: 可替代性判定修复的变更说明
@@ -179,10 +185,16 @@ bc0c9c9  基线（进入本批之前）
 tools/server/server-disk-cache-match.h
 tools/server/server-disk-cache-match.cpp
 tools/server/tests/unit/test_disk_cache_match.cpp
-test-run/README.md            （测试脚本说明，脚本本身一并入库）
+test-run/README.md            （测试脚本说明）
+reports/2026-11-15-handover-disk-cache-fixes.md   （本文）
 ```
 
-`test-run/` 只提交**脚本**；原始日志（`logs/*.log`）、模型续写文本（`logs/out-*.txt`，含本地语料衍生内容）、缓存目录（`cache-*/`，每个 0.5–1.5 GiB）均已加入 `.gitignore`，不入库。测试脚本的语料路径改为环境变量 `LLAMA_TEST_CORPUS`，不再写死本机路径。
+`test-run/` 只提交**脚本**（9 个文件，共约 4 KB）；原始日志（`logs/*.log`）、模型续写文本（`logs/out-*.txt`）、缓存目录（`cache-*/`，每个 0.5–1.5 GiB）与临时 exe 均已加入 `.gitignore`，不入库。
+
+两点需要说明的处置：
+
+1. `logs/out-*.txt` 是模型基于本地中文语料续写出的文本片段，属第三方作品衍生内容，**不应上传公开仓库**，因此单独加入忽略规则，而不是连带 `test-run/` 一起忽略。
+2. 测试脚本原先写死了本机路径（仓库目录、模型目录、语料路径）。改用环境变量 `MODEL_DIR` / `LLAMA_TEST_CORPUS` / `LLAMA_TEST_PORT`，`ROOT` 由脚本自身位置推导，默认 `MODEL_DIR=<repo>\models`。
 
 ---
 
