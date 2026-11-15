@@ -669,6 +669,15 @@ struct common_params {
     // common_cache_boundary, 0 - disabled (the historical behaviour)
     int32_t     cache_boundary_capture = 0;   // --cache-boundary-capture
 
+    // single-user common-prefix discovery: keep an in-memory directory of the
+    // token/media prefixes successive requests share. metadata only - it never
+    // restores anything and never counts as a cache hit
+    bool        cache_prefix_discovery      = false; // --cache-prefix-discovery
+    int32_t     cache_prefix_min_tokens     = 512;   // --cache-prefix-min-tokens
+    int32_t     cache_prefix_observations   = 2;     // --cache-prefix-observations
+    int32_t     cache_prefix_max_candidates = 256;   // --cache-prefix-max-candidates
+    int32_t     cache_prefix_max_index_mib  = 64;    // --cache-prefix-max-index-mib
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";

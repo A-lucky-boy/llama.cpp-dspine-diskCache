@@ -37,6 +37,10 @@
 | 请求级 token 来源分解（`--cache-stats` + `/metrics`） | **已实现并实测自洽** | 恒等式 `prompt = reused_slot+ram+disk+prefill` 三例成立 |
 | 请求边界捕获（`--cache-boundary-capture`） | **已实现；`input` 只进 RAM** | 双卡实测，output 才写盘 |
 | 边界捕获 / 磁盘恢复后的数值一致性 | **已验证** | 同前缀冷/暖输出逐字节相同（sha256 相同） |
+| 公共前缀目录（`--cache-prefix-discovery`） | **已实现；发现≠可恢复≠命中** | 双卡实测 + 独立自检 |
+| 用目录候选当作磁盘命中 | **已否证（设计上禁止）** | 实测 `candidate_lcp=1596 / reused_disk=0 / reject=io_cost` |
+| 长快照（A+B）能否把短前缀（A）标为 persisted | **不能**（保守语义） | 代码级：只认可精确端点 |
+| 目录观察输出边界 | **不可行** | `task->tokens` 不含生成 token，`keep_first` 触发断言（已修） |
 
 ---
 

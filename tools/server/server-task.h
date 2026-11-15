@@ -13,9 +13,11 @@
 #include <thread>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-prefix-index.h"
 #include "mtmd-helper.h"
 
 
@@ -680,6 +682,9 @@ struct server_task_result_metrics : server_task_result {
     // counters of the on-disk prompt cache tier (zero when it is disabled)
     disk_cache_counters cache_disk;
 
+    // counters of the optional prefix directory (zero when it is disabled)
+    prefix_index_stats cache_prefix;
+
     virtual json to_json() override;
 
     struct metric_item {
@@ -887,6 +892,16 @@ struct server_disk_cache {
 
     // cumulative counters for /metrics; takes the lock to sample entries/queue
     disk_cache_counters stats() const;
+
+    // copy of the committed entries, so the prefix directory can register the
+    // snapshots that already exist on disk without touching the cache internals
+    std::vector<server_disk_cache_entry> entries_snapshot() const;
+
+    // optional hooks for the prefix directory. `on_entry_committed` runs after a
+    // write has been committed (file in place, manifest updated); both may run
+    // on the writer thread and must not touch disk-cache state
+    std::function<void(const server_disk_cache_entry &)> on_entry_committed;
+    std::function<void(const std::string &)>            on_entry_invalidated;
 
     // counters written from the lookup path and the writer thread; the sizes of
     // `entries` and `queue` are sampled separately under the lock

@@ -13,7 +13,8 @@
 1. **阶段 0（缺陷修复）已完成并经端到端验证**：重启后首个请求整段 prefill 的真因（`touch_entry()` 写偏移覆盖 `crc_drft`）已修复；packed 元数据补齐写侧 CRC 与读写绑定（格式 v7 → v8，清单 v2 → v3）。
 2. **阶段 1（精确命中统计）已完成**：`--cache-stats` 与 `/metrics` 新增的 `llamacpp:cache_*` 系列可把每个请求的输入 token 拆成 `slot / RAM / 磁盘 / 真实 prefill` 四份互斥计数，并把"未命中"归因到具体拒绝原因。
 3. **阶段 2（请求边界捕获）已完成**：`--cache-boundary-capture input|output|both` 在输入结束与生成结束两个安全点捕获完整快照，默认关闭；捕获只覆盖内存实际持有位置，不会声称未计算的 KV。
-4. **阶段 3–7 未开始**。其中阶段 4（分块 KV）按规划要求必须先完成"序列状态可分块性"技术审查，未做审查前不得对 opaque state 做字节切片。
+4. **阶段 3（公共前缀目录）已完成**：`--cache-prefix-discovery` 维护只读的内存前缀目录，区分 `observed / eligible / persisted / unavailable`，与 v8 快照按**精确端点**关联并在条目删除时撤销引用；不参与查找、不计命中。
+5. **阶段 4–7 未开始**。阶段 4（分块 KV）必须先完成"序列状态可分块性"技术审查，未做审查前不得对 opaque state 做字节切片。
 5. **未部署到生产**。`D:\AiHelper\llama.cpp` 仍是旧二进制，本次产物只落在仓库 `output/`。
 
 ---
@@ -51,7 +52,7 @@
 | 阶段 0 缺陷修复 | **完成** | `touch_entry` 偏移；packed CRC + 读写绑定；版本化丢弃；读盘三态与先校验后恢复；候选回退（单次最多 4 个）；每条失败分支独立日志 |
 | 阶段 1 统计与可观测性 | **完成** | 逐请求分解 + 拒绝原因 + 15 项指标；`candidate_lcp / restored / reused` 三者分离 |
 | 阶段 2 请求边界捕获 | **完成** | `input` 只进 RAM、`output` 进 RAM 并排队写盘；复用既有去重与写入抑制 |
-| 阶段 3 公共前缀识别与准入 | **未开始** | 需新增 `server-prefix-index.*`；必须先区分"被观察到的公共前缀"与"有可恢复状态的前缀" |
+| 阶段 3 公共前缀识别与准入 | **完成** | `server-prefix-index.*`；`observed/eligible` 永不作为命中，`persisted` 只认精确端点快照 |
 | 阶段 4 可增量持久化的分块 KV | **未开始（有前置阻断）** | 规划要求先审查 `llama_state_seq_get/set_data_ext` 是否提供"前 N token 的自洽状态"；目前证据是只保证整序列兼容，**不得切片** |
 | 阶段 5 增量写入与成本感知查找 | **未开始** | 依赖阶段 4 的物理格式 |
 | 阶段 6 热点准入与分层淘汰 | **未开始** | 依赖独立对象存储与稳定统计 |
@@ -156,3 +157,37 @@ python test-run\probe.py 2000 8 cold
 python test-run\probe.py 2000 8 append ext:2300
 python test-run\metrics.py
 ```
+
+---
+
+## 10. 阶段 3 追加（2026-11-15 19:35）
+
+在上文截止点之后落地了 `test1_2` 规定的内容，本节只补充差异，前文条款中与之冲突处以本节为准。
+
+**新增**
+
+- `tools/server/server-prefix-index.h/.cpp`：路径压缩 radix tree，边键 `(token id, 媒体驻留编号)`；`observe()` 按请求 ID 去重、返回共享前缀候选；`on_snapshot_committed/invalidated` 维护物理引用；容量上限按节点数与内存双重约束，只淘汰无引用叶子。
+- 5 个开关：`--cache-prefix-discovery`（默认关）、`--cache-prefix-min-tokens 512`、`--cache-prefix-observations 2`、`--cache-prefix-max-candidates 256`、`--cache-prefix-max-index-mib 64`。
+- 指标：`cache_prefix_requests_total`、`_candidates_total`、`_observed_total`、`_eligible_total`、`_invalidated_refs_total`、`_evicted_total`、`_rejected_total`，以及 gauge `_nodes`、`_tokens`、`_bytes`、`_persisted_refs`、`_snapshots`、`_unavailable`。
+- `projectSummary.md`：项目结构、数据流、格式、开关、口径与阶段进度的汇总。
+- 独立自检 `tools/server/tests/unit/test_cache_prefix_index.cpp`（不加载模型，文件头有编译命令）。
+
+**证据**
+
+| 检查 | 结果 |
+|---|---|
+| 自检 7 组（分叉/去重/媒体/钳制/引用/容量/关闭） | 通过（首轮 3 项失败，修复 `walk()` 的边内分歧候选后通过） |
+| 发现序列 A+B / A+C / A+D | `best_prefix=1385`，`observed → eligible` 随观察数增长；异前缀请求 0 候选 |
+| input 捕获 + 精确端点 | 写 1385 快照后下一请求 `best_state=persisted, persisted_prefix=1385` |
+| 条目替换致引用失效 | `drop_prefixes` 删除 1385 条目 → `invalidated_refs=1 / unavailable=1` |
+| 重启重建 | `1 snapshot(s) registered`，无新索引文件 |
+| 关闭开关回归 | 0 条 prefix 日志、指标全 0、`prompt_n/cache_n` 与开启时逐一相同、输出 sha 相同 |
+| 候选≠命中 | `candidate_lcp=1596, restored=0, reused_disk=0, reject=io_cost` |
+
+**新增边界**
+
+- 只观察输入边界（`task->tokens`），输出边界不构成独立观察；覆盖生成尾部的快照由磁盘提交事件登记。
+- 长快照不把更短前缀标为 `persisted`（保守语义），尽管磁盘 LCP 查找仍可能命中它。
+- 目录为单用户、单实例；不持久化，不写新索引文件。
+
+**下一步仍是阶段 4 的只读可行性审查**：在确认存在"导出前 N token 自洽状态"的正式 API 之前，不做任何分块 KV 或字节切片。

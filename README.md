@@ -188,6 +188,11 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `--cache-disk-queue-max N` | 24576 MiB | 24576 | 待写队列字节预算 |
 | `--cache-stats` | 关闭 | 关闭 | 逐请求输出 token 来源分解与拒绝原因，并开放对应 /metrics 计数 |
 | `--cache-boundary-capture none\|input\|output\|both` | none | none | 在请求输入/输出边界主动捕获完整快照 |
+| `--cache-prefix-discovery` | 关闭 | 关闭 | 维护单用户公共前缀目录（只读元数据，见 §6.9） |
+| `--cache-prefix-min-tokens N` | 512 | 512 | 前缀进入 `eligible` 的最小长度 |
+| `--cache-prefix-observations N` | 2 | 2 | 进入 `eligible` 的最小不同请求数 |
+| `--cache-prefix-max-candidates N` | 256 | 256 | 目录节点上限 |
+| `--cache-prefix-max-index-mib N` | 64 | 64 | 目录内存预算 |
 | `--n-ctx-checkpoints` | 32 | 32 | 每个 slot 的上下文检查点上限 |
 
 ### 6.7 请求边界捕获
@@ -223,6 +228,32 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 
 **命中实践**：系统提示、工具定义、few-shot 静态化并置于最前；时间戳、用户名等动态内容后置；多轮对话只追加不改写。
 
+### 6.9 公共前缀发现（单用户）
+
+默认关闭（`--cache-prefix-discovery`）。开启后维护一个**只读、常驻内存**的 token/media 前缀目录，用来回答"哪些前缀被多个请求共享"。它不参与缓存查找，也不改变 `load()` 的候选选择。
+
+| 状态 | 含义 | 能否当作命中 |
+|---|---|---|
+| `observed` | 观察到多个请求共享该前缀 | 否 |
+| `eligible` | 长度与观察次数达到门槛，值得为它捕获状态 | 否 |
+| `persisted` | 已有校验通过的磁盘快照，且与该前缀**精确对齐** | 否，真实复用仍由磁盘缓存路径判定 |
+| `unavailable` | 前缀仍被记录，但其快照已被删除或失效 | 否 |
+
+- 结构是路径压缩 Trie（radix tree），边的键是 `(token id, 媒体身份)`。媒体身份是**字符串驻留编号**而不是哈希，所以比较是精确比较：只有 token 与媒体身份都相同前缀才继续匹配，不做"64 位哈希相等即等价"的推断。
+- 观察只来自请求输入边界：`slot.task->tokens` 是用户输入，输出边界含有生成 token，不构成独立观察；覆盖生成尾部的快照由磁盘缓存在**提交后**登记（`on_snapshot_committed`）。每请求按 ID 去重，输入/输出边界只计一次。
+- 与物理快照的关联是**精确端点**：只有快照的 token 序列与该前缀完全相等才标 `persisted`。`A+B` 的快照不会让 `A` 变成 `persisted`（`A` 仍可被磁盘层按 LCP 命中，那是既有路径的事，与本目录无关）。
+- 失效：条目被损坏删除、TTL 过期、配额淘汰、前缀去重删除时，目录立即撤销引用并把节点标为 `unavailable`；重启时从已校验的磁盘条目重建引用，**不写任何新的持久索引文件**。
+- 容量：`--cache-prefix-max-candidates` 与 `--cache-prefix-max-index-mib` 联合约束，只淘汰**无物理引用**的叶子节点，因此不会因目录容量丢掉仍被引用的快照。
+- 目录既不触发额外 prefill，也不序列化状态；实测同参数开/关对照，生成文本逐字节相同，`reused_*` 统计完全一致。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--cache-prefix-discovery` | 关闭 | 启用目录 |
+| `--cache-prefix-min-tokens N` | 512 | 进入 `eligible` 的最小长度，独立于 `--cache-disk-min-tokens` |
+| `--cache-prefix-observations N` | 2 | 进入 `eligible` 的最小不同请求数 |
+| `--cache-prefix-max-candidates N` | 256 | 节点上限 |
+| `--cache-prefix-max-index-mib N` | 64 | 内存预算 |
+
 ## 7. 可观测性
 
 `-lv 3` 为默认 INFO，`TRACE=4`、`DEBUG=5`。
@@ -240,6 +271,7 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `write queue is full` | WRN | 待写队列达到字节或条目上限 |
 | `cache_stats: prompt = ..., reused_slot/ram/disk = ..., prefill = ...` | INFO | `--cache-stats` 开启时每请求一行，token 来源分解 |
 | `cache_stats: boundary = input/output, captured = yes/no, tokens = ...` | INFO | `--cache-stats` 开启时的边界捕获结果 |
+| `cache_stats: prefix_tokens = ..., prefix_candidates = ..., best_prefix = ..., best_state = ...` | INFO | `--cache-stats` 开启时目录的发现结果，**不是命中** |
 
 ### 7.1 缓存指标（`/metrics`，需 `--metrics`）
 
@@ -256,6 +288,13 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `llamacpp:cache_disk_restore_seconds_total` | 读盘 + 状态恢复耗时 |
 | `llamacpp:cache_disk_entries` / `_queue_entries` / `_queue_bytes` | 条目数与待写队列 |
 | `llamacpp:cache_disk_manifest_fallback_total` | 清单不可信、回退全量扫描的次数 |
+| `llamacpp:cache_prefix_requests_total` | 已发布观察的请求数 |
+| `llamacpp:cache_prefix_candidates_total` | 返回给调用方的候选前缀数（累计） |
+| `llamacpp:cache_prefix_observed_total` / `_eligible_total` | 进入 `observed` / `eligible` 的累计次数 |
+| `llamacpp:cache_prefix_invalidated_refs_total` | 因快照消失而撤销的引用（累计） |
+| `llamacpp:cache_prefix_evicted_total` / `_rejected_total` | 容量淘汰 / 拒绝（累计） |
+| `llamacpp:cache_prefix_nodes` / `_tokens` / `_bytes` | 目录当前规模 |
+| `llamacpp:cache_prefix_persisted_refs` / `_snapshots` / `_unavailable` | 当前被精确对齐的前缀数、活引用数、失效前缀数 |
 
 三条口径不可混用：`candidate_lcp` 是候选共享前缀，`restored` 是候选条目实际恢复的长度，`reused_*` 是恢复后仍被 `n_past` 认可、真正免掉 prefill 的 token 数（还会被检查点与「末位 token 必须重算」等守卫削减）。恒等式为 `prompt = reused_slot + reused_ram + reused_disk + prefill`。
 
@@ -263,6 +302,8 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 
 - CUDA 后端只支持按层切分（`-sm layer`）；`-sm row` 在模型加载阶段即被拒绝。
 - 生效的非 aLoRA 适配器下，共享缓存对该 slot 不写入；slot 自身的增量续算仍可用。
+- 公共前缀目录面向**单用户、单实例**：不做租户隔离、不做跨用户配额，也不参与跨用户共享。
+- 目录只观察输入边界；比请求更长的快照覆盖该前缀时，该前缀不会被标为 `persisted`（保守语义），但磁盘 LCP 查找仍可命中它。
 - packed 元数据自 v8 起有独立 CRC：写侧写入条目头，读侧在**任何**状态写入之前校验，并与启动清单记录绑定；清单不可信时回退逐文件头校验，不会因为清单存在就跳过验证。
 - 条目按前缀匹配，首次请求必然全量 prefill；`-np 1` 下单 slot 串行服务。
 - 强制终止进程不触发析构，持久化依赖空闲镜像（60 s）或淘汰落盘。

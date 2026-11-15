@@ -1734,9 +1734,73 @@ std::string server_task_result_metrics::to_metrics() {
         }
     };
 
+    // prefix directory: discovery metadata only. none of these counters may be
+    // added to the reused-token counters above - a candidate prefix is not a hit
+    const std::vector<metric_item> prefix_counters = {
+        {
+            "cache_prefix_requests_total",
+            "Requests published to the prefix directory",
+            (double) cache_prefix.n_requests
+        }, {
+            "cache_prefix_candidates_total",
+            "Common prefixes reported to callers",
+            (double) cache_prefix.n_candidates
+        }, {
+            "cache_prefix_observed_total",
+            "Prefixes that became observed (cumulative transitions)",
+            (double) cache_prefix.n_observed_events
+        }, {
+            "cache_prefix_eligible_total",
+            "Prefixes that became eligible for capture (cumulative transitions)",
+            (double) cache_prefix.n_eligible_events
+        }, {
+            "cache_prefix_invalidated_refs_total",
+            "Physical references withdrawn because the snapshot went away",
+            (double) cache_prefix.n_invalidated
+        }, {
+            "cache_prefix_evicted_total",
+            "Prefix nodes dropped by the capacity limits",
+            (double) cache_prefix.n_evicted
+        }, {
+            "cache_prefix_rejected_total",
+            "Observations refused because nothing could be evicted",
+            (double) cache_prefix.n_rejected
+        },
+    };
+
+    const std::vector<metric_item> prefix_gauges = {
+        {
+            "cache_prefix_nodes",
+            "Prefix nodes currently held",
+            (double) cache_prefix.n_nodes
+        }, {
+            "cache_prefix_tokens",
+            "Token/media units currently indexed",
+            (double) cache_prefix.n_tokens
+        }, {
+            "cache_prefix_bytes",
+            "Approximate memory held by the prefix directory",
+            (double) cache_prefix.bytes
+        }, {
+            "cache_prefix_persisted_refs",
+            "Prefixes currently backed by a validated snapshot",
+            (double) cache_prefix.n_persisted
+        }, {
+            "cache_prefix_snapshots",
+            "Live physical references",
+            (double) cache_prefix.n_snapshots
+        }, {
+            "cache_prefix_unavailable",
+            "Prefixes whose snapshot was withdrawn",
+            (double) cache_prefix.n_unavailable
+        },
+    };
+
     add_items("counter", counters);
     add_items("counter", cache_counters);
+    add_items("counter", prefix_counters);
     add_items("gauge",   gauges);
+    add_items("gauge",   prefix_gauges);
 
     // labeled counter: one series per reject reason
     prometheus << "# HELP llamacpp:cache_disk_reject_total Prompts the on-disk cache could not serve, by reason" << "\n"
@@ -2297,6 +2361,11 @@ size_t server_disk_cache::n_entries() const {
 size_t server_disk_cache::size() const {
     std::lock_guard<std::mutex> lock(mtx);
     return total_size;
+}
+
+std::vector<server_disk_cache_entry> server_disk_cache::entries_snapshot() const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return entries;
 }
 
 disk_cache_counters server_disk_cache::stats() const {
@@ -3085,6 +3154,18 @@ bool server_disk_cache::touch_entry(const server_disk_cache_entry & e) {
 // the file, drop it from the index and persist the manifest. must not be
 // called with mtx held
 void server_disk_cache::drop_entry(const std::string & path) {
+    // the prefix directory only keeps metadata: notify it after the entry is
+    // gone, without holding the cache lock
+    struct notify_guard {
+        server_disk_cache & self;
+        const std::string & path;
+        ~notify_guard() {
+            if (self.on_entry_invalidated) {
+                self.on_entry_invalidated(path);
+            }
+        }
+    } notify { *this, path };
+
     std::lock_guard<std::mutex> lock(mtx);
 
     std::error_code ec;
@@ -3170,6 +3251,9 @@ void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vecto
                 SRV_INF("disk cache: dropping '%s': prefix of a stored prompt, %zu tokens, %.2f MiB\n",
                         it->path.c_str(), old_ids.size(), size_file/(1024.0*1024.0));
                 total_size -= size_file;
+                if (on_entry_invalidated) {
+                    on_entry_invalidated(it->path);
+                }
                 it = entries.erase(it);
             } else {
                 ++it;
@@ -3794,6 +3878,9 @@ void server_disk_cache::sweep_expired() {
             fs::remove(it->path, ec);
 
             total_size -= std::min(total_size, it->size_file);
+            if (on_entry_invalidated) {
+                on_entry_invalidated(it->path);
+            }
             it = entries.erase(it);
         } else {
             ++it;
@@ -3820,6 +3907,9 @@ void server_disk_cache::enforce_limit() {
                 it->path.c_str(), it->size_file/(1024.0*1024.0));
 
         total_size -= std::min(total_size, it->size_file);
+        if (on_entry_invalidated) {
+            on_entry_invalidated(it->path);
+        }
         entries.erase(it);
     }
 }
@@ -3878,6 +3968,9 @@ void server_disk_cache::worker() {
 
         const bool ok = write_entry(pending, path, size_file);
 
+        server_disk_cache_entry committed;
+        bool have_committed = false;
+
         {
             std::lock_guard<std::mutex> lock(mtx);
 
@@ -3911,11 +4004,27 @@ void server_disk_cache::worker() {
 
                 // the entry set changed - persist the startup index
                 save_manifest();
+
+                // only now is the file committed and discoverable. drop_prefixes
+                // and enforce_limit above may have removed it again (a shorter
+                // prefix or a quota eviction), so look it up instead of assuming
+                // it is the last entry
+                for (const auto & e : entries) {
+                    if (e.path == path) {
+                        committed = e;
+                        have_committed = true;
+                        break;
+                    }
+                }
             }
         }
 
         if (ok) {
             counters.n_write_bytes += size_file;
+
+            if (have_committed && on_entry_committed) {
+                on_entry_committed(committed);
+            }
 
             SRV_INF("disk cache: stored %zu tokens, %.2f MiB in %.2f ms\n",
                     n_tokens, size_file/(1024.0*1024.0), (ggml_time_us() - t_start)/1000.0);

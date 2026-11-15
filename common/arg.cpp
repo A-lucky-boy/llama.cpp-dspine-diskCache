@@ -1780,6 +1780,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_BOUNDARY_CAPTURE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-prefix-discovery"},
+        {"--no-cache-prefix-discovery"},
+        "keep an in-memory directory of the token/media prefixes that successive requests share, so that a common "
+        "prefix can be recognised before it has a snapshot of its own. metadata only: it never restores a state and "
+        "is never counted as a cache hit (default: disabled)",
+        [](common_params & params, bool value) {
+            params.cache_prefix_discovery = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_DISCOVERY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-min-tokens"}, "N",
+        string_format("a discovered prefix must be at least this long to become a capture candidate "
+                      "(default: %d, independent of --cache-disk-min-tokens)", params.cache_prefix_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-prefix-min-tokens must be non-negative");
+            }
+            params.cache_prefix_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-observations"}, "N",
+        string_format("number of distinct requests that must share a prefix before it becomes a capture candidate "
+                      "(default: %d)", params.cache_prefix_observations),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("cache-prefix-observations must be at least 1");
+            }
+            params.cache_prefix_observations = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_OBSERVATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-max-candidates"}, "N",
+        string_format("maximum number of prefix nodes kept by the directory (default: %d)", params.cache_prefix_max_candidates),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("cache-prefix-max-candidates must be positive");
+            }
+            params.cache_prefix_max_candidates = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_MAX_CANDIDATES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-max-index-mib"}, "N",
+        string_format("memory budget of the prefix directory in MiB (default: %d)", params.cache_prefix_max_index_mib),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("cache-prefix-max-index-mib must be positive");
+            }
+            params.cache_prefix_max_index_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_MAX_INDEX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

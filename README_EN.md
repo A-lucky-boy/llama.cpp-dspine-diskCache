@@ -188,6 +188,11 @@ The index is validated first at startup: only when magic, version, signature len
 | `--cache-disk-queue-max N` | 24576 MiB | 24576 | pending-write byte budget |
 | `--cache-stats` | off | off | per-request breakdown of where the prompt tokens came from, plus the matching /metrics counters |
 | `--cache-boundary-capture none\|input\|output\|both` | none | none | capture a full snapshot at a request boundary |
+| `--cache-prefix-discovery` | off | off | keep a single-user common-prefix directory (metadata only, see 6.9) |
+| `--cache-prefix-min-tokens N` | 512 | 512 | minimum prefix length for `eligible` |
+| `--cache-prefix-observations N` | 2 | 2 | minimum distinct requests for `eligible` |
+| `--cache-prefix-max-candidates N` | 256 | 256 | node cap of the directory |
+| `--cache-prefix-max-index-mib N` | 64 | 64 | memory budget of the directory |
 | `--n-ctx-checkpoints` | 32 | 32 | per-slot checkpoint cap |
 
 ### 6.7 Request boundary capture
@@ -223,6 +228,32 @@ On a mechanical disk the measured write throughput is 130–155 MiB/s and restor
 
 **Hit-rate practice**: keep system prompts, tool definitions and few-shot examples static and first; put timestamps and usernames later; append to multi-turn conversations instead of rewriting them.
 
+### 6.9 Common-prefix discovery (single user)
+
+Disabled by default (`--cache-prefix-discovery`). When enabled it keeps a **read-only, in-memory** directory of the token/media prefixes that requests share. It does not take part in cache lookup and does not change which candidate `load()` picks.
+
+| State | Meaning | Counts as a hit |
+|---|---|---|
+| `observed` | several requests shared this prefix | no |
+| `eligible` | long and frequent enough to be worth capturing a state for | no |
+| `persisted` | a validated disk snapshot matches this prefix **exactly** | no, the disk path still decides the reuse |
+| `unavailable` | the prefix is still known, its snapshot is gone | no |
+
+- The structure is a path-compressed radix tree whose edge key is `(token id, media identity)`. The media identity is an **interned string index, not a hash**, so the comparison is exact: a prefix only continues while both the token and the media identity match. "A 64-bit hash match is proof of equality" is never assumed.
+- Observations come from the input boundary only: `slot.task->tokens` is the user input, while the output boundary also holds generated tokens and is therefore not a separate observation. A snapshot that covers the generated tail is registered by the disk cache **after** its commit (`on_snapshot_committed`). Observations are deduplicated by request id, so the two boundaries of one request count once.
+- The link to a physical snapshot is **exact end point**: only a snapshot whose token sequence equals the prefix marks it `persisted`. A snapshot of `A+B` never marks `A` as persisted (the disk path may still serve `A` by LCP, but that is the existing path, not this directory).
+- Invalidation: when an entry is removed by corruption, TTL, quota eviction or prefix dedup, the directory withdraws the reference at once and marks the node `unavailable`. On restart the references are rebuilt from the validated disk entries - **no new persistent index file is written**.
+- Capacity: `--cache-prefix-max-candidates` and `--cache-prefix-max-index-mib` bound the directory; only leaf nodes without a physical reference are evicted, so a referenced snapshot is never dropped to make room for metadata.
+- The directory triggers no extra prefill and no state serialization. In an A/B run with the same parameters the generated text is byte-identical and the `reused_*` statistics match exactly.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--cache-prefix-discovery` | off | enable the directory |
+| `--cache-prefix-min-tokens N` | 512 | minimum length for `eligible`, independent of `--cache-disk-min-tokens` |
+| `--cache-prefix-observations N` | 2 | minimum distinct requests for `eligible` |
+| `--cache-prefix-max-candidates N` | 256 | node cap |
+| `--cache-prefix-max-index-mib N` | 64 | memory budget |
+
 ## 7. Observability
 
 `-lv 3` is the default INFO level, `TRACE=4`, `DEBUG=5`.
@@ -240,6 +271,7 @@ On a mechanical disk the measured write throughput is 130–155 MiB/s and restor
 | `write queue is full` | WRN | pending queue hit its byte or entry limit |
 | `cache_stats: prompt = ..., reused_slot/ram/disk = ..., prefill = ...` | INFO | one line per request with `--cache-stats` |
 | `cache_stats: boundary = input/output, captured = yes/no, tokens = ...` | INFO | boundary capture result with `--cache-stats` |
+| `cache_stats: prefix_tokens = ..., prefix_candidates = ..., best_prefix = ..., best_state = ...` | INFO | directory discovery result with `--cache-stats`, **not a hit** |
 
 ### 7.1 Cache metrics (`/metrics`, requires `--metrics`)
 
@@ -256,6 +288,13 @@ On a mechanical disk the measured write throughput is 130–155 MiB/s and restor
 | `llamacpp:cache_disk_restore_seconds_total` | read + restore time |
 | `llamacpp:cache_disk_entries` / `_queue_entries` / `_queue_bytes` | entries and pending queue |
 | `llamacpp:cache_disk_manifest_fallback_total` | starts that could not trust the index and rescanned |
+| `llamacpp:cache_prefix_requests_total` | requests published to the directory |
+| `llamacpp:cache_prefix_candidates_total` | candidates reported (cumulative) |
+| `llamacpp:cache_prefix_observed_total` / `_eligible_total` | cumulative transitions into `observed` / `eligible` |
+| `llamacpp:cache_prefix_invalidated_refs_total` | references withdrawn because a snapshot went away |
+| `llamacpp:cache_prefix_evicted_total` / `_rejected_total` | capacity evictions / refusals |
+| `llamacpp:cache_prefix_nodes` / `_tokens` / `_bytes` | current size of the directory |
+| `llamacpp:cache_prefix_persisted_refs` / `_snapshots` / `_unavailable` | exactly-matched prefixes, live references, withdrawn prefixes |
 
 Do not mix the three quantities: `candidate_lcp` is the prefix a candidate shares, `restored` is what the entry actually restored, and `reused_*` is what `n_past` still accepted afterwards, i.e. the prefill really avoided (checkpoints and the forced re-evaluation of the last token cut it down). The identity is `prompt = reused_slot + reused_ram + reused_disk + prefill`.
 
@@ -263,6 +302,8 @@ Do not mix the three quantities: `candidate_lcp` is the prefix a candidate share
 
 - The CUDA backend only supports layer split (`-sm layer`); `-sm row` is rejected at model load.
 - With an active non-aLoRA adapter the shared cache does not write for that slot; the slot's own incremental continuation still works.
+- The prefix directory targets **a single user and a single instance**: no tenant isolation, no cross-user quota, no cross-user sharing.
+- The directory observes the input boundary only; a longer snapshot that covers a prefix does not mark it `persisted` (conservative), although the disk LCP lookup may still serve it.
 - Packed metadata has its own CRC since v8: the writer stores it in the entry header, the reader verifies it before **any** state is written, and the startup index record is bound to it. When the index cannot be trusted the reader falls back to per-file header validation instead of skipping the checks.
 - Entries match by prefix, so the first request always prefills in full; `-np 1` means one slot serving serially.
 - A forced kill does not run destructors; persistence depends on the idle mirror (60 s) or an eviction.

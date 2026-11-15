@@ -775,3 +775,161 @@ GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `
   - 中断（超时/取消）路径下 input 边界保留行为：本机测试均为短请求，未构造超时中断用例
   - 多 slot 并发（`-np > 1`）：生产与测试均为 `-np 1`，未验证
   - Linux/POSIX 构建：本机为 Windows/MSVC，未执行；本次改动未引入平台相关 API
+
+# 2026-11-15 19-35 - Change Record（阶段 3：公共前缀目录）
+
+## 变更概述
+
+按 `betterModification.md` 的 `test1_2` 实施阶段 3：新增**单用户、只读、常驻内存**的公共前缀目录（`server-prefix-index`），并为它接上观察事件、与既有 v8 磁盘快照的物理引用关联/失效，以及独立指标。本次**不改变**磁盘条目格式、清单格式、查找策略、恢复顺序、写入抑制与模型计算；不引入任何区间 KV 切片。
+
+目录把三个概念分开：`observed`（观察到共享前缀）、`eligible`（长度/频次达标，值得为它捕获状态）、`persisted`（存在**精确对齐**且校验通过的磁盘快照）。三者**都不计入** `reused_slot/ram/disk`；真实复用仍只由 `server_disk_cache::load()` 判定。
+
+### 实施前核查（`change.md` §2.1 要求）
+
+- 起始 HEAD：`eb7681889f44304d2bd5b3e41572f5530af91a1d`；工作树含 `2026-11-15 18-18 / 18-35 / 18-49` 三条记录对应的未提交改动
+- 先建立可回退提交：`01d5686 feat(disk-cache): 请求级命中统计与请求边界捕获（阶段 1/2）`，此后本阶段的改动均相对该提交
+- 记录到的源码哈希（md5，本阶段改动前）：`server-task.cpp 5848fcf3…`、`server-context.cpp 68b50f73…`、`server-task.h a8dae66b…`、`server-common.h 6d5f6693…`、`common/common.h 9cccaa03…`、`common/arg.cpp e30d4d8f…`
+- 构建产物：`output/llama-server-impl.dll` `2026-11-15 18:47:25`，`--version` 为 `0.9.0-dev (build 7, commit eb76818)`
+- 逐项复核既有改动：CRC/长度校验先于状态恢复；恢复失败清空 slot；target/draft、KV 类型、mmproj、LoRA、media 守卫均未改动；`--cache-boundary-capture none` 与新开关关闭时路径不变（本阶段实测见下）。未发现需要先修复的阻断性缺陷
+
+## 修改文件
+
+### tools/server/server-prefix-index.h / .cpp
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/server-prefix-index.h、tools/server/server-prefix-index.cpp
+- 修改位置：新模块全文
+- 具体变更：
+  - 路径压缩 radix tree，边键为 `(token id, 媒体身份)`；媒体身份用**字符串驻留编号**（`media_intern`），因此比较是精确比较，不以 64 位哈希作为等价证明
+  - `observe()`：先算候选再插入（不与自身比较），按 `request_id` 去重（环形表，4096 条），插入后对路径节点累加 `observations`、更新 `last_observed` 并刷新状态
+  - 候选包含"落在边内部的共享前缀"（`walk()` 返回 `partial` 与所属边的观察数），并钳制到媒体块起点，避免给出媒体块内部的非法边界
+  - 状态机 `observed / eligible / persisted / unavailable`；`refresh_state()` 只在状态迁移时累加 `n_eligible_events`，`observed` 事件在节点创建时累加
+  - `on_snapshot_committed()`：仅在快照 token 序列与某节点前缀**完全相等**时挂载引用（`A+B` 的快照不会把 `A` 标为 `persisted`）；`on_snapshot_invalidated()` 撤销引用并标 `unavailable`
+  - 容量：`max_candidates` / `max_index_bytes` 联合约束，`evict_one()` 只淘汰**无引用**的叶子；死节点过半时 `compact()` 重建索引并重映射 parent/children/snapshot_ref
+- 修改原因：`test1_2` §三、§四
+
+### tools/server/CMakeLists.txt
+
+- 修改类型：修改
+- 修改前路径：tools/server/CMakeLists.txt
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/CMakeLists.txt（同批备份）
+- 修改后路径：tools/server/CMakeLists.txt
+- 修改位置：`server-context` 静态库源文件列表
+- 具体变更：加入 `server-prefix-index.cpp` / `.h`
+- 修改原因：注册新模块
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/server-task.h
+- 修改后路径：tools/server/server-task.h
+- 修改位置：头文件包含、`server_task_result_metrics`、`server_disk_cache` 公有段
+- 具体变更：引入 `server-prefix-index.h` 与 `<functional>`；`server_task_result_metrics` 增加 `prefix_index_stats cache_prefix`；`server_disk_cache` 增加 `entries_snapshot()`、`on_entry_committed`、`on_entry_invalidated`
+- 修改原因：目录需要只读访问已提交条目并在提交/失效时得到通知
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/server-task.cpp
+- 修改后路径：tools/server/server-task.cpp
+- 修改位置：`drop_entry()`、`sweep_expired()`、`drop_prefixes()`、`enforce_limit()`、`worker()`、新增 `entries_snapshot()`、`server_task_result_metrics::to_metrics()`
+- 具体变更：
+  - `worker()`：写入成功且 `save_manifest()` 之后，按路径在 `entries` 中确认该条目仍然存在（可能刚被 `drop_prefixes` 或 `enforce_limit` 删除），再在锁外触发 `on_entry_committed`
+  - `drop_entry()`：用析构守卫在**释放锁之后**触发 `on_entry_invalidated`，避免在持锁状态下回调
+  - `sweep_expired()` / `drop_prefixes()` / `enforce_limit()`：删除后触发 `on_entry_invalidated`
+  - `to_metrics()`：新增 7 个 `llamacpp:cache_prefix_*` counter 与 6 个 gauge，并注明不得与 `reused_*` 相加
+- 修改原因：`test1_2` §4.3 的引用一致性要求
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/server-context.cpp
+- 修改后路径：tools/server/server-context.cpp
+- 修改位置：析构函数、`load_model` 的缓存初始化、新增 `observe_prefix()`、`SLOT_STATE_DONE_PROMPT → GENERATING` 分支、`SERVER_TASK_TYPE_METRICS` 分支、`capture_boundary()` 的写盘判据
+- 具体变更：
+  - 配置签名的构造从 `if (!cache_disk_path.empty())` 内提升到外层并存入 `cache_config_sig`，磁盘层与目录共用同一签名
+  - `--cache-prefix-discovery` 开启时创建目录：`min_tokens / min_observations / max_candidates / max_index_mib` 来自参数；把 `entries_snapshot()` 中已存在的条目登记为 `persisted` 引用；挂上提交/失效回调；启动打印 `prefix discovery: enabled, ...`
+  - `observe_prefix()`：在输入边界发布**不可变**观察（`slot.task->tokens` 截断到 `llama_memory_seq_pos_max` 覆盖的 token，且不超过 task token 数），携带 media 三元组；`--cache-stats` 下输出 `cache_stats: prefix_tokens / prefix_candidates / best_prefix / best_state / persisted_prefix`
+  - 只在**输入边界**发布观察：输出边界含生成 token，`task->tokens` 不含它们，覆盖生成尾部的快照由 `on_snapshot_committed` 登记，避免同一请求两次观察
+  - `capture_boundary()`：`input` 边界在**仅有 input 捕获**时也写盘（此时不再有更长的 output 条目会覆盖它），`both` 仍由 output 负责落盘
+  - 析构时先清空磁盘层回调，避免目录先于磁盘层析构造成悬空回调
+  - `/metrics` 任务填充 `res->cache_prefix`
+- 修改原因：`test1_2` §三、§五
+
+### common/common.h、common/arg.cpp
+
+- 修改类型：修改
+- 修改前路径：common/common.h、common/arg.cpp
+- 修改前备份：.backupChange/2026-11-15 18-32/common/common.h、common/arg.cpp
+- 修改后路径：同前
+- 修改位置：`common_params` 缓存参数段；`--cache-boundary-capture` 之后
+- 具体变更：新增 `cache_prefix_discovery`、`cache_prefix_min_tokens`、`cache_prefix_observations`、`cache_prefix_max_candidates`、`cache_prefix_max_index_mib` 及对应 5 个命令行选项（含 env 变量），非法取值抛 `invalid_argument`
+- 修改原因：目录的开关与候选门槛
+
+### tools/server/tests/unit/test_cache_prefix_index.cpp
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：tools/server/tests/unit/test_cache_prefix_index.cpp
+- 修改位置：新文件全文（`main()` + 7 组检查）
+- 具体变更：覆盖分叉发现（`A+B/A+C/A+D`）、请求 ID 去重、媒体身份隔离、媒体块内部候选钳制、快照精确对齐与撤销、容量淘汰保护带引用的节点、开关关闭时的空目录。文件头给出独立编译命令；**未**接入 CMake 测试目标（该目录为需要运行服务的 pytest 套件）
+- 修改原因：`test1_2` §8.2 / §8.3 的纯元数据检查
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改 / 新增
+- 修改前路径：README.md、README_EN.md；projectSummary.md 不存在
+- 修改前备份：.backupChange/2026-11-15 18-32/README.md、README_EN.md
+- 修改后路径：README.md、README_EN.md、projectSummary.md（新增）
+- 修改位置：§6.6 参数表、新增 §6.9、§7 日志表、§7.1 指标表、§8 行为边界；projectSummary.md 全文
+- 具体变更：说明"发现 ≠ 可恢复 ≠ 实际命中"、四种状态、精确端点语义、失效规则、容量与单用户边界；列出新指标；projectSummary 汇总当前结构、数据流、格式、开关、口径与阶段进度
+- 修改原因：`test1_2` §三 的文档交付
+
+### change.md
+
+- 修改类型：修改（追加）
+- 修改前路径：change.md
+- 修改前备份：无（按规范只追加）
+- 修改后路径：change.md
+- 修改位置：文末
+- 具体变更：追加本记录
+- 修改原因：记录实际实施与验证
+
+## 验证记录
+
+- 已执行检查：全量/增量 CUDA 构建共 5 次（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real）
+- 检查结果：通过，`0 FAILED`。`--version` 为 `0.9.0-dev (build 8, commit 01d5686)`；`--help` 可见 5 个新选项
+
+- 已执行检查：编译并运行 `tools/server/tests/unit/test_cache_prefix_index.cpp`（cl 直接编译，不加载模型）
+- 检查结果：**先失败后通过**。首次运行 3 项失败，定位为：`walk()` 在边内部发生分歧时只 `break`，不报告"边内部的共享前缀"，导致 `A+C` 相对边 `A+B` 只得到 0 而不是 10。修复为 `walk()` 额外返回 `partial`（分歧位置）与所属边的观察数，并在候选列表中加入该合成候选（状态只能是 `observed/eligible`，永不为 `persisted`）。修复后 7 组检查全部通过（`all prefix-index checks passed`）
+
+- 已执行检查：`--cache-prefix-discovery --cache-boundary-capture both` 下的发现序列（`test-run/logs/prefix-runA.log`，双卡 `-ts 38,62`，语料 `E:\小说\正文.md`）
+- 检查结果：通过。`corpus[:2000]`（1385 token）首请求 0 候选；同前缀第二请求 `prefix_candidates=1, best_prefix=1385, best_state=observed`；`corpus[:2300]`（1596 token）`best_prefix=1385, best_state=eligible`（观察数达 2）；从 5000 字符偏移取的 1317-token 请求 `prefix_candidates=0`（无错误共享）。指标：`requests 6 / candidates 5 / nodes 5 / tokens 4859 / bytes 39730 / persisted_refs 1 / snapshots 1`
+
+- 已执行检查：`--cache-boundary-capture input` 下的精确对齐与失效（`logs/prefix-runB.log`、`cache-prefixB`）
+- 检查结果：通过。B1 写入 1385-token 输入快照（505.77 MiB）；B2 `best_prefix=1385, best_state=persisted, persisted_prefix=1385`；B4（6233 token，与存量条目相差 4848 > 4096）写入新条目并触发 `drop_prefixes` 删除 1385 条目 → 指标 `invalidated_refs_total=1 / snapshots=1 / unavailable=1`，目录同步撤销引用
+
+- 已执行检查：强杀重启后引用重建（`logs/prefix-runD.log`，复用 `cache-prefixB`）
+- 检查结果：通过。启动日志 `prefix discovery: enabled, ... 1 snapshot(s) registered`，目录由已校验条目重建，未写任何新的索引文件；1596-token 请求得到 `candidate_lcp=1596, restored=0, reused_disk=0, reject=io_cost`（1225.98 MiB ÷ 1596 = 786 KiB/token 超过 `768 KiB/token` 成本闸门）——说明候选前缀没有被当作命中，且既有成本守卫不受影响
+
+- 已执行检查：关闭开关的回归对照（`logs/prefix-runC.log`，同参数、独立缓存目录）
+- 检查结果：通过。`prefix_tokens` 日志行数 0，全部 `cache_prefix_*` 指标为 0；三个请求的 `prompt_n / cache_n` 与开启时逐一相同（1385 / 0；4 / 1381；215 / 1381），生成文本 sha 相同（`fd7c5bda…`、`03e0e517…`）
+
+- 已执行检查：`git status`、临时文件清理
+- 检查结果：通过。`test-run/` 三个缓存目录（505 MiB / 1.2 GiB / 505 MiB）与 `build-cuda-shared/build*.log`、临时编译脚本、测试 exe 已删除，`test-run/` 仅剩 610 KB 脚本与日志
+
+- 已执行检查：构建期崩溃排查
+- 检查结果：已修复。首版在输出边界发布观察时 `server_tokens::keep_first()` 触发 `GGML_ASSERT(n <= tokens.size())`——`n_covered`（1392）含生成 token，超出 `task->tokens`（1385）。修复为只在输入边界发布观察，并把截断长度钳制到 `task->tokens.size()`
+
+- 未执行的检查及原因：
+  - 阶段 4–7：未进入。阶段 4 的"状态可分块性"审查仍未做（需要读 `src/llama-context.cpp` 的序列状态布局）
+  - 多 slot（`-np > 1`）、并发请求：生产与测试均为 `-np 1`
+  - 中断/超时/断流路径的观察与引用清理：本机测试均为正常完成
+  - Linux/POSIX 构建：本机为 Windows/MSVC；本次未引入平台相关 API
+  - 目录长期内存与 GC 压力：仅以 5 节点的小规模验证，未做长跑统计

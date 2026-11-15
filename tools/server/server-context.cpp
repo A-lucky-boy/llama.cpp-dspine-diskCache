@@ -1135,6 +1135,13 @@ public:
     }
 
     ~server_context_impl() {
+        // the disk tier may notify the prefix directory while it drains its
+        // queue in its own destructor, but the directory is destroyed first
+        if (prompt_cache && prompt_cache->disk) {
+            prompt_cache->disk->on_entry_committed   = nullptr;
+            prompt_cache->disk->on_entry_invalidated = nullptr;
+        }
+
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1191,6 +1198,13 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // model/context configuration signature shared by the disk tier and the
+    // prefix directory
+    std::string cache_config_sig;
+
+    // optional single-user common-prefix directory (metadata only)
+    std::unique_ptr<server_prefix_index> prefix_index;
 
     // when the server became idle, used by the disk-cache idle flush
     int64_t t_cache_idle_since = 0;
@@ -1685,7 +1699,7 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
 
-            if (!params_base.cache_disk_path.empty()) {
+            {
                 // entries are only valid for the exact same model + context configuration
                 auto file_sig = [](const std::string & path) {
                     std::error_code ec;
@@ -1725,13 +1739,52 @@ private:
                             file_sig(params_base.mmproj.path).c_str());
                 }
 
-                prompt_cache->init_disk(
-                        params_base.cache_disk_path,
-                        sig,
-                        params_base.cache_disk_max_mib,
-                        params_base.cache_disk_min_tokens,
-                        params_base.cache_disk_ttl,
-                        params_base.cache_disk_queue_max_mib);
+                // kept for the prefix directory: a prefix may only be shared
+                // inside one model/context configuration, with or without a
+                // disk tier
+                cache_config_sig = sig;
+
+                if (!params_base.cache_disk_path.empty()) {
+                    prompt_cache->init_disk(
+                            params_base.cache_disk_path,
+                            cache_config_sig,
+                            params_base.cache_disk_max_mib,
+                            params_base.cache_disk_min_tokens,
+                            params_base.cache_disk_ttl,
+                            params_base.cache_disk_queue_max_mib);
+                }
+            }
+
+            if (params_base.cache_prefix_discovery) {
+                prefix_index_options idx_opt;
+                idx_opt.min_tokens       = (size_t) params_base.cache_prefix_min_tokens;
+                idx_opt.min_observations = (size_t) params_base.cache_prefix_observations;
+                idx_opt.max_candidates   = (size_t) params_base.cache_prefix_max_candidates;
+                idx_opt.max_index_bytes  = (size_t) params_base.cache_prefix_max_index_mib * 1024ull * 1024ull;
+
+                prefix_index = std::make_unique<server_prefix_index>(cache_config_sig, idx_opt);
+
+                // snapshots that already exist on disk are physical references
+                // from the start; the directory only records metadata, the
+                // restore path still validates every entry on its own
+                if (prompt_cache->disk) {
+                    for (const auto & e : prompt_cache->disk->entries_snapshot()) {
+                        prefix_index->on_snapshot_committed(e.path, e.tokens, e.media_indices,
+                                e.media_token_counts, e.media_ids);
+                    }
+
+                    prompt_cache->disk->on_entry_committed = [this](const server_disk_cache_entry & e) {
+                        prefix_index->on_snapshot_committed(e.path, e.tokens, e.media_indices,
+                                e.media_token_counts, e.media_ids);
+                    };
+                    prompt_cache->disk->on_entry_invalidated = [this](const std::string & path) {
+                        prefix_index->on_snapshot_invalidated(path);
+                    };
+                }
+
+                SRV_INF("prefix discovery: enabled, min %zu tokens, min %zu observations, at most %zu nodes / %zu MiB, %zu snapshot(s) registered\n",
+                        idx_opt.min_tokens, idx_opt.min_observations, idx_opt.max_candidates,
+                        idx_opt.max_index_bytes / (1024ull*1024ull), prefix_index->stats().n_snapshots);
             }
         } else {
             if (!params_base.cache_disk_path.empty()) {
@@ -1983,7 +2036,11 @@ private:
         // entry, and the usual spill/idle-mirror paths still persist it. the
         // output boundary is written through because it is the state a follow-up
         // turn needs after a restart
-        const bool to_disk = kind == COMMON_CACHE_BOUNDARY_OUTPUT;
+        // the output boundary is the state a follow-up turn needs. an explicit
+        // input-only configuration has no later boundary to rely on, so there the
+        // input boundary is written through instead
+        const bool to_disk = kind == COMMON_CACHE_BOUNDARY_OUTPUT ||
+            params_base.cache_boundary_capture == COMMON_CACHE_BOUNDARY_INPUT;
 
         const bool ok = slot.prompt_capture(*prompt_cache, std::move(snapshot), to_disk);
 
@@ -2001,6 +2058,70 @@ private:
     // prefilled. n_past is the value that survived every guard (checkpoints,
     // media boundaries, forced re-evaluation of the last token), so it is the
     // real avoided work - not the candidate lcp the lookup reported
+    // publish the request's immutable prefix metadata to the optional directory.
+    // metadata only: nothing is serialized, nothing is restored, and a candidate
+    // is never counted as a cache hit.
+    //
+    // only the input boundary is published: the request's task tokens are the
+    // user input, while the output boundary additionally holds generated tokens.
+    // a snapshot that covers those is attached by on_snapshot_committed from the
+    // disk cache instead, which keeps one observation per request
+    void observe_prefix(server_slot & slot) {
+        if (!prefix_index || !slot.task || slot.prompt.tokens.empty()) {
+            return;
+        }
+
+        // only the positions the memory holds describe the request that was
+        // actually executed
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max < 0) {
+            return;
+        }
+
+        size_t n_covered = slot.prompt.tokens.size_up_to_pos(pos_max + 1);
+        n_covered = std::min(n_covered, slot.task->tokens.size());
+        if (n_covered == 0) {
+            return;
+        }
+
+        prefix_observation obs;
+        obs.request_id = (uint64_t) slot.task->id;
+
+        server_tokens snapshot = slot.task->tokens.clone();
+        snapshot.keep_first(n_covered);
+
+        obs.tokens             = snapshot.get_tokens();
+        obs.media_indices      = snapshot.media_chunk_indices();
+        obs.media_token_counts = snapshot.media_chunk_token_counts();
+        for (const uint32_t idx : obs.media_indices) {
+            obs.media_ids.push_back(snapshot.media_chunk_id(idx));
+        }
+
+        const size_t n_tokens = obs.tokens.size();
+
+        const auto candidates = prefix_index->observe(obs);
+
+        if (!params_base.cache_stats) {
+            return;
+        }
+
+        size_t       best_tokens = 0;
+        size_t       best_persisted = 0;
+        prefix_state best_state  = prefix_state::observed;
+        for (const auto & c : candidates) {
+            if (c.state == prefix_state::persisted) {
+                best_persisted = std::max(best_persisted, c.prefix_tokens);
+            }
+            if (c.prefix_tokens > best_tokens) {
+                best_tokens = c.prefix_tokens;
+                best_state  = c.state;
+            }
+        }
+
+        SLT_INF(slot, "cache_stats: prefix_tokens = %zu, prefix_candidates = %zu, best_prefix = %zu, best_state = %s, persisted_prefix = %zu\n",
+                n_tokens, candidates.size(), best_tokens, prefix_state_name(best_state), best_persisted);
+    }
+
     void add_cache_stats(const server_slot & slot, int n_past) {
         const uint64_t n_prompt = (uint64_t) slot.task->n_tokens();
         const uint64_t n_reuse  = (uint64_t) std::max(0, n_past);
@@ -3477,6 +3598,9 @@ private:
                     // here instead of being folded into server_metrics
                     if (prompt_cache && prompt_cache->disk) {
                         res->cache_disk = prompt_cache->disk->stats();
+                    }
+                    if (prefix_index) {
+                        res->cache_prefix = prefix_index->stats();
                     }
 
                     if (task.metrics_reset_bucket) {
@@ -5212,6 +5336,7 @@ private:
                 // prompt evaluated for next-token prediction: the last input
                 // token now has its KV, so this is the input boundary
                 capture_boundary(slot, COMMON_CACHE_BOUNDARY_INPUT);
+                observe_prefix(slot);
 
                 slot.state = SLOT_STATE_GENERATING;
 
