@@ -871,3 +871,226 @@ writer / deletion
 本补充仅授权**修复现有目录的终止性、索引输入一致性、物理引用时序，以及磁盘删除/空间账本问题**。不授权修改 KV 物理序列化格式、不授权直接切分 opaque state、不授权为提高表面命中数放松 `io_cost`/媒体/CRC 约束。
 
 本轮完成后，开发人员需要提供：更新的 `change.md`、实际修复 commit、单用户回归日志及更新后的 `projectSummary.md`，供下一次源码审查使用；这项交接要求不构成新的性能实验规划。
+
+---
+
+# 2026-11-15 20-31 - test1_2
+
+## 一、本轮定位：修复磁盘缓存的错误覆盖与错误去重
+
+本轮是已有单用户提示缓存实现的**缺陷修复补充**，不是新算法实验。不得在现有缓存写入/替代逻辑存在明显缺陷时同时开发主动公共前缀捕获、分块 KV、KV 增量序列化或改变缓存成本阈值。
+
+### 1.1 已核对的代码版本与依据
+
+- 目标仓库：`A-lucky-boy/llama.cpp-dspine-diskCache`，本轮审查时 `main` HEAD `bc0c9c97414022c30fe72f7d363ca2ed9350f888`（文档追加提交），实际修复代码提交 `57d9fce6402a39deff5328350a1af175878f68bc`。
+- 在提出本轮任务前，已读取 `change.md` 最新的 `2026-11-15 20-22 - Change Record`、`projectSummary.md` 和《2026-11-15-delivery-for-experiment-planning.md》，并核对 `8325ae4 → 57d9fce` 的提交文件差异。
+- 已核查 `tools/server/server-task.cpp` 的 `load()`、`covered_cheaply()`、`store()`、`mirror()`、`worker()`、`drop_prefixes()`、`dedup_prefixes()`；`tools/server/server-prefix-index.cpp` 的终止性修复；`tools/server/server-context.cpp` 的启动登记；与改造前 baseline 提交 `eb7681889f44304d2bd5b3e41572f5530af91a1d` 及当前修复前提交 `8325ae4` 进行能力/变更对比。
+- 修复提交已建立 `quarantined` 状态，且 `load()` 的候选选择排除该状态。但在其他重用判定路径中仍未一致排除。
+- 锁定原有缓存条目格式 **v8**、manifest **v3**、CRC64、target/draft 状态校验、恢复失败回退语义、单用户单 slot `-np 1` 作为兼容前提；本轮不得更改这些协议或修改模型计算。
+
+上述版本和代码位置是本轮缺陷位置定位依据。编码人员开始修改前须再次读取实验机的最新 `change.md`、本地 HEAD、`git status` 和构建产物版本；如本地又有新提交，须先逐行核对相应函数是否已经改变，避免覆盖他人修复。
+
+### 1.2 已确认问题 A：不可恢复条目仍可能阻止有效写入
+
+**错误位置**：`tools/server/server-task.cpp`
+
+1. `server_disk_cache::load()` 的候选循环显式跳过 `e.quarantined`。
+2. `server_disk_cache::covered_cheaply()` 遍历 `entries` 时没有 `e.quarantined` 过滤。`store()`、`mirror()` 均调用该函数。
+3. `server_disk_cache::store()` / `mirror()` 的“`hash` 相同且 `tokens.size()` 相同即已保存”条件未排除 `quarantined`，也未核对完整 token + media 身份。
+4. `server_disk_cache::worker()` 写盘前的“存在更长前缀就跳过”判断没有排除 `quarantined`。
+
+因此，条目可同时满足“加载时不可用”与“写入时被认为已覆盖请求”两种矛盾状态。该错误与 `quarantined` 的新生命周期有关，属于必须优先修复的旧代码/新状态兼容性缺陷。
+
+**修复要求**：
+
+- 定义统一的 `is_reusable_cache_entry(e)` 或等价条件：至少要求条目**未隔离、仍被索引视为可查找、配置身份有效**。该函数仅表示候选有效，不免除 `load()` 的文件校验。
+- `covered_cheaply()`、`store()`、`mirror()`、`worker()` 的每条“已有条目可替代新条目”路径统一使用候选有效性判断。
+- 已隔离条目仍留在磁盘账本并占用配额；不得因排除其写入抑制作用而调用 `remove_file()` 强行删除、提前扣减 `total_size` 或恢复其 `persisted` 引用。
+- 如果可写配额已被不可删除文件占满，新条目应通过原队列/空间限制返回明确拒绝；**不能以“已有可用缓存”伪装为去重成功**。
+- 变更须保留磁盘锁内的 `notify_committed/notify_invalidated` 顺序与 `epoch` 语义，不增加独立异步通知通道。
+
+### 1.3 已确认问题 B：“更长快照替代短快照”并不总是成立
+
+**错误位置**：`tools/server/server-task.cpp` 的 `worker()`、`drop_prefixes()`、`dedup_prefixes()`、`covered_cheaply()`。
+
+当前几条写入/删除路径主要依赖纯 token 前缀关系来判断短快照冗余，但真实 `load()` 在执行恢复前还会检查：
+
+- 最小可用匹配长度；
+- token 前缀下的双向媒体身份、媒体区间和合法边界；
+- 条目是否被隔离；
+- `e.size_file > lcp * DISK_CACHE_MAX_BYTES_PER_TOKEN` 的读盘成本守卫；
+- 最终仍需要通过 v8 文件校验以及 target/draft 状态恢复。
+
+因此，“A 的 tokens 是 B 的严格前缀”并不充分证明“B 可以取代 A 服务未来对 A 的请求”。现有实验材料记录过短快照被删除后，长快照因 `io_cost` 不可恢复的真实情况；本轮应修复这一可替代性判定，而不是放宽成本守卫。
+
+**修复要求**：
+
+1. 提取一个**不执行 KV 读取、不修改状态**的保守复用判定辅助逻辑，专供写入抑制、worker 冗余判断以及短快照去重使用；其判定规则必须与真实 `load()` 的确定性前置过滤条件一致。
+2. 对候选请求的有效 LCP 做**双向媒体校验**：已有和待保存条目的媒体元组（位置、长度、ID）在可用前缀范围内必须等价；候选结束位置不能在媒体块内部。禁止仅验证“短条目的媒体是长条目的子集”。
+3. 对“长条目完全覆盖短请求”情形，确认该长条目的文件字节成本可通过现有阈值，并且 LCP 满足实际最小长度。仅比较 token 长度不构成替代证明。
+4. `covered_cheaply()` 保留原 4096-token 尾部容忍语义，但将签名补充为接受待写 prompt 的媒体元数据；对于已有缓存能覆盖的那一段，必须先通过相同的媒体和可恢复成本约束。
+5. `drop_prefixes()` 与启动期 `dedup_prefixes()` 在不能证明较长条目可替代较短条目时，应保留短条目；不引入复杂的新收益函数，也不把阈值调大来实现去重。
+6. 若冗余关系成立，仍必须先按现有文件删除原语进行操作，删除成功之后才能扣减实际字节并同步撤销前缀引用；删除失败不改配额账本。
+7. 若某一策略需要比较 `pending` 与 `entry` 的 metadata，必须使用已经由 `disk_cache_pack()` 产生并验证的 token/media 元组，不能在 worker 线程重新读取 live `server_slot` 或未同步的推理状态。
+
+可参考的职责抽象：
+
+```cpp
+struct cache_prefix_match {
+    size_t token_lcp = 0;
+    size_t usable_lcp = 0;  // after bidirectional media/boundary checks
+    bool   media_compatible = false;
+};
+
+cache_prefix_match match_restorable_prefix(
+    const cache_prompt_identity & lhs,
+    const cache_prompt_identity & rhs);
+
+bool eligible_as_existing_replacement(
+    const server_disk_cache_entry & existing,
+    const cache_prompt_identity & wanted,
+    size_t required_usable_tokens);
+```
+
+上述代码仅为接口意图，实际应沿用项目既有命名、锁约束和 `disk_cache_*` 工具函数。**不能将静态可替代性判断误当作文件 CRC 已重新验证**，真实 `load()` 仍需做完整校验。
+
+### 1.4 已确认问题 C：hash + token 数不足以证明“同一缓存条目”
+
+**错误位置**：`store()`、`mirror()` 两处使用 `e.hash == hash && e.tokens.size() == pending.ids.size()` 的去重判断。
+
+该判断没有区分不可恢复状态，也没有对完整 token 与 media 元组做等价确认。哈希只应作为索引加速条件，不能直接作为输入身份的唯一证明。
+
+**修复要求**：
+
+- 先跳过 `quarantined`；hash/长度相同后，再逐 token 比较 `ids`，并逐项比较 `media_indices/media_token_counts/media_ids`。
+- 发生 hash 冲突但元数据不同时，不能把新条目计为 `dedup`；由于现有文件名依赖 hash，本轮应先安全拒绝此冲突并记录明确原因，禁止无版本规划地覆写原文件。
+- 对真正的完全相同条目，保持现有去重行为和计数，不增加不必要的序列化。
+
+## 二、预期修改文件
+
+| 文件 | 修改位置 | 变更内容 |
+|---|---|---|
+| `tools/server/server-task.h` | 磁盘条目和辅助函数声明 | 增加/抽取纯元数据身份校验与复用资格判断；不更改格式 v8 |
+| `tools/server/server-task.cpp` | `covered_cheaply()` | 检查 `quarantined`、媒体身份、有效 LCP 及 IO 守卫；保持尾部容忍 |
+| `tools/server/server-task.cpp` | `store()`、`mirror()` | 对精确去重先过滤不可用条目，再核对 token/media 全量身份 |
+| `tools/server/server-task.cpp` | `worker()` | 修复“较长缓存存在就跳过”逻辑，排除不可恢复和无法经济替代的条目 |
+| `tools/server/server-task.cpp` | `drop_prefixes()`、`dedup_prefixes()` | 仅在被保留的长快照实际可服务短请求时删除短快照；继续调用现有删除原语 |
+| `tools/server/server-task.cpp` | `load()` 辅助判断区域 | 复用同一媒体前缀判定规则，避免两个路径出现不同语义；不改变 KV 恢复/CRC 过程 |
+| `tools/server/tests/unit/` | 新增/扩展独立单元测试 | 验证隔离、双向媒体、成本守卫、真实冗余、hash 冲突分支 |
+| `test-run/` | 回归脚本与日志工具 | 构造单用户、单 slot 的条目隔离、前缀分叉和重启场景 |
+| `change.md` | 追加 | 记录实际缺陷、代码位置和修复过程 |
+| `projectSummary.md` | 更新既有对应章节 | 总结已落地后的缓存可替代性语义，不写规划或未实现承诺 |
+
+不要为了这轮修复引入新的缓存前缀对象文件格式、跨 slot 状态、后端 KV API、线程池或额外用户隔离逻辑。
+
+## 三、算法与数据流修改
+
+### 3.1 在所有写入抑制点共用相同的“物理可替代”定义
+
+**修改前**：
+
+```text
+Store/Mirror/Worker 接收准备写入的 P
+  → entries 中有 token prefix / 相同 hash
+  → 直接认为已覆盖或已保存
+  → 跳过新快照
+
+但 Load 查询时：
+  → e.quarantined / media_mismatch / io_cost
+  → 无法使用该缓存
+```
+
+**修改后**：
+
+```text
+Store/Mirror/Worker 接收 P 与 packed metadata
+  → 检查候选条目状态（非 quarantined）
+  → 按全 token + media 比较真实前缀
+  → 钳制到合法媒体边界
+  → 用现有 min_tokens / io_cost 判断是否可恢复
+  → 只有能替代 P 的条目才允许抑制写入
+  → 其余情况继续原有写入/预算路径
+
+Load：
+  → 使用相同的静态前缀匹配规则
+  → 文件完整性校验与真正的 KV 恢复维持原样
+```
+
+此处不增加新的命中率奖励、不调整 `--cache-disk-min-tokens`、不修改 `DISK_CACHE_MAX_BYTES_PER_TOKEN`、不改变 `DISK_CACHE_MAX_PREFIX_LAG_TOKENS`。
+
+### 3.2 快照删除与引用通知
+
+```text
+删除短快照之前
+  → 判断长快照是否确实可替代短快照
+     ├─ 否：保留短快照，物理引用与配额不变
+     └─ 是：调用 remove_file()
+             ├─ 成功/已不存在：更新 entries/total_size
+             │                 → notify_invalidated(epoch) → manifest
+             └─ 失败：保留账面字节
+                       → 按原有错误/隔离语义处置，不伪造已删除
+```
+
+对一个**仍然有效、仅因文件被占用而删除失败**的短快照，保留其有效条目和引用；对于已因 CRC/恢复问题被明确判定无效的条目，则遵循现有隔离流程。不能混淆“删除失败”和“缓存数据损坏”。
+
+### 3.3 与单用户环境的关系
+
+继续只支持单用户、单实例、`-np 1`。单用户不消除后台 worker 和前台请求线程的同步需要；所有 `entries` 生命周期判断必须遵守原 `mtx`，磁盘锁内的单一通知通道与 `event_epoch` 保留。新 helper 不得在持有 disk lock 时反向获取会访问 disk 的其他锁。
+
+**训练流水线**：无训练，完全不变。**推理流水线**：仅修改缓存是否入队、是否被认为冗余、何时删除；不修改模型计算图、解码、draft/target 选择、logits 或 n_past。现有 v8 快照的真正读取、CRC 校验和 KV 恢复仍由 `server_disk_cache::load()` 处理。
+
+## 四、与既有修改的兼容性
+
+1. **Baseline 行为**：在没有 quarantined 条目、媒体身份相同且候选确实满足真实加载成本守卫时，保留原有缓存查找与去重语义。不要为简单的无媒体完全重复请求引入新的差异。
+2. **关闭态**：`--no-cache-prefix-discovery` 时仍需修复磁盘共用路径；修复不依赖前缀目录是否开启。不能错误地将通用磁盘层缺陷掩盖在 prefix 开关之下。
+3. **前缀目录**：`server-prefix-index.*` 仍是只读元数据目录；不参与物理候选挑选，也不把 `eligible` 当命中。真正快照被删除才撤销引用。
+4. **写盘与配额**：保持 `remove_file()` 真实删除结果驱动账本更新、quarantined 仍占空间、受保护引用与单调 `epoch`；不允许为了提高命中写入而突破磁盘配额。
+5. **文件格式**：v8 条目、v3 manifest、CRC 覆盖范围、配置签名、target/draft/checkpoint 状态不变。
+6. **性能守卫**：`768 KiB/token` 和 4096-token lag 两项现有常量保持原值；本轮只修正其使用前的候选有效性。
+7. **模型/媒体安全**：不能放松 LoRA、mmproj、媒体块边界、媒体 ID/长度、KV 量化与 context 签名的原隔离要求。
+8. **回退**：任何不确定或元数据不一致的候选不能用于替代性判断；仍可以走原正常的写盘/空间限制路径，不能借此要求新模型 KV 恢复。
+
+## 五、验证检查清单
+
+### 5.1 版本与静态核对
+
+- [ ] 先检查实验机 `change.md` 的最新记录、HEAD、工作树状态和当前运行二进制。
+- [ ] 将本轮变更与改造前 baseline、修复前提交分别比较，确认修改范围只覆盖缓存状态/复用判定与相应单元测试。
+- [ ] 逐个检查 `store`、`mirror`、`covered_cheaply`、`worker`、`drop_prefixes`、`dedup_prefixes` 的候选有效性是否一致。
+
+### 5.2 隔离条目不可阻止有效写入
+
+- [ ] 构造已存在、与待写请求完全相同但 `quarantined=true` 的条目；分别经过 `store()`、`mirror()`，检查不会被错误统计为已有可用快照。
+- [ ] 构造 `quarantined` 长条目与待写短前缀；检查 `worker()` 不因长条目的纯 token 覆盖而丢弃待写任务。
+- [ ] 配额被隔离条目占满时检查 `cache_disk_bytes`、`cache_disk_quarantined`、队列拒绝/去重原因；不得将账面占用抹除或强行突破预算。
+- [ ] 模拟隔离条目的删除失败/句柄释放/后续回收，并检查通知、配额与磁盘索引一致。
+
+### 5.3 长短快照的真实可替代性
+
+- [ ] 准备合法的长/短条目，二者 token 前缀完全相同，但长条目恢复短前缀会触发 `io_cost`；检查短快照不会因纯前缀关系被错误抑制或删除。
+- [ ] 准备长条目能够通过现有静态恢复门槛的情况，检查去重判断仍走原正常路径。
+- [ ] 检查 `drop_prefixes` 与 `dedup_prefixes` 两条删除路径使用完全一致的前缀身份和成本约束。
+- [ ] 通过原 `load()` 再次对可替代与不可替代的条目做实际复用归属检查，候选 LCP、restored 和 reused 不得混算。
+
+### 5.4 媒体与精确身份
+
+- [ ] 使用相同 token placeholder、不同媒体 ID 的两段请求，检查 `worker`、`covered_cheaply`、`drop_prefixes` 不能互相错误覆盖。
+- [ ] 在较长条目中加入位于短条目前缀内部的媒体块，验证短条目仍能保留其独立状态。
+- [ ] 相同媒体 ID 但 token count 不同、媒体块结束位置不同、media 三元组不一致的候选全部采用保守处理。
+- [ ] 同 hash/同 token 长度但不同 token 或 media 的构造测试不得进入 `dedup` 分支；不允许覆盖现有文件。
+
+### 5.5 端到端单用户回归
+
+- [ ] Windows/CUDA 单用户 `-np 1`：冷启动、完全重复、追加、公共前缀分叉、输入/输出边界、强杀重启、文件删除失败后恢复。
+- [ ] 现有 13 组 `test_cache_prefix_index.cpp` 自检仍能够执行；本轮磁盘层规则新增独立测试，不复用仅验证 radix tree 的断言代替缓存写入验证。
+- [ ] `--cache-prefix-discovery` 启用和禁用两种路径：检查 `prompt = reused_slot + reused_ram + reused_disk + prefill` 恒等式，以及输出与同配置冷 prefill 的一致性。
+- [ ] 删除失败后重试的日志必须能区分 `dedup`、写入队列满、配额限制及条目被隔离，不应把这四种事件混为一个原因。
+- [ ] 验证所有修复不引入 KV 字节切片、修改现有缓存格式或绕过 CRC。
+- [ ] 检查取消/中断时遗留的写入任务仍不会把已隔离条目当作有效替代来源；只覆盖单用户与后台 IO 并发，不扩展至多 slot。
+
+## 六、交付与记录规范
+
+- `change.md`：只记录实验人员真实修改的文件、函数、错误位置、实际构建验证情况，以及和 baseline 的差异；不得预填未执行的结果。
+- `projectSummary.md`：仅更新整个项目已实现的缓存结构与“可替代条目”的一致性约束。
+- 本文件保持为实验规划和算法修改日志，不收录未来收益预测、测试数值估计、性能计算报告、早停条件或最终性能优劣判定。
+- 此修复完成前，不授权新缓存文件格式、新 KV 分块物理对象或新的前缀自动捕获算法实现。
