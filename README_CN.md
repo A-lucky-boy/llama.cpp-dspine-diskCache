@@ -2,208 +2,250 @@
 
 [English](README_EN.md) | 简体中文
 
-基于 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的定制分支，面向 **Qwen3.8 27B** 长上下文本地推理，在原项目之上叠加了两项能力：
+基于 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的定制分支，面向 **Qwen3.8 27B** 长上下文本地推理：在双消费级显卡上跑投机解码，并让长前缀的 KV 状态跨重启、跨会话复用。
 
-1. **DSpine 投机解码加速**（`draft-dflash`）— 用轻量草稿模型换取整段接受率，提升解码吞吐
-2. **磁盘二级前缀缓存** — 长前缀的 KV 状态落盘，跨重启、跨会话复用，跳过重复的 prefill
+目标硬件：RTX 4070 Ti SUPER 16GB + RTX 3090 24GB（单机双卡，层切分）。生产用途是本地 agent 后端。
 
-目标硬件：NVIDIA 双卡（RTX 3090 + RTX 4070 Ti SUPER），单机本地部署，配合 WorkBuddy 代理做计费统计。
+## 特性
+
+| 能力 | 说明 |
+|---|---|
+| **DSpine 投机解码** | `--spec-type draft-dflash`，1.2 GiB 草稿模型批量预测，目标模型只做一次校验 |
+| **两级前缀缓存** | RAM 提示缓存 + 磁盘 KV 状态缓存；长前缀命中后跳过 prefill，跨重启有效 |
+| **完整性体系** | 配置签名、CRC64-ECMA 校验、启动清单索引、损坏条目隔离、LoRA 感知 |
+| **写入抑制** | 存量条目已覆盖绝大部分前缀时跳过重写，避免机械盘上的 GB 级重复写入 |
+| **可观测性** | 分级日志覆盖命中、恢复、落盘、跳过写入、淘汰与草稿解码形态 |
+
+缓存层不改变任何计算结果：磁盘里存的是当初算出的 KV 字节，命中即原样读回。
 
 ---
 
-## 1. 已实现功能
+## 1. 环境与依赖
 
-### 1.1 Qwen3.8 27B DSpine 投机解码
-
-在目标模型之外加载一个 DSpine 草稿模型，由它批量预测一段 token，目标模型只做校验，从而减少昂贵的自回归解码次数。
-
-| 项 | 值 |
+| 项 | 版本 |
 |---|---|
-| 推理类型 | `--spec-type draft-dflash` |
-| 目标模型 | `localModel/Qwen3.8-27B-pi-Q4_K_M.gguf`（Q4_K_M） |
-| 草稿模型 | `localModel/Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf`（Q4_K_M） |
-| 视觉投影 | `localModel/mmproj-Qwen3.8-27B-pi-BF16.gguf` |
-| 草稿长度 | n_max = 15，n_min = 0 |
-| 块参数 | block_size = 16，mask_token_id = 248070，n_extract = 5 |
-| 采样 | sample_from_anchor = true，p_min = 0.00 |
-| 显存放置 | 目标模型跨 CUDA0/CUDA1 分层（38/62），草稿模型整体在 CUDA1 |
-| 草稿 KV | q8_0 / q8_0 |
+| 编译器 | MSVC 14.44.35207（v143 工具集） |
+| CUDA | 12.8 |
+| 构建 | CMake ≥ 3.14 + Ninja |
+| 显卡架构 | `86-real;89-real`（RTX 3090 / RTX 4070 Ti SUPER） |
 
-解码吞吐实测约 **10 t/s**（12 万 token 上下文下的生产日志观测值）。本分支未做「关闭 DSpine」的对照基准，如需精确加速比请另行跑基准。
+CUDA 12.8 的 `nvcc` 不接受 MSVC 14.50，编译器路径必须固定到 14.44。
 
-### 1.2 磁盘二级前缀缓存（本分支新增）
+模型文件不随仓库分发，放在部署目录的 `localModel/` 下：
 
-原版 llama.cpp 的提示缓存只在内存里，进程退出即失效。本分支在它下面挂了一级磁盘缓存：**长前缀的 KV 状态写入磁盘，重启后直接恢复，跳过 prefill**。
-
-核心特性：
-
-- **四个落盘时机**：RAM 缓存淘汰时迁移；空闲 N 秒后镜像当前会话；优雅退出时刷盘；启动时按容量修剪
-- **LRU 循环覆盖**：超出 `--cache-disk-max` 自动删除最旧条目，无需人工清理
-- **按需读取检查点**：恢复时只读取分歧点之前最新的那个上下文检查点，IO 减少约 35%
-- **自动失效**：条目绑定「模型路径 + 文件大小 + mtime + 草稿模型 + KV 类型 + ctx + 并行数」，换模型、改参数后旧条目自动丢弃
-- **后台写入**：序列化与落盘在独立线程，不阻塞推理
-
-实测数据（RTX 3090 + RTX 4070 Ti SUPER）：
-
-| 指标 | 结果 |
-|---|---|
-| 恢复 17,765 token | **0.9–1.0 s**（全量 prefill 需 8.85 s） |
-| 端到端 | 8.85 s → **1.29 s，约 6.7×** |
-| 空闲镜像 | RAM 未满时正常触发，切换会话后重启仍可命中 |
-| 条目体积 | 约 235 MiB 固定开销 + 18 KB/token（含检查点与草稿状态） |
-| 多会话切换 | 切回历史会话 **0.3–0.5 s**，命中率 99.97% |
-
-### 1.3 其他
-
-- WorkBuddy 兼容的 chat template（`localModel-workbuddy-chat-template.jinja`）
-- tokens-proxy / tokens-dashboard 计费统计（部署侧工具，不在本仓库）
-
----
+```
+Qwen3.8-27B-pi-Q4_K_M.gguf          # 目标模型，64 层，head_count 24 / kv 4 / head_dim 256
+Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf  # DSpine 草稿模型（block_size 16）
+mmproj-Qwen3.8-27B-pi-BF16.gguf     # 视觉投影，可选
+```
 
 ## 2. 构建
 
-```
-工具链:  MSVC 14.44.35207 (v143) + Ninja + CUDA 12.8.61
-架构:    CMAKE_CUDA_ARCHITECTURES=86-real;89-real   (RTX 3090 / RTX 4070 Ti SUPER)
-配置:    Release, BUILD_SHARED_LIBS=ON, GGML_CUDA=ON, LLAMA_CURL=OFF, GGML_NATIVE=OFF
+```bat
+build-cuda-shared.bat
 ```
 
-> **注意**：CUDA 12.8 的 nvcc 不接受 MSVC 14.50（`_MSC_VER=1950`），必须固定工具集版本：
-> `call vcvars64.bat -vcvars_ver=14.44.35207`
->
-> `build-cuda128.bat` 会通过 vswhere 自动定位 Visual Studio；若你的 VS 未注册到安装器，
-> 先设置环境变量 `VCVARS` 指向 `vcvars64.bat` 的完整路径。工具集版本可用 `VCVARS_VER` 覆盖。
+脚本完成 configure 与增量构建。**产物直接写入 `output/`** —— `CMakeLists.txt` 把 `CMAKE_RUNTIME_OUTPUT_DIRECTORY` 与 `CMAKE_LIBRARY_OUTPUT_DIRECTORY` 指向该目录，无需再拷贝。脚本只额外补上不参与构建的 CUDA runtime DLL。
+
+```
+配置  Release, BUILD_SHARED_LIBS=ON, GGML_CUDA=ON,
+      LLAMA_CURL=OFF, LLAMA_BUILD_TESTS=OFF, GGML_NATIVE=OFF
+```
+
+`output/` 是交付布局：含 47 个 `.exe` 与 19 个 `.dll`，在版本控制中只保留空目录（`.gitkeep`）。核心三个：
+
+| 文件 | 作用 |
+|---|---|
+| `llama-server.exe` | 服务启动器 |
+| `llama-server-impl.dll` | 服务实现；磁盘缓存、LoRA 守卫等逻辑位于此 |
+| `llama-common.dll` | 公共参数与命令行解析 |
+
+`llama-server.exe --version` / `--help` 可验证产物与参数注册。部署时把 `output/` 中的 exe/dll 同名覆盖到部署目录即可，不需要改模型或参数。
+
+## 3. 运行
+
+生产配置的完整参数（`--cache-disk` 指向缓存盘，其余为固定项）：
 
 ```bat
-:: 一键构建（仓库根目录，产物在 build\bin\）
-build-cuda128.bat
+llama-server.exe ^
+  -m localModel\Qwen3.8-27B-pi-Q4_K_M.gguf ^
+  -ngl all -dev CUDA0,CUDA1 -sm layer -ts 38,62 -fit off -fa on ^
+  -np 1 -c 262144 -ctk q4_0 -ctv q4_0 -t 8 -tb 16 --backend-sampling ^
+  --spec-type draft-dflash ^
+  --spec-draft-model localModel\Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf ^
+  --spec-draft-n-max 6 --spec-draft-n-min 0 ^
+  --spec-draft-device CUDA0 --spec-draft-ngl all ^
+  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 ^
+  --kv-unified --cache-prompt --cache-ram 25600 --cache-idle-slots ^
+  --cache-disk E:\llama.cpp.cache --cache-disk-max 204800 ^
+  --cache-disk-min-tokens 2048 --cache-disk-idle-flush 60 ^
+  --mmproj localModel\mmproj-Qwen3.8-27B-pi-BF16.gguf --mmproj-device CUDA0 ^
+  --jinja --reasoning on --reasoning-format deepseek-legacy --reasoning-preserve ^
+  -b 4096 -ub 1024 -lv 3 --api-key sk-0 --host 0.0.0.0 --port 18080
 ```
 
-如需手动构建：
-
-```bat
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-      -DCMAKE_CUDA_ARCHITECTURES=86-real;89-real ^
-      -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=ON
-cmake --build build --config Release --parallel 16
-```
-
-产物为 `build/bin/` 下的 exe + dll（含 `llama-server.exe` 与 `llama-server-impl.dll`），部署时整目录拷贝即可。
-
----
-
-## 3. 部署脚本用法
-
-部署脚本 `start-localModel-dspine.ps1` / `stop-localModel.ps1` 位于部署目录（即存放 exe、dll 和模型的目录，下文以 `<部署目录>` 表示）。
-
-### 启动
-
-```powershell
-powershell -ExecutionPolicy Bypass -File <部署目录>\start-localModel-dspine.ps1
-```
-
-脚本做的事：检查 WorkBuddy 模板 → 校验模型文件存在 → 后台拉起 llama-server → 写 PID 到 `localModel.pid`。
-
-### 停止
-
-```powershell
-powershell -ExecutionPolicy Bypass -File <部署目录>\stop-localModel.ps1
-```
-
-按 PID + 命令行特征匹配后强制终止，清理 PID 文件。
-
-### 验证
+部署目录外的启停脚本（不在本仓库）在此基础上额外做三件事：从 GGUF 导出 chat template 并注入 `reasoning_effort` 兼容前缀、校验模型文件存在、后台拉起服务并写 PID 文件。就绪检查：
 
 ```bash
 curl http://127.0.0.1:18080/health
-# {"status":"ok"}
 ```
 
-日志：`localModel-server.log`（stdout）、`localModel-server-error.log`（stderr，模型加载与缓存命中信息都在这里）。
+日志：stdout 与 stderr 分开，模型加载与缓存行为在 stderr。
 
-### 脚本内关键参数
+## 4. 模型放置与上下文
 
-| 参数 | 值 | 说明 |
-|---|---|---|
-| `-m` | `Qwen3.8-27B-pi-Q4_K_M.gguf` | 目标模型 |
-| `--mmproj` | `mmproj-Qwen3.8-27B-pi-BF16.gguf` | 视觉投影（CUDA0） |
-| `--spec-type` | `draft-dflash` | DSpine 投机解码 |
-| `--spec-draft-model` | `Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf` | 草稿模型 |
-| `-dev` / `-sm` / `-ts` | `CUDA0,CUDA1` / `layer` / `38,62` | 目标模型分层放置 |
-| `-c` | `262144` | 上下文长度 |
-| `-ctk` / `-ctv` | `q4_0` / `q4_0` | KV 量化 |
-| `--kv-unified` | — | 统一 KV 缓存（空闲槽可回收显存） |
-| `--cache-ram` | `25600` | 内存提示缓存上限（MiB） |
-| `--cache-idle-slots` | — | 新任务开始时把空闲槽存入缓存 |
-| `--cache-disk` | `<缓存目录>` | 磁盘二级缓存目录（自选，建议放 SSD） |
-| `--cache-disk-max` | `102400` | 磁盘缓存上限（MiB，LRU 循环覆盖） |
-| `--cache-disk-min-tokens` | `2048` | 小于该长度的前缀不缓存 |
-| `--cache-disk-idle-flush` | `60` | 空闲 60 秒后把内存条目镜像落盘 |
-| 端口 / API key | `18080` / `sk-0` | 对外接口 |
-
----
-
-## 4. 磁盘缓存参数调优
-
-| 参数 | 默认 | 调整建议 |
-|---|---|---|
-| `--cache-disk PATH` | 关闭 | 必填，指向 SSD 上的目录 |
-| `--cache-disk-max N` | 65536 | 按盘容量设。条目 ≈ 235 MiB + 18 KB/token，10 万 token 会话约 2 GB |
-| `--cache-disk-min-tokens N` | 2048 | 调小可缓存更短前缀，但每条固定开销约 235 MiB，不建议小于 1024 |
-| `--cache-disk-idle-flush N` | 60 | 0 = 仅淘汰时落盘；调小更持久但写入更多 |
-
-**命中规则**（重要）：
-
-- 按 **token 级最长公共前缀** 匹配，前缀必须从第一个 token 开始完全一致
-- 命中部分需 ≥ `--cache-disk-min-tokens`（默认 2048），取最长公共前缀者；没有内存层那样的 25% 保留门槛，因为磁盘恢复不淘汰任何条目
-- 中途改一个字，从那里往后全部重新计算
-- 上下文检查点只在**消息边界**生成，所以分叉点落在消息边界上时复用最充分；在单条长消息内部修改则收益有限
-
-优化实践：系统提示、工具定义、few-shot 全部静态化并放在最前；动态内容（时间戳、用户名）后置；多轮对话只追加不改写。
-
----
-
-## 5. 已知限制
-
-1. 含图片/音频的前缀不进磁盘缓存（媒体 chunk 不持久化）
-2. 首次请求必然全量 prefill，缓存只对重复前缀生效
-3. `stop-localModel.ps1` 是强制终止，不会触发退出刷盘；依赖空闲镜像（60 s）或淘汰落盘
-4. `--n-ctx-checkpoints` 上限 32，每个检查点约 150 MiB，长上下文下条目偏大
-5. 单 slot（`-np 1`）串行服务，并发请求会排队
-
----
-
-## 6. 目录说明
-
-```
-llama.cpp-dspine-diskCache/  本仓库（源码）
-  src/ ggml/ tools/ common/  llama.cpp 主体
-  include/ vendor/ cmake/    头文件、第三方依赖、CMake 模块
-  tests/ examples/ pocs/     测试与示例（默认随构建生成）
-  build-cuda128.bat          一键构建脚本
-
-部署目录（部署机上，不在本仓库）
-  llama-server.exe + *.dll   编译产物
-  localModel/                GGUF 模型 + chat template
-  <缓存目录>\                磁盘缓存条目
-  start-localModel-dspine.ps1 / stop-localModel.ps1
-  tokens-proxy.py / tokens-dashboard.html
-  SHA256SUMS.txt             二进制校验
-```
-
----
-
-## 7. 本分支相对上游的改动
-
-| 文件 | 改动 |
+| 项 | 当前配置 |
 |---|---|
-| `common/common.h` | 新增 4 个磁盘缓存参数 |
-| `common/arg.cpp` | 新增对应命令行选项 |
-| `tools/server/server-task.h/.cpp` | `server_disk_cache`：落盘、恢复、LRU、按需读检查点、空闲镜像 |
-| `tools/server/server-context.cpp` | 缓存初始化 + 模型签名、空闲判定 |
-| `tools/server/server-queue.h/.cpp` | 空闲回调钩子 |
+| 目标模型放置 | `-dev CUDA0,CUDA1 -sm layer -ts 38,62` |
+| 草稿模型放置 | `--spec-draft-device CUDA0`，`--spec-draft-ngl all` |
+| 视觉投影 | `--mmproj-device CUDA0` |
+| 草稿长度 | `--spec-draft-n-max 6`、`--spec-draft-n-min 0` |
+| KV 量化 | 目标 `q4_0/q4_0`，草稿 `q8_0/q8_0` |
+| 上下文 | `-c 262144`、`--kv-unified`、`-np 1` |
 
----
+按层切分的分工由 `38,62` 固定。CUDA 后端不提供 split buffer 支持，`-sm row` 在模型加载阶段即被拒绝，双卡只剩 `-sm layer` 一条路。按 4070 Ti SUPER 672 GB/s、3090 936 GB/s 计算，带宽最优点约 42/58，`38,62` 与其等价；30/70、45/55 实测均无收益。
+
+草稿模型放在 CUDA0 而非 CUDA1：1.26 GiB 的草稿若与目标模型 62% 的层共用 3090，会争抢同一块 HBM。移到 4070 Ti SUPER 后每轮耗时下降约 2–3%，同时给 3090 释放 2.1 GiB 显存。
+
+## 5. 解码性能
+
+`--spec-draft-n-max 6`、单 slot、128 token 解码段、温度 0。语料为中文长文本（1.406 字/token），实测上下文规模由 prompt 前缀决定：
+
+| 上下文 | 投机解码 | 无投机 | 投机收益 | 每轮耗时 | 接受率 / mean len |
+|---|---|---|---|---|---|
+| ~6K | 43.9 t/s | 37.4 t/s | 1.06× | 54.9 ms | 0.09 / 2.4 |
+| ~33K | 48.7 t/s | 30.9 t/s | 1.52× | 60.9 ms | 0.14 / 3.2 |
+| ~90K | 37.3 t/s | 22.8 t/s | 1.55× | 73.3 ms | 0.12 / 2.8 |
+
+判读方式：表观 t/s 受草稿接受率波动影响很大，比较配置应看**每轮耗时**（`predicted_ms / (draft_n / n_max)`），它与接受率无关；`ms/token = 每轮耗时 / mean len`。
+
+prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1.25–1.4K t/s；123K token 全量 prefill 约 98 s。UB=2048 在双卡层切分下反而慢 10%，`-ub 1024` 是当前最优点。
+
+## 6. 两级前缀缓存
+
+### 6.1 数据流
+
+```
+请求 → RAM 提示缓存（--cache-ram）
+         ├─ 命中：直接复用 KV
+         └─ 淘汰 / 空闲镜像 → 磁盘待写队列（后台线程）
+                                 └─ 原子写 pc-<hash>.bin → 更新 pc-index.dat
+新请求未命中 RAM → 磁盘层按前缀查找 → 恢复 KV 与检查点 → 从分歧点续算
+```
+
+条目进入磁盘的时机：RAM 缓存淘汰时迁移、空闲 N 秒后镜像当前会话、后台队列写入、进程退出时排空队列。序列化与落盘在独立线程完成，不阻塞推理；写入按每 256 MiB 让出 10 ms 节流。
+
+### 6.2 条目格式与完整性
+
+| 组成 | 内容 |
+|---|---|
+| 条目文件 | `pc-<hash>.bin`，格式版本 7；头含 magic、版本、配置签名、packed 长度、main/drft 尺寸、检查点个数、时间戳与 CRC |
+| 状态载荷 | `main`（目标 KV）、`drft`（草稿 KV）、每个检查点的 `data_spec / data_tgt / data_dft` |
+| packed 元数据 | token id 序列 + media 占位符区间与媒体标识 |
+| 校验和 | CRC64-ECMA（反射多项式 `0xC96C5795D7870F42`），slice-by-8；覆盖 main、drft 及每个检查点的三块状态 |
+| 启动清单 | `pc-index.dat`，格式版本 2；记录 hash、`size_file`、`size_main`、`size_drft`、`last_used` 与 packed 元数据 |
+| 配置签名 | 目标/草稿模型路径 + `size@mtime`、目标 K/V 类型、`n_ctx`、`n_parallel`、草稿 K/V 类型、`kv_unified`，启用 mmproj 时追加 `mmproj:path@size@mtime` |
+
+清单在启动时先行校验：magic、版本、签名长度与内容一致，且每条记录能重新解包并重算 hash 的，才走快速路径；否则回退逐文件头校验。清单以「临时文件 + 替换」写入，条目集变化时自动重写。
+
+### 6.3 命中与恢复
+
+- 按 **token 级最长公共前缀** 匹配，取最长者；命中部分需 ≥ `--cache-disk-min-tokens`。
+- 恢复闸门要求条目尺寸不超过 `lcp × 768 KiB`（`DISK_CACHE_MAX_BYTES_PER_TOKEN`），因此 `best_lcp ≥ 1` 恒成立；只读取不越过分歧点的那个检查点，其余检查点直接 seek 跳过。
+- 恢复后 `prompt.tokens` 保留公共前缀，`seq_rm` 截掉 KV 尾部，`--cache-idle-slots` 继续管理显存。
+- `load()` 的返回值契约：任何**尚未改写 ctx 状态**的返回都是 `true`（KV 与提示仍自洽）；**已写入 KV 之后**的失败返回 `false`，由调用方清空 slot 并重新 prefill。
+- 失败分层：条目读取失败、含草稿状态但无草稿上下文、packed 解码失败、media 元数据不一致都会删除条目；可能瞬时的失败（显存压力等）保留条目供下次重试。
+
+### 6.4 失效、淘汰与写入抑制
+
+- 配置签名不匹配、TTL 到期、条目损坏都会在启动扫描或访问时丢弃。
+- 超出 `--cache-disk-max` 时按 `last_used` 最小的条目循环删除；启动时也按当前限额修剪，并清理遗留 `.tmp`。
+- 新条目若包含已有短前缀条目，短条目会被去重删除。
+- **写入抑制**：存量条目已与待写提示共享除末尾一小段外的全部前缀时，跳过本次写入。重写一份 2.7 GiB 条目在 150 MiB/s 的盘上约 18 s，而重算 4K token 尾段约 3 s。允许落后的幅度由 `DISK_CACHE_MAX_PREFIX_LAG_TOKENS`（4096 token）限定，避免存下的前缀过于陈旧。判据用最长公共前缀而非严格 token 前缀——追加文本会让切点附近的 token 重新合并。
+- 待写队列由 `--cache-disk-queue-max`（MiB）与最多 8 条待写条目共同约束。
+- 命中时间戳在内存中更新，优雅退出时先写清单再回写条目头，保证跨重启的 LRU 顺序。
+
+### 6.5 LoRA 感知
+
+`lora_blocks_cache()` 判定「任一生效适配器 scale ≠ 0 且非 aLoRA」。满足时：不把该 slot 状态写入共享缓存；命中守卫时保留 slot 自身 KV；per-request LoRA 在选槽阶段即被预判；生效适配器集变化时清理 slot 提示状态；启动时输出 INFO 说明共享缓存不可用。
+
+### 6.6 参数
+
+| 参数 | 默认 | 部署值 | 说明 |
+|---|---|---|---|
+| `--cache-prompt` | 开启 | 开启 | 提示缓存总开关 |
+| `--cache-ram N` | 8192 MiB | 25600 | RAM 提示缓存上限；`--cache-disk` 依赖它 |
+| `--cache-idle-slots` | 开启 | 开启 | 新任务开始时把空闲槽存入缓存 |
+| `--cache-disk PATH` | 关闭 | `E:\llama.cpp.cache` | 磁盘缓存目录 |
+| `--cache-disk-max N` | 65536 MiB | 204800 | `-1` 不限，`0` 禁用 |
+| `--cache-disk-min-tokens N` | 2048 | 2048 | 短于该长度的前缀不入磁盘 |
+| `--cache-disk-idle-flush N` | 60 s | 60 | 空闲 N 秒后镜像 RAM 条目，`0` 关闭 |
+| `--cache-disk-ttl N` | 0 | 0 | 条目闲置 N 秒后删除，`0` 不过期 |
+| `--cache-disk-queue-max N` | 24576 MiB | 24576 | 待写队列字节预算 |
+| `--n-ctx-checkpoints` | 32 | 32 | 每个 slot 的上下文检查点上限 |
+
+### 6.7 实测条目构成
+
+条目不是一个整体，拆开看由三段组成。同一套配置下实测：
+
+| 前缀长度 | 文件 | main | drft | 检查点 | 检查点数 |
+|---|---|---|---|---|---|
+| 123,674 token | 3039 MiB | 2326 MiB | 88 MiB | 624 MiB | 3 |
+| 5,852 token | 727 MiB | 255 MiB | 62 MiB | 410 MiB | 2 |
+
+两点值得注意：
+
+- 目标模型是混合架构，单个状态有约 **151 MiB 的固定开销**（与上下文长度无关），所以短前缀条目的单位成本天然偏高——6K token 条目约 128 KiB/token，而 123K 条目约 25 KiB/token。这不是缺陷。
+- 实际条目里只有 1–3 个检查点，远低于 `--n-ctx-checkpoints` 的 32 上限，因此调小该参数并不会压缩条目体积。
+
+写入吞吐在机械盘上实测 130–155 MiB/s，恢复读取约 180 MiB/s：3 GiB 条目落盘约 20 s、恢复约 17 s，而 123K token 全量 prefill 约 98 s。
+
+**命中实践**：系统提示、工具定义、few-shot 静态化并置于最前；时间戳、用户名等动态内容后置；多轮对话只追加不改写。
+
+## 7. 可观测性
+
+`-lv 3` 为默认 INFO，`TRACE=4`、`DEBUG=5`。
+
+| 日志 | 级别 | 用途 |
+|---|---|---|
+| `causal_attn=... selector_top_k=... is_dflash2=...` | INFO | 区分草稿模型的 lattice 路径与每行词表 top-k 路径 |
+| `disk cache: restored N/M tokens (a + b bytes)` | DEBUG | `N` 实际复用前缀、`M` 条目长度 |
+| `entry with length ... lcp = ... f_keep = ...` | TRACE | 逐条候选的匹配情况 |
+| `disk cache: stored ... tokens ... in ... ms` | INFO | 落盘耗时与体积 |
+| `covered up to a N-token tail ... skipping a X MiB write` | INFO | 写入抑制生效，附被跳过的体积 |
+| `disk cache: limit reached, removing ...` | WRN | LRU 淘汰 |
+| `dropping ... different model or context configuration` | WRN | 签名不匹配的条目清理 |
+| `prompt cache effectively disabled: active LoRA ...` | INFO | 当前 LoRA 配置下共享缓存不可用 |
+| `write queue is full` | WRN | 待写队列达到字节或条目上限 |
+
+## 8. 行为边界
+
+- CUDA 后端只支持按层切分（`-sm layer`）；`-sm row` 在模型加载阶段即被拒绝。
+- 生效的非 aLoRA 适配器下，共享缓存对该 slot 不写入；slot 自身的增量续算仍可用。
+- packed 元数据没有独立 CRC；其完整性由启动清单的自校验（重算 hash）、恢复时的 media 语义比对以及状态载荷的 CRC 共同保证。
+- 条目按前缀匹配，首次请求必然全量 prefill；`-np 1` 下单 slot 串行服务。
+- 强制终止进程不触发析构，持久化依赖空闲镜像（60 s）或淘汰落盘。
+- 恢复永远读取整个条目文件，因此命中率低的长条目会白读一段；`DISK_CACHE_MAX_BYTES_PER_TOKEN` 只拦极端情况。
+- 多轮对话每增长一段就会产生一条新条目；写入抑制只挡小增量，累计增量超过 4096 token 后仍会重写。
+
+## 9. 实现位置
+
+| 文件 | 职责 |
+|---|---|
+| `common/common.h` / `common/arg.cpp` | 缓存参数定义与命令行注册 |
+| `tools/server/server-task.h/.cpp` | `server_disk_cache`：条目格式、CRC64、落盘队列、恢复、清单、LRU/TTL、写入抑制 |
+| `tools/server/server-context.cpp` | 缓存初始化、配置签名、slot 保存/加载守卫、LoRA 切换清理、空闲判定 |
+| `tools/server/server-common.h/.cpp` | `lora_blocks_cache()` 与 LoRA 比较工具 |
+| `tools/server/server-queue.h/.cpp` | 空闲回调钩子 |
+| `common/speculative.cpp` | 草稿解码实现与启动形态日志 |
+| `CMakeLists.txt` | 产物目录指向 `output/` |
+| `build-cuda-shared.bat` | configure、增量构建、补齐 CUDA runtime DLL |
+
+## 10. 实验记录
+
+- `change.md` — 逐次代码变更记录，含修改前备份路径与验证结果
+- `experienceHistory.md` — 已排除方案与依据、确定性分级、排查纪律
+- `experiments/` — 压测脚本（`bench_decode.py`、`start-bench*.ps1`）与实测数据（`RESULTS.md`、`RESULTS-OPT.md`）
 
 ## License
 

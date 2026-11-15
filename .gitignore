@@ -153,3 +153,25 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Deployment output
+#
+# output/ is the build target (CMakeLists.txt points the runtime and library
+# output directories at it) and the deployment layout. It is kept in the tree as
+# an empty directory so a fresh clone can build straight into it.
+
+/output/*
+!/output/.gitkeep
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# The build scripts the docs refer to; the generic *.bat rule above would
+# otherwise hide them
+!/build-cuda-shared.bat
+!/experiments/*.bat
+
+# Local pre-change backups (see the project workflow rules)
+/.backupChange/
+
