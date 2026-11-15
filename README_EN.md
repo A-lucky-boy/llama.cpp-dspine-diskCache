@@ -1,6 +1,6 @@
 # llama.cpp-dspine-diskCache
 
-English | [简体中文](README_CN.md)
+English | [简体中文](README.md)
 
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for long-context local inference of **Qwen3.8 27B**: speculative decoding across two consumer GPUs, plus a KV state tier that lets a long prefix survive restarts and sessions.
 

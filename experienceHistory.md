@@ -1,7 +1,7 @@
 # 排查与决策经验记录（Experience History）
 
 > 文档定位：记录**哪些方案已被排除、依据是什么、哪些仍开放**，供后续优化前先查，避免重复试错。
-> `README_CN.md` / `README_EN.md` 描述当前功能；`change.md` 记录变更与验证；本文只记结论、证据强度与排查方法。
+> `README.md` / `README_EN.md` 描述当前功能；`change.md` 记录变更与验证；本文只记结论、证据强度与排查方法。
 >
 > 记录时间：2026-11-15；实测环境：RTX 4070 Ti SUPER 16GB (CUDA0) + RTX 3090 24GB (CUDA1)，Qwen3.8 27B Q4_K_M + DSpine 草稿模型，单机 `-np 1`。
 

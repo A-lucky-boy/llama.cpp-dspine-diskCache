@@ -424,3 +424,45 @@ llama_model_load: error loading model: device CUDA0 does not support split buffe
 - 已执行检查：删除 `build-cuda-shared/` 与 `output/` 内容后执行 `build-cuda-shared.bat` 全量构建；统计产物数量；`output/llama-server.exe --version`；`git check-ignore` 校验忽略规则；核对 README 引用的 9 个路径
 - 检查结果：通过。0 个 FAILED，`output/` 直接得到 47 个 `.exe` 与 19 个 `.dll`，`--version` 输出 `0.9.0-dev (build 2, commit 60f3891)`；`/backupChange` 与 `build-cuda-shared/` 被正确忽略，`build-cuda-shared.bat`、`output/.gitkeep`、`experiments/bench_decode.py` 均可入库；README 引用的路径全部存在
 - 备注：首次在旧构建目录上增量重链时出现 `LNK2001 __std_regex_transform_primary_char` 等 STL 符号缺失，删除整个构建目录全量重编后消失，属跨工具链的陈旧对象，非源码问题
+
+# 2026-11-15 12-57 - Change Record
+
+## 变更概述
+
+GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `README_EN.md`，而首页只识别精确匹配的 `README.md / README.rst / README.txt / README`（大小写不敏感），带下划线后缀的 `README_CN.md` 不在此列。将中文版重命名为 `README.md` 作为首页，英文版保留，两处交叉链接同步更新。
+
+## 修改文件
+
+### README_CN.md → README.md
+
+- 修改类型：重命名（内容未改）
+- 修改前路径：README_CN.md
+- 修改前备份：.backupChange/2026-11-15 12-57/README_CN.md
+- 修改后路径：README.md
+- 修改原因：GitHub 仅把精确命名的 README 渲染为仓库首页
+- 备注：本文档历史条目中的 `README_CN.md` 是对当时文件的记录，未回改
+
+### README_EN.md
+
+- 修改类型：修改
+- 修改前路径：README_EN.md
+- 修改前备份：.backupChange/2026-11-15 12-57/README_EN.md
+- 修改后路径：README_EN.md
+- 修改位置：文件首部语言切换行
+- 具体变更：`[简体中文](README_CN.md)` → `[简体中文](README.md)`
+- 修改原因：中文版已改名，原链接会 404
+
+### experienceHistory.md
+
+- 修改类型：修改
+- 修改前路径：experienceHistory.md
+- 修改前备份：.backupChange/2026-11-15 12-57/experienceHistory.md
+- 修改后路径：experienceHistory.md
+- 修改位置：文首说明段
+- 具体变更：`README_CN.md` → `README.md`
+- 修改原因：同上
+
+## 验证记录
+
+- 已执行检查：`git ls-files | grep -i readme`；全仓检索 `README_CN` 残留引用；`git mv` 后确认重命名被记录为 R 而非删除+新增
+- 检查结果：通过。仓库现有 `README.md` 与 `README_EN.md` 两个文件；除 `change.md` 的历史条目外无残留引用
