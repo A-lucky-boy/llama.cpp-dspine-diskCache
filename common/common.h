@@ -454,6 +454,13 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// request boundaries at which a full prompt snapshot may be captured
+enum common_cache_boundary {
+    COMMON_CACHE_BOUNDARY_NONE   = 0,
+    COMMON_CACHE_BOUNDARY_INPUT  = 1 << 0, // the last input token has been evaluated
+    COMMON_CACHE_BOUNDARY_OUTPUT = 1 << 1, // the generation reached a normal stop
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -652,6 +659,15 @@ struct common_params {
     int32_t     cache_disk_idle_flush = 60;   // mirror the RAM cache to disk after N seconds of inactivity, 0 = disable
     int32_t     cache_disk_ttl       = 0;     // --cache-disk-ttl: drop entries unused for N seconds, 0 = never expire
     int32_t     cache_disk_queue_max_mib = 24576; // --cache-disk-queue-max: pending disk-cache write budget (MiB), -1 = no limit
+
+    // optional per-request breakdown of where the prompt tokens came from
+    // (slot, RAM tier, disk tier, actual prefill) and why a lookup failed
+    bool        cache_stats          = false; // --cache-stats
+
+    // capture a full prompt snapshot at a request boundary, in addition to the
+    // existing save-on-eviction and idle mirror paths. bitmask of
+    // common_cache_boundary, 0 - disabled (the historical behaviour)
+    int32_t     cache_boundary_capture = 0;   // --cache-boundary-capture
 
     // llama-connect params
     bool        server_connect      = false;

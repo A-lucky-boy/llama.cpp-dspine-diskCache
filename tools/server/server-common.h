@@ -536,6 +536,17 @@ struct server_metrics {
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
 
+    // per-request decomposition of n_prompt_cached: every prompt token is
+    // counted exactly once, either as reused from one of the three sources or
+    // as prefilled. the boundaries are the actual avoided prefill work, not the
+    // candidate lcp, so a restore that ends up discarded counts as prefilled
+    uint64_t n_cache_req_prompt         = 0; // sum of the prompt tokens of all accounted requests
+    uint64_t n_cache_req_prompt_disk_ok = 0; // the subset whose prompt could be offered to the disk tier
+    uint64_t n_cache_reused_slot        = 0;
+    uint64_t n_cache_reused_ram         = 0;
+    uint64_t n_cache_reused_disk        = 0;
+    uint64_t n_cache_prefill            = 0;
+
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;

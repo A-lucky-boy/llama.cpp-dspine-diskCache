@@ -466,3 +466,312 @@ GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `
 
 - 已执行检查：`git ls-files | grep -i readme`；全仓检索 `README_CN` 残留引用；`git mv` 后确认重命名被记录为 R 而非删除+新增
 - 检查结果：通过。仓库现有 `README.md` 与 `README_EN.md` 两个文件；除 `change.md` 的历史条目外无残留引用
+
+# 2026-11-15 18-18 - Change Record
+
+## 变更概述
+
+按 `betterModification.md` 的阶段 0 实施：定位并修复「重启后首个请求偶发全量重算」的真实根因，把 token/media 元数据的校验纳入写路径，并补齐启动与读盘失败路径的可观测性。不涉及任何新缓存格式（分块/增量持久化）、不改变模型计算、不改变查找策略与 slot 生命周期语义。
+
+**已定位的根因（问题 A）**：`server_disk_cache::touch_entry()` 计算 `last_used` 写入偏移时使用 `DISK_CACHE_HEADER_FIXED - 8 + sig_len + packed_size`。v7 头部固定部分为 72 字节，`last_used` 实际位于 `48 + sig + packed`，而该公式得到 `64 + sig + packed`，正好落在 **`crc_drft`** 上（`crc_main` 在 56，`crc_drft` 在 64）。因此每次优雅退出时，凡是被命中过（`last_used_dirty`）的条目都会把 8 字节的 unix 时间戳写进草稿状态的 CRC 字段。下次启动的首个匹配请求在 `read_entry()` 里做 `disk_cache_crc64(drft) != crc_drft` 判定必然失败，日志打 `failed to read ... dropping it`，条目被删除并整段重新 prefill；该请求结束又会把状态重新写入 RAM 缓存，于是「第二个请求正常」。这也解释了为何该现象只在重启后出现、且与被用过的条目相关。
+
+**未完全定位的部分（如实记录）**：部署日志 `D:\AiHelper\llama.cpp\localModel-server-error.log` 中还出现两类不同签名：
+
+- 第 4046 行：`load: disk cache: failed to read 'pc-ff2770755480dcb4.bin', dropping it`，其前无 `read_entry` 告警，说明命中的是当时无日志输出的静默失败分支（头部/长度/截断类）。
+- 第 4129 行：`read_entry: disk cache: checkpoint checksum mismatch in 'pc-ff2770755480dcb4.bin'`，即草稿状态 CRC 正常但某个检查点 CRC 不符。
+
+两者都不由上述偏移错误解释（偏移错误必然先触发 payload CRC 分支）。可能来源是同一版本号下不同构建产物的检查点表布局差异，或写入侧与读侧对检查点表理解不一致；现有日志无法定论，故本次不做猜测性修复，只把每条失败路径改为输出具体原因（见下），使下一次复现即可定位。当前 `E:\llama.cpp.cache` 中 26 个条目的头部 CRC 字段均为正常 64 位值、与 `pc-index.dat` 逐字段一致（见验证记录），说明损坏条目已被删除而不在目录中残留。
+
+**规划要点对照**：阶段 0 的「问题 B（packed 元数据写侧校验）」已实施：v8 头部新增 `crc_packed`，写侧计算、读侧在**任何** `llama_state_seq_set_data_ext` 之前校验；清单升级 v3，记录 packed 的 CRC 并对整块记录加校验和；旧版本条目显式丢弃并说明原因。规划中阶段 1 及以后（统计、边界捕获、公共前缀识别、分块 KV、成本感知查找、热点淘汰）本次**未实施**，因为它们要求阶段 0 结论先行确认，且需要新缓存格式。
+
+## 修改文件
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 18-11/tools/server/server-task.cpp
+- 修改后路径：tools/server/server-task.cpp
+- 修改位置：`server_disk_cache` 条目文件布局注释、常量区、`disk_cache_crc64` 重载、构造函数、`scan()`、`load_manifest()`、`save_manifest()`、`write_entry()`、`read_entry()`、`touch_entry()`、`load()`、`worker()`
+- 具体变更：
+  - 布局注释补全 `crc_main / crc_drft / crc_packed` 三行与检查点表的三个 CRC 字段（原注释漏写前两项、检查点表缺 crc 字段）。
+  - `DISK_CACHE_VERSION` 7 → 8；新增 `DISK_CACHE_HDR_PREFIX / HDR_BEFORE_LAST / HDR_AFTER_LAST / HDR_LAST_USED_OFFSET` 与 `DISK_CACHE_HEADER_FIXED`（80），并加两条 `static_assert`（固定头 80 字节、`last_used` 相对偏移 48）。
+  - `DISK_CACHE_INDEX_VERSION` 2 → 3，新增常量 `DISK_CACHE_MAX_LOAD_ATTEMPTS = 4`。
+  - 新增 `disk_cache_crc64(const std::vector<char> &)` 重载：packed 元数据以 char 容器存放，原模板只匹配 `value_type == uint8_t`，直接调用无法编译。
+  - `touch_entry()`：偏移改为 `DISK_CACHE_HDR_LAST_USED_OFFSET + sig_len + packed_size`，即根因修复。
+  - `write_entry()`：写头部前计算 `crc_packed`，写在 `crc_drft` 之后。
+  - `read_entry()`：签名改为 `disk_cache_read_status read_entry(const server_disk_cache_entry &, size_t lcp, server_disk_cache_payload &)`，按 `ok / corrupt / io_error` 三态返回；校验顺序改为「头部 → packed 存储 CRC → 与索引 CRC 绑定 → 解包 → 与索引 token/media 逐项比对 → 检查点表 → 载荷 CRC」，全部在返回前完成，不再在 ctx 已被改写之后才发现元数据损坏；每条失败分支单独打印原因（原来是静默 `return false`）。
+  - `load()`：候选选择抽为 `pick()` lambda（持锁内完成选择，读数仍不持锁）；新增最多 4 次候选回退循环——某条目读盘失败时丢弃（corrupt）或保留（io_error）并换下一个候选，而不是直接整段 prefill；media 元数据一致性检查与「有无草稿上下文」判断前移到任何 `set_data_ext` 之前，失败时走干净回退（`return true`），只有真正写坏过 KV 才 `return false`。
+  - `scan()`：新增 `cache_scan_begin` / `cache_scan_manifest` / `cache_scan_end` 事件与计数（manifest 命中/回退、按头解析、陈旧索引记录、丢弃、临时文件清理）；版本不符时打印 `entry format v7 is older than v8, the cache will be rebuilt` 而非笼统 `bad header`；按头解析时同时校验 packed CRC，坏条目在启动阶段即被丢弃。
+  - `load_manifest()`：改为 magic/version/sig → `body_size` → `body` → `body_crc64` 的结构，整块记录校验失败即回退全量扫描并说明原因；每条记录新增 `packed_crc`。
+  - `save_manifest()`：先序列化记录块再计算并写入 CRC，避免先写头再写记录时出现计数与实际记录不一致；记录新增 `packed_crc`。
+  - 构造函数：去重/配额修剪后打印 `cache_index_ready`（扫描后条目数、去重后条目数、占用），把初始化完成屏障显式化。
+  - `worker()`：新建条目的 `packed_crc` 与写入文件头的值一致，保证索引与文件绑定。
+- 修改原因：`betterModification.md` §2.1（问题 A 定位与修复）、§2.2（packed 与 KV 配对完整性、版本化丢弃策略、失败返回契约）、§2.3（阶段 0 验证清单所需的启动/查找/恢复日志）。
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 18-11/tools/server/server-task.h
+- 修改后路径：tools/server/server-task.h
+- 修改位置：`server_disk_cache_entry`、`disk_cache_manifest_meta`、`server_disk_cache` 私有段
+- 具体变更：`server_disk_cache_entry` 新增 `uint64_t packed_crc`；新增 `enum class disk_cache_read_status { ok, corrupt, io_error }` 与 `struct server_disk_cache_payload`（packed、tokens、media 三元组、main/drft、checkpoints）；`disk_cache_manifest_meta` 新增 `packed_crc`；`read_entry` 声明改为返回三态并填充 payload。
+- 修改原因：承载「先校验后恢复」的中间结果，避免校验失败时已改写 ctx；区分确定性损坏与瞬时读失败。
+
+### README.md / README_EN.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md
+- 修改前备份：无（改动仅文档，回退以 git 历史为准）
+- 修改后路径：README.md、README_EN.md
+- 修改位置：§6.2 条目格式与完整性、§6.3 命中与恢复
+- 具体变更：条目格式版本 7 → 8、清单版本 2 → 3；校验和一行补 packed 元数据；新增「格式版本是硬边界」段落说明 v7 会被显式丢弃重建、清单 packed CRC 与条目头绑定；§6.3 补「先校验后恢复」顺序、候选回退、失败分层（确定性损坏删除 / 瞬时失败保留）。
+- 修改原因：文档必须与实际二进制行为一致。
+
+### change.md
+
+- 修改类型：修改（追加）
+- 修改前路径：change.md
+- 修改前备份：无（按规范只追加、不改写历史）
+- 修改后路径：change.md
+- 修改位置：文末
+- 具体变更：追加本记录。
+- 修改原因：记录已实施变更。
+
+### experienceHistory.md
+
+- 修改类型：修改
+- 修改前路径：experienceHistory.md
+- 修改前备份：.backupChange/2026-11-15 18-18/experienceHistory.md
+- 修改后路径：experienceHistory.md
+- 修改位置：§0 结论速览表、§2 新增 2.6 小节
+- 具体变更：新增两行结论（`touch_entry` 偏移错误已修复；重启首请求读盘失败已在部署日志中实证）；新增 2.6 记录该 bug 的证明方法（公式推导 + 独立复现程序 + 部署日志）与「读盘失败 ≠ 缓存不存在」的排查要点。
+- 修改原因：避免后续再把它当成「并发竞态」重复排查。
+
+## 验证记录
+
+- 已执行检查：单 TU 编译 `ninja tools/server/CMakeFiles/server-context.dir/server-task.cpp.obj`（MSVC 19.44.35226，/W3）；全量 CUDA 构建（sm_86-real、GGML_CUDA=ON、BUILD_SHARED_LIBS=ON、LLAMA_CURL=OFF）；`output/llama-server.exe --version`
+- 检查结果：通过。单 TU 编译 1/1 成功、无告警；全量构建 436/436、`0 FAILED`，产出 `output/llama-server.exe` 与 `output/llama-server-impl.dll`；`--version` 输出 `0.9.0-dev (build 7, commit eb76818)`
+
+- 已执行检查：独立布局复现程序（`.tmp_layout_check.cpp`，模拟 v7/v8 头部写入 + 两种 `touch_entry` 偏移）
+- 检查结果：通过，复现并证明根因。v7 头（固定 72）：`last_used` 实际偏移 178、`crc_main` 186、`crc_drft` 194，旧公式得 194 → 命中 `crc_drft`；写入后实测 `last_used` 未变、`crc_main` 完好、`crc_drft` 由 `0xd00dfeedd00dfeed` 变为 `0x00000000671db480`（时间戳）。新公式得 178 → 命中 `last_used`，两个 CRC 均不变。v8 头（固定 80）下旧公式还会命中新增的 `crc_packed`
+
+- 已执行检查：解析 `E:\llama.cpp.cache` 现有 26 个条目头部（magic/version/sig/packed/size_main/size_drft/CRC）并与 `pc-index.dat`（v2，26 条记录）逐字段比对
+- 检查结果：通过。26/26 条目 `size_file / size_main / size_drft / packed` 与索引记录完全一致，0 条陈旧记录；所有条目的 `crc_main / crc_drft` 均为正常 64 位值，无被时间戳覆盖的痕迹——与「被破坏的条目在首次读取时即被删除、不会留在目录中」一致
+
+- 已执行检查：检索部署日志 `localModel-server-error.log`（42 次启动）中的磁盘缓存事件
+- 检查结果：症状已实证。第 4042 行启动 `1 entries, 841.61 MiB`，第 4046 行首个请求 `failed to read ... dropping it`，随后 `prompt processing, n_tokens = 5060, t = 3.17 s`（整段 prefill）；同一条目在第 4129 行另一次运行中报 `checkpoint checksum mismatch`。两类签名不同，后者不由偏移错误解释，已作为未定位项记录
+
+- 已执行检查：`git status` 确认变更范围；`.tmp_*` 临时文件与 `build-check/` 构建目录清理
+- 检查结果：通过。仅 `tools/server/server-task.cpp`、`tools/server/server-task.h`、`README.md`、`README_EN.md`、`change.md`、`experienceHistory.md` 被修改；`output/` 被 .gitignore 忽略
+
+- 未执行的检查及原因：
+  - 端到端模型验证（完全重复 / 分叉前缀 / 短前缀 / 长前缀 / 多媒体 / 重启首请求 / 单比特破坏 / 断电 `.tmp` 残留）需要真实模型与 GPU：生产实例正在 `D:\AiHelper\llama.cpp` 运行（占 14101/18049 MiB 显存），本机加载第二份 27B 模型有 OOM 风险，且未经授权不应改动生产部署。
+  - 跨重启 `-lv 4` 观察 `restored N/M tokens`：同上。
+  - Linux/POSIX 构建：本机为 Windows/MSVC 环境，未执行；本次改动未引入平台相关 API（仅 `std::filesystem` / `std::fstream`，与既有代码一致）。
+  - 上游 baseline 逐行 diff：仓库未配置上游 remote，`0.9.0-dev commit 60f3891` 无法在本环境解析为完整 SHA，因此未做也无法声称完成逐行源码 diff；本次仅与本仓库 HEAD `eb768189f44304d2bd5b3e41572f5530af91a1d` 对比。
+
+# 2026-11-15 18-35 - Change Record（运行时验证，无代码变更）
+
+## 变更概述
+
+对 `2026-11-15 18-18` 那条记录实施的改动做端到端实测验证，测试语料为 `E:\小说\正文.md`（155535 字中文散文，无重复段落，避免合成文本把命中率抬高）。本次**不改任何源码**，只追加验证事实，并更正上一条记录中「端到端模型验证未执行」的表述——该表述在当时是准确的（改动刚完成、生产实例状态未知），现在已实际执行。
+
+测试环境：`output/llama-server.exe`（本次构建，v8 格式）、Qwen3.8-27B-pi-Q4_K_M + DSpine 草稿模型、`-c 16384`、`-ctk/-ctv q4_0`、`-np 1 --kv-unified`、独立缓存目录、端口 18090。测试脚本与日志保留在 `test-run/`（脚本 6 个、日志 6 份，共约 488 KB；8 GB 缓存副本已删除）。
+
+## 修改文件
+
+### test-run/（新增，未入库）
+
+- 修改类型：新增
+- 修改前路径：无（新增文件）
+- 修改前备份：无（新增文件）
+- 修改后路径：test-run/start_test_server.bat、test-run/run_case.bat、test-run/req.py、test-run/prep_cases.py、test-run/drive_case.sh、test-run/drive_two.sh、test-run/logs/*.log
+- 修改位置：不适用
+- 具体变更：测试实例启动脚本、请求脚本、破坏场景构造脚本、逐场景驱动脚本与运行日志。`test-run/` 未被 .gitignore 覆盖，也未提交。
+- 修改原因：使阶段 0 的验证可复现。
+
+## 验证记录
+
+- 已执行检查：冷启动 → 首次请求 → 空闲镜像落盘 → 强杀 → 重启 → 同请求（`logs/run1.log`、`logs/run2.log`）
+- 检查结果：通过。冷请求 `prompt_n=8243, cache_n=0`（4.71 s prefill）；落盘 `stored 8246 tokens, 839.64 MiB`；强杀后重启扫描 `manifest hit, 1 record(s)`、`cache_index_ready: 1 entries`；同一请求 `prompt_n=4, cache_n=8239`，`read_entry: read 614.99 MiB of 839.64 MiB, checkpoints 1/2`。即**重启后首个请求恢复 8239 token、只 prefill 4 token**
+
+- 已执行检查：把时间戳写进真实条目头部三处偏移，分别用当前二进制读取（`logs/case-*.log`）
+- 检查结果：通过，且与诊断完全一致：
+  - 写在 `48+sig+packed`（修复后的 `touch_entry` 偏移，`case-correct`）：`cache_n=8239`、`prompt_n=4`，恢复成功
+  - 写在 `64+sig+packed`（v7 下旧公式命中的 `crc_drft`，`case-v7off`）：`read_entry: payload checksum mismatch ... dropping it` → `dropping the corrupt entry` → 再次查找 `0 entries` → `prompt_n=8243, cache_n=0`，**整段重算 4.69 s**。这就是生产日志第 4046 行的现象，复现条件确认
+  - 写在 `72+sig+packed`（v8 下旧公式会命中的 `crc_packed`，`case-v8off`）：`prompt metadata checksum mismatch` → 丢弃 → 整段重算
+
+- 已执行检查：单比特破坏（`logs/case-packedflip.log`、`logs/case-mainflip.log`）
+- 检查结果：通过。packed 中部翻一位 → `prompt metadata checksum mismatch in ... dropping it`；main 载荷中部翻一位 → `payload checksum mismatch in ... dropping it`。两种都先丢弃再全量 prefill，没有出现错误复用或错误输出
+
+- 已执行检查：清单损坏（`logs/case-indexcorrupt.log`）
+- 检查结果：通过。`index checksum mismatch, falling back to a full scan` → `cache_scan_manifest: miss` → `cache_scan_end: 1 entries (header 1)` → 恢复 `cache_n=8239`。清单损坏不阻断命中，只是退化为逐文件头校验
+
+- 已执行检查：v7 旧格式文件 + 断电残留 `.tmp`（`logs/case-v7file.log`）
+- 检查结果：通过。`dropping 'pc-0000000000000001.bin': entry format v7 is older than v8, the cache will be rebuilt`；`cache_scan_end: ... 1 dropped, 1 temp removed`。旧格式被显式丢弃并说明原因，不当作损坏、也不按新格式解析
+
+- 已执行检查：两条前缀关系条目 + 重启后请求短前缀（`logs/two-run1.log`、`logs/two-run2.log`）
+- 检查结果：通过。run1 中短请求冷 prefill `prompt_n=2844`，长请求恢复 `cache_n=2840` 后补 5403；两条都落盘（短条目 2847 token / 577.09 MiB、长条目 8246 token / 1187.31 MiB）。短条目不是长条目的严格 token 前缀（`lcp=2843 < 2847`，追加文本在切点处重新合并），故 `drop_prefixes`/`dedup_prefixes` 不去重，这符合设计。重启后短请求：`2 entries` 中选中 `lcp=2844` 的短条目，`cache_n=2840, prompt_n=4`，**重启后首个请求未重算**
+
+- 已执行检查：`git status`；临时文件清理
+- 检查结果：通过。源码变更仍是 `tools/server/server-task.cpp`、`tools/server/server-task.h`；文档变更 `README.md`、`README_EN.md`、`change.md`、`experienceHistory.md`；`build-check/`（488 MB）与全部 `.tmp_*` 已删除；`test-run/` 内 8 GB 缓存副本已删除，仅留脚本与日志
+
+- 未执行的检查及原因：
+  - `input`/`output` 边界捕获、统计口径、公共前缀识别、分块 KV、成本感知查找：对应规划阶段 1–5，本次按规划顺序**未实施**，无可验证对象。
+  - 候选回退到「另一个条目」的分支：`load()` 的多次尝试逻辑被执行（丢弃后重新 `lookup ... 0 entries`），但未构造出「首个候选损坏、第二个候选可用」的用例；该场景在阶段 1 统计落地后应补测。
+  - Linux/POSIX 构建与多 slot 并发：本机为 Windows 单实例，未执行；改动未引入平台相关 API。
+
+### 补充（触发条件与上一条记录的边界）
+
+本记录不修改上一条记录的任何内容，只补充两点事实边界：
+
+1. `touch_entry()` 只在 `~server_disk_cache()` 里调用，因此上一条记录描述的崩溃链条**只在前一轮优雅退出时成立**。部署脚本 `stop-localModel.ps1` 使用 `Stop-Process -Force`（等价 TerminateProcess），析构函数不执行，`touch_entry()` 与收尾的 `save_manifest()` 都不会跑；用这种方式重启不触发该 bug。本次实测确认：强杀前后 `pc-index.dat` 的 mtime 不变。
+2. 因此，上一条记录中「这也解释了为何该现象只在重启后出现」应理解为「解释了优雅退出后重启首请求重算」这一条路径。生产日志里的其余两类签名（`checkpoint checksum mismatch`、无告警的静默读失败）仍未定位，结论保持为未定位，不做推断性归因。
+
+该 bug 的修复与实测结论不因此改变：修复后的偏移经真实条目验证可正常恢复（`case-correct`，`cache_n=8239`），而按旧公式写入同一字段会导致 `payload checksum mismatch` 并整段重算（`case-v7off`，`cache_n=0`）。
+
+# 2026-11-15 18-49 - Change Record（阶段 1 + 阶段 2）
+
+## 变更概述
+
+按 `betterModification.md` 的实施顺序（阶段 0 已完成并记录于 `2026-11-15 18-18` / `18-35`），本次实施 **阶段 1（精确命中统计与事件可观测性）** 与 **阶段 2（请求边界捕获）**。两阶段均为新增开关、默认关闭；关闭时全部走原有路径，缓存文件格式、查找策略、写入抑制、slot 生命周期与模型计算均未改变。
+
+阶段 1 把「没有命中」拆成可区分的事实：请求是否查询过磁盘层、候选前缀多长、被哪一道闸门拒绝、恢复后有多少 token 真正免掉 prefill。关键点是**以真实免除的 prefill 为准**：`candidate_lcp`（候选共享前缀）、`restored`（条目恢复长度）与 `reused_*`（`n_past` 最终认可）三者分开统计，实测分别为 1385 / 1385 / 1381，差值来自检查点钳制与「末位 token 必须重算」守卫。
+
+阶段 2 在「RAM 淘汰落盘」与「空闲镜像」之外增加两个请求边界事件：`input`（最后一个输入 token 的 KV 算完、即将采样）与 `output`（生成正常结束）。捕获只覆盖内存实际持有位置（以 `llama_memory_seq_pos_max` 为上界），因此条目不会声称一段没算过的前缀。
+
+## 修改文件
+
+### common/common.h
+
+- 修改类型：修改
+- 修改前路径：common/common.h
+- 修改前备份：.backupChange/2026-11-15 18-32/common/common.h
+- 修改后路径：common/common.h
+- 修改位置：`common_cache_boundary` 枚举（新增，置于 `common_params` 前）、`common_params` 的 server 参数段
+- 具体变更：新增 `enum common_cache_boundary { NONE, INPUT = 1<<0, OUTPUT = 1<<1 }`；新增 `bool cache_stats`（默认 false）与 `int32_t cache_boundary_capture`（默认 `COMMON_CACHE_BOUNDARY_NONE`）
+- 修改原因：承载阶段 1 的统计开关与阶段 2 的边界选择
+
+### common/arg.cpp
+
+- 修改类型：修改
+- 修改前路径：common/arg.cpp
+- 修改前备份：.backupChange/2026-11-15 18-32/common/arg.cpp
+- 修改后路径：common/arg.cpp
+- 修改位置：`--cache-disk-queue-max` 之后
+- 具体变更：新增 `--cache-stats / --no-cache-stats`（env `LLAMA_ARG_CACHE_STATS`）与 `--cache-boundary-capture {none,input,output,both}`（env `LLAMA_ARG_CACHE_BOUNDARY_CAPTURE`）；非法取值抛 `invalid_argument`
+- 修改原因：两个功能都必须显式开启
+
+### tools/server/server-common.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-common.h
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/server-common.h
+- 修改后路径：tools/server/server-common.h
+- 修改位置：`server_metrics`
+- 具体变更：新增 `n_cache_req_prompt`、`n_cache_req_prompt_disk_ok`、`n_cache_reused_slot/ram/disk`、`n_cache_prefill`
+- 修改原因：请求级 token 来源分解的累计计数器（单线程主循环更新，可随 metrics 任务直接复制）
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/server-task.h
+- 修改后路径：tools/server/server-task.h
+- 修改位置：`/metrics` 结果结构之前新增三个类型；`server_disk_cache`、`server_prompt_cache` 声明
+- 具体变更：新增 `enum class cache_reject_reason`（`none / no_prefix / too_short / media_mismatch / io_cost / checksum_error / read_error / restore_failed / signature_mismatch`）与 `cache_reject_reason_name()`；新增 `prompt_cache_restore_info`（来源层、`entry_tokens`、`candidate_lcp`、`lcp`、`read_bytes`、`elapsed_us`、拒绝原因）与 `disk_cache_counters`；`server_task_result_metrics` 增加 `disk_cache_counters cache_disk`；`server_disk_cache::load` 增加 `prompt_cache_restore_info &` 形参；新增 `server_disk_cache::stats()` 与成员 `counters`；`server_prompt_cache::load` 增加同一形参；新增 `server_prompt_cache::mirror_latest()`
+- 修改原因：统计口径需要值对象承载；三个类型必须位于 `server_task_result_metrics` 之前才能作为其成员
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/server-task.cpp
+- 修改后路径：tools/server/server-task.cpp
+- 修改位置：`cache_reject_reason_name()`（新增，匿名命名空间之前）、`scan()`、`server_disk_cache::stats()`（新增）、`load()`、`store()`、`mirror()`、`worker()`、`server_prompt_cache::load()`、`mirror_latest()`（新增）、`server_task_result_metrics::to_metrics()`
+- 具体变更：
+  - `scan()`：清单不可信时 `counters.n_manifest_fallback++`
+  - `load()`：新增 `info` 出参与 `note_reject()`；逐候选记录「最佳 lcp + 该候选被拒原因」，媒体钳制单独标记，`lcp < min_tokens` 时按是否被媒体钳制区分 `media_mismatch` / `no_prefix`；`io_cost`、`checksum_error`、`read_error`、`restore_failed`、`signature_mismatch` 各有独立计数；成功恢复时填 `src / lcp / entry_tokens / read_bytes / elapsed_us` 并累加 `n_read_bytes`、`n_restore_us`
+  - `store()` / `mirror()`：入队结果分三态计数（`queued` / `dedup` / `rejected`），判定顺序不变
+  - `worker()`：写入成功累加 `n_write_bytes`
+  - `stats()`：加锁采样 `entries`、`queue` 大小与队列字节
+  - `server_prompt_cache::load()`：RAM 恢复成功时填 `src=ram`、`entry_tokens`、`candidate_lcp=lcp`、`elapsed_us`；恢复失败填 `restore_failed`；未命中转交磁盘层时透传 `info`
+  - `mirror_latest()`：对刚插入 RAM 的条目调用 `disk->mirror()`，去重/限额/队列预算全部沿用
+  - `to_metrics()`：新增 15 个 `llamacpp:cache_*` counter 与 3 个 gauge，并按 reason 输出 labeled counter（跳过 `none`）
+- 修改原因：阶段 1 的分解统计与观测口径；阶段 2 的落盘入口
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 18-32/tools/server/server-context.cpp
+- 修改后路径：tools/server/server-context.cpp
+- 修改位置：`server_slot`（新增 `cache_restore`、`boundary_captured` 与 `prompt_capture()`）、`prompt_load()`、`get_available_slot()`、`capture_boundary()`（新增）、`add_cache_stats()`（新增）、`SLOT_STATE_DONE_PROMPT → GENERATING` 分支、两处 `process_token()` 停止分支、`SERVER_TASK_TYPE_METRICS` 分支
+- 具体变更：
+  - `prompt_cache.load()` 调用传入 `cache_restore`；`get_available_slot()` 在分配任务前把 `cache_restore` 与 `boundary_captured` 归零，避免跨请求串味
+  - `add_cache_stats()`：在 `n_past` 定案处按 `cache_restore.src` 把复用 token 计入 slot/ram/disk 之一，差额计入 prefill；`src == disk` 或 `reject != none` 时把该请求计入磁盘命中率分母；`--cache-stats` 开启时输出一行 `cache_stats:`
+  - `prompt_capture()`：与 `prompt_save()` 同构，但接受给定的（已截断的）快照；`to_disk` 时以与空闲镜像相同的预算（RAM 上限的 1/4，1.5–6 GiB）调用 `mirror_latest()`
+  - `capture_boundary()`：按 `--cache-boundary-capture` 位掩码、任务类型（COMPLETION）、`cache_prompt`、`is_stateless()`、LoRA 守卫过滤；用 `llama_memory_seq_pos_max` 求实际覆盖的 token 数并截断快照，丢弃超出前缀的检查点；`input` 只进 RAM，`output` 才排队写盘
+  - 三处调用点：`DONE_PROMPT` 转 `GENERATING` 前（input）、两处 `!process_token()` 停止分支（output）
+  - metrics 任务：`res->cache_disk = prompt_cache->disk->stats()`
+- 修改原因：阶段 1 的请求级归属与阶段 2 的边界捕获
+
+### README.md / README_EN.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md
+- 修改前备份：.backupChange/2026-11-15 18-32/README.md、README_EN.md
+- 修改后路径：README.md、README_EN.md
+- 修改位置：§6.6 参数表、新增 §6.7「请求边界捕获」（原 6.7 顺延为 6.8）、§7 日志表、新增 §7.1 指标表、§8 行为边界
+- 具体变更：补两个新参数；说明边界捕获的触发点、写入目标、截断规则、input 为何不落盘与代价；列出全部 `llamacpp:cache_*` 指标、三条口径（candidate / restored / reused）不可混用及恒等式；把「packed 元数据没有独立 CRC」这一过时表述更正为 v8 的事实
+- 修改原因：文档必须与实际二进制行为一致
+
+### change.md
+
+- 修改类型：修改（追加）
+- 修改前路径：change.md
+- 修改前备份：无（按规范只追加）
+- 修改后路径：change.md
+- 修改位置：文末
+- 具体变更：追加本记录
+- 修改原因：记录已实施变更
+
+## 验证记录
+
+- 已执行检查：全量 CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real，GGML_CUDA=ON，BUILD_SHARED_LIBS=ON），1 次全量 + 2 次增量
+- 检查结果：通过，`0 FAILED`；`output/llama-server.exe --version` 输出 `0.9.0-dev (build 7, commit eb76818)`；`--help` 可见两个新参数
+
+- 已执行检查：双卡（`-dev CUDA0,CUDA1 -sm layer -ts 38,62`）冷请求 → 重复请求（`test-run/logs/stats-run1.log`，测试语料 `E:\小说\正文.md`，`--cache-stats`，边界捕获取默认 none）
+- 检查结果：通过。冷请求 `cache_stats: prompt = 1385, reused_slot = 0, prefill = 1385, source = slot, reject = no_prefix`；重复请求 `reused_slot = 1381, prefill = 4`；空闲镜像随即 `stored 1392 tokens, 505.97 MiB`。两例恒等式 `prompt = reused + prefill` 成立
+
+- 已执行检查：强杀 → 重启同目录 → 同一请求（`test-run/logs/stats-run2.log`）
+- 检查结果：通过。`cache_stats: prompt = 1385, reused_disk = 1381, prefill = 4, source = disk, candidate_lcp = 1385, restored = 1385, entry_tokens = 1392, read_bytes = 530543650, restore_us = 436478`；`/metrics`：`cache_request_prompt_tokens_total 2770 = reused_slot 1381 + reused_disk 1381 + prefill 8`
+
+- 已执行检查：首次 `/metrics` 抓取（`--cache-stats --metrics`）
+- 检查结果：**发现问题并修复**。首版 `cache_disk_bytes_read_total` 恒为 0——`load()` 只填了 `info.read_bytes`，漏加 `counters.n_read_bytes`；同时 `n_lookup_prompt_tokens`、`n_reused_tokens` 为无出口的死字段，`cache_request_prompt_tokens_disk_ok_total` 的分母错误地只统计「磁盘命中」的请求。修正为：读字节入计数器、删除两个死字段、分母改为「查询过磁盘层（命中或被拒）」的请求。修复后实测 `cache_disk_bytes_read_total = 5.30544e+08`、`cache_request_prompt_tokens_disk_ok_total = 1596 = prompt`，与日志一致
+
+- 已执行检查：`--cache-boundary-capture both` 冷请求（`test-run/logs/boundary-run2.log`）
+- 检查结果：通过。`boundary = input, captured = yes, tokens = 1385, pos_max = 1384`（仅入 RAM，无写盘日志）→ `boundary = output, captured = yes, tokens = 1392, pos_max = 1391` → `stored 1392 tokens, 505.97 MiB`
+
+- 已执行检查：追加请求 `corpus[:2000] → corpus[:2300]`（同一日志）
+- 检查结果：通过。`reused_slot = 1381, prefill = 215`；input 捕获 1596、output 捕获 1603；output 的镜像被既有写入抑制拦下：`1603 tokens are covered up to a 4096-token tail by a stored entry, skipping a 678.05 MiB mirror`，说明边界捕获没有绕过 `covered_cheaply()`
+
+- 已执行检查：强杀 → 重启 → 请求 `corpus[:2300]`（`test-run/logs/boundary-run3.log`）
+- 检查结果：通过。`reused_disk = 1381, prefill = 215, candidate_lcp = 1385, restore_us = 365928`；`/metrics`：`cache_disk_bytes_read_total 5.30544e+08`、`cache_disk_restore_seconds_total 0.365928`、`cache_disk_lookups_total 1`、全部 `cache_disk_reject_total` 为 0。1385 → 1381 的差值正是检查点钳制，验证了不能用 `candidate_lcp` 当命中量
+
+- 已执行检查：数值一致性——恢复谱系 vs 冷启动（`test-run/logs/out-warm_restore.txt`、`test-run/logs/out-cold_ref.txt`）
+- 检查结果：通过。同一 `corpus[:2300]`、`n_predict = 32`、temperature 0：走过「磁盘恢复 + 边界捕获」谱系的输出与全新缓存冷启动的输出**逐字节相同**（sha256 前 16 位均为 `8e0f7474b632c91f`）
+
+- 已执行检查：`--cache-boundary-capture none` 回归（`test-run/logs/cold-run.log`）
+- 检查结果：通过。`grep -c "boundary ="` 为 0，行为与原路径一致；冷请求 `prefill = 1596`、`reject = no_prefix`、`cache_disk_manifest_fallback_total 1`（首次启动无清单）
+
+- 已执行检查：`git status`；临时产物清理
+- 检查结果：通过。`test-run/` 下三个 500 MiB 级缓存目录与 `build-cuda-shared/build*.log` 已删除，仅保留脚本与 500 KB 级日志；无 `.tmp_*` 残留
+
+- 未执行的检查及原因：
+  - 阶段 3–7（公共前缀目录、分块 KV、成本感知查找、热点淘汰、回归套件）：按 `betterModification.md` 的顺序尚未进入，无验证对象；阶段 4 要求的「状态可分块性」技术审查也仍未做
+  - 中断（超时/取消）路径下 input 边界保留行为：本机测试均为短请求，未构造超时中断用例
+  - 多 slot 并发（`-np > 1`）：生产与测试均为 `-np 1`，未验证
+  - Linux/POSIX 构建：本机为 Windows/MSVC，未执行；本次改动未引入平台相关 API

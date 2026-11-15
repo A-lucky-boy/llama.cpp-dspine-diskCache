@@ -139,22 +139,26 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 
 | 组成 | 内容 |
 |---|---|
-| 条目文件 | `pc-<hash>.bin`，格式版本 7；头含 magic、版本、配置签名、packed 长度、main/drft 尺寸、检查点个数、时间戳与 CRC |
+| 条目文件 | `pc-<hash>.bin`，格式版本 8；头含 magic、版本、配置签名、packed 长度、main/drft 尺寸、检查点个数、时间戳与 CRC |
 | 状态载荷 | `main`（目标 KV）、`drft`（草稿 KV）、每个检查点的 `data_spec / data_tgt / data_dft` |
-| packed 元数据 | token id 序列 + media 占位符区间与媒体标识 |
-| 校验和 | CRC64-ECMA（反射多项式 `0xC96C5795D7870F42`），slice-by-8；覆盖 main、drft 及每个检查点的三块状态 |
-| 启动清单 | `pc-index.dat`，格式版本 2；记录 hash、`size_file`、`size_main`、`size_drft`、`last_used` 与 packed 元数据 |
+| packed 元数据 | token id 序列 + media 占位符区间与媒体标识；写侧对其单独计算 CRC64 并存入条目头 |
+| 校验和 | CRC64-ECMA（反射多项式 `0xC96C5795D7870F42`），slice-by-8；覆盖 main、drft、每个检查点的三块状态，以及 packed 元数据 |
+| 启动清单 | `pc-index.dat`，格式版本 3；每条记录含 hash、`size_file`、`size_main`、`size_drft`、`last_used`、packed 的 CRC 与 packed 元数据，整个记录块另有 CRC |
 | 配置签名 | 目标/草稿模型路径 + `size@mtime`、目标 K/V 类型、`n_ctx`、`n_parallel`、草稿 K/V 类型、`kv_unified`，启用 mmproj 时追加 `mmproj:path@size@mtime` |
 
-清单在启动时先行校验：magic、版本、签名长度与内容一致，且每条记录能重新解包并重算 hash 的，才走快速路径；否则回退逐文件头校验。清单以「临时文件 + 替换」写入，条目集变化时自动重写。
+清单在启动时先行校验：magic、版本、签名长度与内容一致、记录块 CRC 正确，且每条记录能重新解包并重算 hash 的，才走快速路径；否则回退逐文件头校验。清单以「临时文件 + 替换」写入，条目集变化时自动重写。
+
+**格式版本是硬边界**：低版本条目（如 v7）不含 packed 校验和，无法在读侧验证，启动扫描会连同日志一起丢弃重建（`entry format v7 is older than v8, the cache will be rebuilt`），不会把旧文件当新格式解析。清单记录中的 packed CRC 与条目头 CRC 绑定，任一不一致即视为条目与索引不符并丢弃，避免用错误的 token 前缀参与匹配。
 
 ### 6.3 命中与恢复
 
 - 按 **token 级最长公共前缀** 匹配，取最长者；命中部分需 ≥ `--cache-disk-min-tokens`。
 - 恢复闸门要求条目尺寸不超过 `lcp × 768 KiB`（`DISK_CACHE_MAX_BYTES_PER_TOKEN`），因此 `best_lcp ≥ 1` 恒成立；只读取不越过分歧点的那个检查点，其余检查点直接 seek 跳过。
 - 恢复后 `prompt.tokens` 保留公共前缀，`seq_rm` 截掉 KV 尾部，`--cache-idle-slots` 继续管理显存。
+- 读盘顺序固定为「先校验、后恢复」：packed 的存储 CRC、结构边界、与索引记录的一致性，以及全部状态载荷的 CRC 都在**任何** `llama_state_seq_set_data_ext` 之前完成；任一不通过都不会改写 slot 的 KV。
 - `load()` 的返回值契约：任何**尚未改写 ctx 状态**的返回都是 `true`（KV 与提示仍自洽）；**已写入 KV 之后**的失败返回 `false`，由调用方清空 slot 并重新 prefill。
-- 失败分层：条目读取失败、含草稿状态但无草稿上下文、packed 解码失败、media 元数据不一致都会删除条目；可能瞬时的失败（显存压力等）保留条目供下次重试。
+- 候选回退：某个条目读盘校验失败时不会立刻放弃整次查找，而是在剩余条目中继续选次优候选（单次请求最多 4 个），避免一个坏条目把可复用的前缀一起作废。
+- 失败分层：确定性损坏（CRC/长度/签名不符、packed 与索引不符）删除条目；可能瞬时的失败（文件打不开、显存压力）保留条目供下次重试。
 
 ### 6.4 失效、淘汰与写入抑制
 
@@ -182,9 +186,26 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `--cache-disk-idle-flush N` | 60 s | 60 | 空闲 N 秒后镜像 RAM 条目，`0` 关闭 |
 | `--cache-disk-ttl N` | 0 | 0 | 条目闲置 N 秒后删除，`0` 不过期 |
 | `--cache-disk-queue-max N` | 24576 MiB | 24576 | 待写队列字节预算 |
+| `--cache-stats` | 关闭 | 关闭 | 逐请求输出 token 来源分解与拒绝原因，并开放对应 /metrics 计数 |
+| `--cache-boundary-capture none\|input\|output\|both` | none | none | 在请求输入/输出边界主动捕获完整快照 |
 | `--n-ctx-checkpoints` | 32 | 32 | 每个 slot 的上下文检查点上限 |
 
-### 6.7 实测条目构成
+### 6.7 请求边界捕获
+
+默认关闭（`--cache-boundary-capture none`）。开启后，除「RAM 淘汰落盘」与「空闲镜像」外，缓存还会在两个请求边界主动捕获完整快照：
+
+| 边界 | 触发点 | 写入目标 |
+|---|---|---|
+| `input` | 最后一个输入 token 的 KV 已算完、即将开始采样 | 仅 RAM 层 |
+| `output` | 生成因停止条件正常结束 | RAM 层 + 立即排队写盘 |
+
+- 只捕获内存实际持有位置覆盖的 token：以 `llama_memory_seq_pos_max` 为上界，未算出 KV 的最后一个采样 token 会被裁掉，条目不会声称一段没算过的前缀；恢复时照旧由 `seq_rm` 截掉多余尾部。
+- `input` 边界不直接写盘：正常请求随后就到达 `output` 边界，更长的条目会覆盖前者，提前写盘只白耗带宽。被中断（超时、取消、上下文截断）的请求保留 RAM 条目，仍由淘汰迁移与空闲镜像落盘。
+- 去重沿用既有机制：RAM 层由 `alloc()` 的包含判定拦截，磁盘层由 hash / inflight / `covered_cheaply()` 拦截，因此边界捕获不会绕过写入抑制。
+- 代价：每次捕获都要序列化整个序列状态（本机 1.4K token 约 0.2 s / 506 MiB），因此默认关闭，只在需要以「轮次」为粒度复用前缀时开启。
+- 与 `--cache-disk-idle-flush` 互不替代：前者按请求事件触发，后者按空闲时间触发。
+
+### 6.8 实测条目构成
 
 条目不是一个整体，拆开看由三段组成。同一套配置下实测：
 
@@ -217,12 +238,32 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `dropping ... different model or context configuration` | WRN | 签名不匹配的条目清理 |
 | `prompt cache effectively disabled: active LoRA ...` | INFO | 当前 LoRA 配置下共享缓存不可用 |
 | `write queue is full` | WRN | 待写队列达到字节或条目上限 |
+| `cache_stats: prompt = ..., reused_slot/ram/disk = ..., prefill = ...` | INFO | `--cache-stats` 开启时每请求一行，token 来源分解 |
+| `cache_stats: boundary = input/output, captured = yes/no, tokens = ...` | INFO | `--cache-stats` 开启时的边界捕获结果 |
+
+### 7.1 缓存指标（`/metrics`，需 `--metrics`）
+
+| 指标 | 含义 |
+|---|---|
+| `llamacpp:cache_request_prompt_tokens_total` | 已统计请求的输入 token 总数（命中率分母） |
+| `llamacpp:cache_request_prompt_tokens_disk_ok_total` | 其中查询过磁盘层的请求的输入 token 数（磁盘命中率分母） |
+| `llamacpp:cache_reused_tokens_slot_total` / `_ram_total` / `_disk_total` | 三层各自实际免除 prefill 的 token 数，互斥 |
+| `llamacpp:cache_prefill_tokens_total` | 实际执行 prefill 的 token 数 |
+| `llamacpp:cache_disk_candidate_lcp_tokens_total` | 最佳候选前缀长度之和，含被拒绝的候选 |
+| `llamacpp:cache_disk_reject_total{reason}` | 磁盘层未能服务的原因（`no_prefix` / `too_short` / `io_cost` / `media_mismatch` / `checksum_error` / `read_error` / `restore_failed` / `signature_mismatch`） |
+| `llamacpp:cache_disk_enqueue_queued_total` / `_dedup_total` / `_rejected_total` | 写盘入队、去重跳过、容量或队列拒绝 |
+| `llamacpp:cache_disk_bytes_read_total` / `_written_total` | 读盘与写盘字节 |
+| `llamacpp:cache_disk_restore_seconds_total` | 读盘 + 状态恢复耗时 |
+| `llamacpp:cache_disk_entries` / `_queue_entries` / `_queue_bytes` | 条目数与待写队列 |
+| `llamacpp:cache_disk_manifest_fallback_total` | 清单不可信、回退全量扫描的次数 |
+
+三条口径不可混用：`candidate_lcp` 是候选共享前缀，`restored` 是候选条目实际恢复的长度，`reused_*` 是恢复后仍被 `n_past` 认可、真正免掉 prefill 的 token 数（还会被检查点与「末位 token 必须重算」等守卫削减）。恒等式为 `prompt = reused_slot + reused_ram + reused_disk + prefill`。
 
 ## 8. 行为边界
 
 - CUDA 后端只支持按层切分（`-sm layer`）；`-sm row` 在模型加载阶段即被拒绝。
 - 生效的非 aLoRA 适配器下，共享缓存对该 slot 不写入；slot 自身的增量续算仍可用。
-- packed 元数据没有独立 CRC；其完整性由启动清单的自校验（重算 hash）、恢复时的 media 语义比对以及状态载荷的 CRC 共同保证。
+- packed 元数据自 v8 起有独立 CRC：写侧写入条目头，读侧在**任何**状态写入之前校验，并与启动清单记录绑定；清单不可信时回退逐文件头校验，不会因为清单存在就跳过验证。
 - 条目按前缀匹配，首次请求必然全量 prefill；`-np 1` 下单 slot 串行服务。
 - 强制终止进程不触发析构，持久化依赖空闲镜像（60 s）或淘汰落盘。
 - 恢复永远读取整个条目文件，因此命中率低的长条目会白读一段；`DISK_CACHE_MAX_BYTES_PER_TOKEN` 只拦极端情况。

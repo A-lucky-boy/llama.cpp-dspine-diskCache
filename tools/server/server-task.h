@@ -615,6 +615,60 @@ struct server_task_result_error : server_task_result {
     virtual json to_json() override;
 };
 
+// why a lookup did not reuse any tokens. the names go into the --cache-stats
+// log line and the /metrics label set, so only append new values
+enum class cache_reject_reason : uint8_t {
+    none = 0,
+    no_prefix,      // no entry shared a prefix long enough to be restored
+    too_short,      // the prompt or every candidate is below --cache-disk-min-tokens
+    media_mismatch, // the media chunks at the shared positions differ
+    io_cost,        // reading the entry would cost more than the prefill it saves
+    checksum_error, // the entry file failed a checksum
+    read_error,     // the entry file could not be read (transient)
+    restore_failed, // the state could not be written into the contexts
+    signature_mismatch, // the entry has a state this process cannot restore (e.g. a draft state without a draft model)
+    count,
+};
+
+const char * cache_reject_reason_name(cache_reject_reason reason);
+
+// outcome of one cache lookup; filled even when nothing was restored, so the
+// caller can tell "no lookup", "no candidate", "candidate rejected" and
+// "restore failed" apart
+struct prompt_cache_restore_info {
+    enum class source : uint8_t {
+        none,
+        ram,
+        disk,
+    };
+
+    source  src  = source::none;
+    size_t  entry_tokens  = 0; // tokens the served entry holds
+    size_t  candidate_lcp = 0; // best lcp over all candidates, before the gates
+    size_t  lcp           = 0; // lcp of the entry that was actually restored
+    size_t  read_bytes    = 0;
+    int64_t elapsed_us    = 0;
+
+    cache_reject_reason reject = cache_reject_reason::none;
+};
+
+// cumulative counters of the on-disk tier, sampled by /metrics
+struct disk_cache_counters {
+    uint64_t n_lookups              = 0;
+    uint64_t n_candidate_lcp_tokens = 0; // sum of the best candidate lcp, accepted or not
+    uint64_t n_read_bytes           = 0;
+    uint64_t n_restore_us           = 0;
+    uint64_t n_write_bytes          = 0;
+    uint64_t n_manifest_fallback    = 0;
+    uint64_t n_reject[(size_t) cache_reject_reason::count] = {};
+    uint64_t n_enqueue_queued       = 0;
+    uint64_t n_enqueue_dedup        = 0; // already stored, already queued or covered by a longer entry
+    uint64_t n_enqueue_rejected     = 0; // over the size limit or the queue budget
+    uint64_t n_entries              = 0;
+    uint64_t n_queue_entries        = 0;
+    uint64_t n_queue_bytes          = 0;
+};
+
 // used by /metrics API
 struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
@@ -622,6 +676,9 @@ struct server_task_result_metrics : server_task_result {
     int n_tasks_deferred = 0;
 
     server_metrics metrics;
+
+    // counters of the on-disk prompt cache tier (zero when it is disabled)
+    disk_cache_counters cache_disk;
 
     virtual json to_json() override;
 
@@ -751,6 +808,33 @@ struct server_disk_cache_entry {
     size_t       size_file = 0; // whole file, including the header
     int64_t      last_used = 0; // unix seconds
     bool         last_used_dirty = false; // in-memory last_used differs from the on-disk header
+    // CRC64 of the packed token/media metadata, as recorded by the writer. the
+    // lookup index only holds metadata, so without it a manifest record cannot
+    // be bound to the entry file it claims to describe: read_entry compares this
+    // value with the one in the file header and re-computes the CRC over the
+    // bytes it actually read
+    uint64_t     packed_crc = 0;
+};
+
+// result of reading one entry file. the caller must not write any KV state into
+// the contexts unless the status is ok: only then have the metadata, the
+// payload checksums and the packed<->KV binding been validated
+enum class disk_cache_read_status {
+    ok,
+    corrupt,   // deterministic: the entry can never be restored, remove it
+    io_error,  // transient: keep the entry, a later request may succeed
+};
+
+// one entry file decoded and validated, in the order the file stores it
+struct server_disk_cache_payload {
+    std::vector<char> packed;
+    llama_tokens tokens;
+    std::vector<uint32_t> media_indices;
+    std::vector<uint32_t> media_token_counts;
+    std::vector<std::string> media_ids;
+    common_state_data main;
+    common_state_data drft;
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 };
 
 // an entry queued for the background writer
@@ -774,6 +858,7 @@ struct disk_cache_manifest_meta {
     uint64_t            size_main = 0; // KV state payload sizes, cross-checked by read_entry
     uint64_t            size_drft = 0;
     int64_t             last_used = 0;
+    uint64_t            packed_crc = 0; // writer-side checksum of the metadata below, bound to the entry file
     std::vector<char>   packed;   // prompt metadata, same encoding as in the entry header
 };
 
@@ -786,7 +871,9 @@ struct server_disk_cache {
 
     // restore the best matching entry (if any) into the contexts
     // returns false only when a restore was attempted and failed
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // info receives the lookup outcome (source, candidate lcp, reject reason)
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+            prompt_cache_restore_info & info);
 
     // hand an evicted RAM entry over to the background writer
     void store(server_prompt_cache_state && state);
@@ -797,6 +884,13 @@ struct server_disk_cache {
 
     size_t n_entries() const;
     size_t size() const;
+
+    // cumulative counters for /metrics; takes the lock to sample entries/queue
+    disk_cache_counters stats() const;
+
+    // counters written from the lookup path and the writer thread; the sizes of
+    // `entries` and `queue` are sampled separately under the lock
+    disk_cache_counters counters;
 
     std::string dir;
     std::string sig;
@@ -834,8 +928,10 @@ private:
     void drop_entry(const std::string & path);
 
     bool write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out);
-    bool read_entry(const server_disk_cache_entry & entry, size_t lcp, std::vector<char> & packed, common_state_data & main, common_state_data & drft,
-            std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints);
+    // read, validate and decode one entry file. every checksum and the
+    // packed<->index consistency are verified here, before the caller restores
+    // anything into the contexts
+    disk_cache_read_status read_entry(const server_disk_cache_entry & e, size_t lcp, server_disk_cache_payload & out);
     // persist the entry's last-used timestamp in the file header
     bool touch_entry(const server_disk_cache_entry & e);
     void scan();
@@ -897,12 +993,17 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+            prompt_cache_restore_info & info);
 
     void update();
 
     // mirror the RAM entries to the disk tier (called when the server has been idle)
     void flush_to_disk();
+
+    // queue a disk write for the entry that was added last (boundary capture).
+    // the usual admission guards apply, so a covered or oversized entry is a no-op
+    void mirror_latest(size_t budget);
 
 private:
     // move an entry that is about to be dropped to the disk tier

@@ -1620,6 +1620,74 @@ std::string server_task_result_metrics::to_metrics() {
         },
     };
 
+    // prompt-token decomposition: every accounted prompt token is counted
+    // exactly once, either reused from one of the tiers or prefilled.
+    // H_total = (slot+ram+disk)/prompt, H_disk = disk/prompt_disk_ok, where
+    // prompt_disk_ok only covers the requests whose prompt reached the disk tier
+    const std::vector<metric_item> cache_counters = {
+        {
+            "cache_request_prompt_tokens_total",
+            "Prompt tokens of the requests accounted by the cache statistics",
+            (double) metrics.n_cache_req_prompt
+        }, {
+            "cache_request_prompt_tokens_disk_ok_total",
+            "Prompt tokens of the requests that queried the disk cache, hit or miss",
+            (double) metrics.n_cache_req_prompt_disk_ok
+        }, {
+            "cache_reused_tokens_slot_total",
+            "Prompt tokens reused from the KV state the slot already held",
+            (double) metrics.n_cache_reused_slot
+        }, {
+            "cache_reused_tokens_ram_total",
+            "Prompt tokens reused from the RAM prompt cache",
+            (double) metrics.n_cache_reused_ram
+        }, {
+            "cache_reused_tokens_disk_total",
+            "Prompt tokens reused from the on-disk prompt cache",
+            (double) metrics.n_cache_reused_disk
+        }, {
+            "cache_prefill_tokens_total",
+            "Prompt tokens that had to be prefilled",
+            (double) metrics.n_cache_prefill
+        }, {
+            "cache_disk_candidate_lcp_tokens_total",
+            "Sum of the best candidate prefix shared with a stored entry, accepted or not",
+            (double) cache_disk.n_candidate_lcp_tokens
+        }, {
+            "cache_disk_lookups_total",
+            "Number of prompts offered to the on-disk cache",
+            (double) cache_disk.n_lookups
+        }, {
+            "cache_disk_bytes_read_total",
+            "Bytes read from the on-disk cache for restores",
+            (double) cache_disk.n_read_bytes
+        }, {
+            "cache_disk_bytes_written_total",
+            "Bytes written into the on-disk cache",
+            (double) cache_disk.n_write_bytes
+        }, {
+            "cache_disk_restore_seconds_total",
+            "Time spent reading and restoring entries from the on-disk cache",
+            cache_disk.n_restore_us / 1.e6
+        }, {
+            "cache_disk_manifest_fallback_total",
+            "Starts that could not trust the startup index and rescanned every entry",
+            (double) cache_disk.n_manifest_fallback
+        }, {
+            "cache_disk_enqueue_queued_total",
+            "Disk cache writes accepted by the admission checks",
+            (double) cache_disk.n_enqueue_queued
+        }, {
+            "cache_disk_enqueue_dedup_total",
+            "Disk cache writes skipped because the prompt is already stored, queued or covered",
+            (double) cache_disk.n_enqueue_dedup
+        }, {
+            "cache_disk_enqueue_rejected_total",
+            "Disk cache writes rejected by the size limit or the queue budget",
+            (double) cache_disk.n_enqueue_rejected
+        },
+    };
+
     const std::vector<metric_item> gauges = {
         {
             "prompt_tokens_seconds",
@@ -1641,6 +1709,18 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "cache_disk_entries",
+            "Number of entries in the on-disk prompt cache",
+            (double) cache_disk.n_entries
+        }, {
+            "cache_disk_queue_entries",
+            "Number of disk cache writes waiting for the writer",
+            (double) cache_disk.n_queue_entries
+        }, {
+            "cache_disk_queue_bytes",
+            "Bytes held by the pending disk cache writes",
+            (double) cache_disk.n_queue_bytes
         },
     };
 
@@ -1655,17 +1735,15 @@ std::string server_task_result_metrics::to_metrics() {
     };
 
     add_items("counter", counters);
+    add_items("counter", cache_counters);
     add_items("gauge",   gauges);
 
-    // labeled counter: one time series per draft position
-    if (!metrics.n_accepted_per_pos.empty()) {
-        prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
-                      " Accepted tokens per draft position\n"
-                   << "# TYPE llamacpp:spec_decode_num_accepted_tokens_per_pos_total counter\n";
-        for (size_t i = 0; i < metrics.n_accepted_per_pos.size(); i++) {
-            prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
-                       << i << "\"} " << metrics.n_accepted_per_pos[i] << "\n";
-        }
+    // labeled counter: one series per reject reason
+    prometheus << "# HELP llamacpp:cache_disk_reject_total Prompts the on-disk cache could not serve, by reason" << "\n"
+               << "# TYPE llamacpp:cache_disk_reject_total counter" << "\n";
+    for (size_t i = (size_t) cache_reject_reason::none + 1; i < (size_t) cache_reject_reason::count; i++) {
+        prometheus << "llamacpp:cache_disk_reject_total{reason=\"" << cache_reject_reason_name((cache_reject_reason) i) << "\"} "
+                   << cache_disk.n_reject[i] << "\n";
     }
 
     return prometheus.str();
@@ -1756,29 +1834,66 @@ json server_task_result_apply_lora::to_json() {
 //   uint32   sig_len
 //   char     sig[sig_len]  model/context signature
 //   uint32   packed_size
-//   uint32   packed[packed_size]  token ids plus media metadata
+//   char     packed[packed_size]  token ids plus media metadata
 //   uint64   size_main
 //   uint64   size_drft
 //   uint32   n_ckpt
 //   uint64   created       unix seconds
 //   uint64   last_used     unix seconds (rewritten in place on every hit)
-//   checkpoint table: n_ckpt x { int64 n_tokens, int32 pos_min, int32 pos_max, uint64 size_spec, uint64 size_tgt, uint64 size_dft }
+//   uint64   crc_main      CRC64 of the main state payload
+//   uint64   crc_drft      CRC64 of the draft state payload
+//   uint64   crc_packed    CRC64 of packed[packed_size] (version 8)
+//   checkpoint table: n_ckpt x { int64 n_tokens, int32 pos_min, int32 pos_max,
+//                                uint64 size_spec, uint64 size_tgt, uint64 size_dft,
+//                                uint64 crc_spec, uint64 crc_tgt, uint64 crc_dft }
 //   main[size_main]
 //   drft[size_drft]
 //   checkpoint blobs, in table order: spec, tgt, dft
 //
 
+const char * cache_reject_reason_name(cache_reject_reason reason) {
+    switch (reason) {
+        case cache_reject_reason::none:           return "none";
+        case cache_reject_reason::no_prefix:      return "no_prefix";
+        case cache_reject_reason::too_short:      return "too_short";
+        case cache_reject_reason::media_mismatch: return "media_mismatch";
+        case cache_reject_reason::io_cost:        return "io_cost";
+        case cache_reject_reason::checksum_error: return "checksum_error";
+        case cache_reject_reason::read_error:     return "read_error";
+        case cache_reject_reason::restore_failed: return "restore_failed";
+        case cache_reject_reason::signature_mismatch: return "signature_mismatch";
+        case cache_reject_reason::count:          break;
+    }
+
+    return "unknown";
+}
+
 namespace {
 
 constexpr char     DISK_CACHE_MAGIC[8] = { 'L', 'L', 'D', 'S', 'C', '0', '0', '1' };
-constexpr uint32_t DISK_CACHE_VERSION  = 7;
+constexpr uint32_t DISK_CACHE_VERSION  = 8;
 
 // version 5 added the last_used field, version 6 added the crc_main/crc_drft
-// integrity checksums, version 7 added per-checkpoint checksums. Header layout
-// is fixed except for the model/context signature, so its size is
-// DISK_CACHE_HEADER_FIXED + sig.size() bytes; touch_entry() rewrites the
-// last_used field in place
-constexpr size_t DISK_CACHE_HEADER_FIXED = 8 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 8 + 8; // magic..crc_drft, without sig (72)
+// integrity checksums, version 7 added per-checkpoint checksums, version 8 adds
+// crc_packed - the writer-side checksum of the token/media metadata, which is the
+// only check that covers corruption that happened before the entry was indexed
+//
+// Header layout is fixed except for the model/context signature and the packed
+// metadata, so its size is DISK_CACHE_HEADER_FIXED + sig.size() + packed_size
+// bytes. touch_entry() rewrites the last_used field in place, so its offset must
+// match this layout exactly - it is derived from the same constants here instead
+// of being written out as a literal
+constexpr size_t DISK_CACHE_HDR_PREFIX        = 8 + 4 + 4 + 4; // magic, version, sig_len, packed_size
+constexpr size_t DISK_CACHE_HDR_BEFORE_LAST   = 8 + 8 + 4 + 8; // size_main, size_drft, n_ckpt, created
+constexpr size_t DISK_CACHE_HDR_AFTER_LAST    = 8 + 8 + 8;     // crc_main, crc_drft, crc_packed
+constexpr size_t DISK_CACHE_HEADER_FIXED      = DISK_CACHE_HDR_PREFIX + DISK_CACHE_HDR_BEFORE_LAST + 8 + DISK_CACHE_HDR_AFTER_LAST;
+
+// offset of the last_used field relative to the start of the file, excluding the
+// variable-length signature and packed metadata
+constexpr size_t DISK_CACHE_HDR_LAST_USED_OFFSET = DISK_CACHE_HDR_PREFIX + DISK_CACHE_HDR_BEFORE_LAST;
+
+static_assert(DISK_CACHE_HEADER_FIXED == 80, "the fixed header size must match the layout documented above");
+static_assert(DISK_CACHE_HDR_LAST_USED_OFFSET == 48, "touch_entry depends on this offset");
 
 // skip entries shorter than this in the lookup: the lcp with any prompt
 // cannot reach min_tokens, so they can never be restored
@@ -1809,10 +1924,18 @@ constexpr size_t DISK_CACHE_MAX_PREFIX_LAG_TOKENS = 4096;
 
 // startup index file: lets scan() trust entry metadata without opening and
 // parsing every entry file. rewritten on every mutation, ignored when the
-// signature, version or any file size does not match
+// signature, version or any file size does not match.
+// layout: magic, version, sig_len, sig, body_size, body[...], body_crc64 - the
+// whole record block is checksummed, so a torn or bit-flipped index falls back
+// to a full scan instead of silently feeding wrong token prefixes to the lookup
 constexpr char     DISK_CACHE_INDEX_MAGIC[8] = { 'L', 'L', 'D', 'S', 'C', 'I', 'D', 'X' };
-constexpr uint32_t DISK_CACHE_INDEX_VERSION  = 2; // v2 added size_main/size_drft (read_entry cross-checks them)
+constexpr uint32_t DISK_CACHE_INDEX_VERSION  = 3; // v2 added size_main/size_drft, v3 added packed_crc + body checksum
 constexpr const char * DISK_CACHE_INDEX_NAME = "pc-index.dat";
+
+// how many entries a single lookup may try before giving up and prefilling.
+// a rejected entry (corrupt file, unreadable, missing draft state) must not
+// force a full prefill while a shorter entry can still cover part of the prompt
+constexpr int DISK_CACHE_MAX_LOAD_ATTEMPTS = 4;
 
 // background writer yields the CPU for this long after every chunk written,
 // so a burst of large evictions does not starve inference of disk IO
@@ -1876,6 +1999,11 @@ uint64_t disk_cache_crc64(const uint8_t * data, size_t size) {
 template <typename T, typename std::enable_if<std::is_same<typename T::value_type, uint8_t>::value, int>::type = 0>
 uint64_t disk_cache_crc64(const T & data) {
     return data.empty() ? 0 : disk_cache_crc64(data.data(), data.size());
+}
+
+// the packed token/media metadata is kept as raw chars
+inline uint64_t disk_cache_crc64(const std::vector<char> & data) {
+    return data.empty() ? 0 : disk_cache_crc64(reinterpret_cast<const uint8_t *>(data.data()), data.size());
 }
 
 uint64_t disk_cache_hash(const llama_tokens & tokens, const std::vector<uint32_t> & media_indices,
@@ -2103,6 +2231,8 @@ server_disk_cache::server_disk_cache(const std::string & dir, const std::string 
     {
         std::lock_guard<std::mutex> lock(mtx);
 
+        const size_t n_after_scan = entries.size();
+
         // entries stored before prefix dedup was added may still hold a chain
         // of prefix prompts - drop the redundant ones
         dedup_prefixes();
@@ -2113,6 +2243,12 @@ server_disk_cache::server_disk_cache(const std::string & dir, const std::string 
         // persist the startup index so the next boot can trust the metadata
         // without opening every entry file
         save_manifest();
+
+        // the lookup only becomes reachable after this block: entries, the dedup
+        // pass and the quota trim are all settled before the first request can
+        // call load(), so a startup race cannot make the first request miss
+        SRV_INF("disk cache: cache_index_ready: %zu entries after scan, %zu after dedup/trim, %.2f MiB\n",
+                n_after_scan, entries.size(), total_size/(1024.0*1024.0));
     }
 
     th = std::thread([this]() { worker(); });
@@ -2163,10 +2299,38 @@ size_t server_disk_cache::size() const {
     return total_size;
 }
 
+disk_cache_counters server_disk_cache::stats() const {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    // `counters` is written from the lookup path (main thread) and from the
+    // writer thread; the copy is only a metrics snapshot, and the sizes of
+    // `entries`/`queue` must be read under the lock anyway
+    disk_cache_counters out = counters;
+
+    out.n_entries       = entries.size();
+    out.n_queue_entries = queue.size();
+    out.n_queue_bytes   = queue_bytes;
+
+    return out;
+}
+
 void server_disk_cache::scan() {
     namespace fs = std::filesystem;
 
     std::error_code ec;
+
+    // counts reported in the startup summary: without them a "cache looks empty
+    // after a restart" report cannot be told apart from a corrupt index, a
+    // format change or an unreadable directory
+    size_t n_from_manifest = 0;
+    size_t n_from_header   = 0;
+    size_t n_manifest_stale = 0; // record present but the header had to be parsed anyway
+    size_t n_dropped       = 0;
+    size_t n_removed_tmp   = 0;
+
+    const int64_t t_scan_start = ggml_time_us();
+
+    SRV_INF("disk cache: cache_scan_begin: dir = '%s', format v%u\n", dir.c_str(), (unsigned) DISK_CACHE_VERSION);
 
     // startup index written by a previous run: when a file's size matches its
     // record, the metadata is trusted and the entry file is not opened at all.
@@ -2174,6 +2338,13 @@ void server_disk_cache::scan() {
     // back to the full header validation below.
     std::map<std::string, disk_cache_manifest_meta> manifest;
     const bool manifest_ok = load_manifest(manifest);
+
+    if (!manifest_ok) {
+        counters.n_manifest_fallback++;
+    }
+
+    SRV_INF("disk cache: cache_scan_manifest: %s, %zu record(s)\n",
+            manifest_ok ? "hit" : "miss (full header scan)", manifest.size());
 
     for (const auto & de : fs::directory_iterator(dir, ec)) {
         if (ec) {
@@ -2193,6 +2364,7 @@ void server_disk_cache::scan() {
             std::error_code ec_rm;
             fs::remove(de.path(), ec_rm);
             if (!ec_rm) {
+                n_removed_tmp++;
                 SRV_WRN("disk cache: removed orphaned temp file '%s'\n", de.path().string().c_str());
             }
             continue;
@@ -2215,12 +2387,13 @@ void server_disk_cache::scan() {
             const auto mi = manifest.find(name);
             if (mi != manifest.end() && mi->second.size_file == (uint64_t) fsize) {
                 server_disk_cache_entry e;
-                e.path      = de.path().string();
-                e.hash      = mi->second.hash;
-                e.size_file = (size_t) fsize;
-                e.size_main = (size_t) mi->second.size_main;
-                e.size_drft = (size_t) mi->second.size_drft;
-                e.last_used = mi->second.last_used;
+                e.path       = de.path().string();
+                e.hash       = mi->second.hash;
+                e.size_file  = (size_t) fsize;
+                e.size_main  = (size_t) mi->second.size_main;
+                e.size_drft  = (size_t) mi->second.size_drft;
+                e.last_used  = mi->second.last_used;
+                e.packed_crc = mi->second.packed_crc;
 
                 // a corrupt index record is not trusted: fall through to the
                 // full validation, which either repairs or drops the entry
@@ -2229,8 +2402,13 @@ void server_disk_cache::scan() {
                     total_size += e.size_file;
                     entries.push_back(std::move(e));
                     manifest.erase(mi);
+                    n_from_manifest++;
                     continue;
                 }
+
+                // the record claims this file but its metadata does not decode
+                // consistently - count it, the header below is the authority
+                n_manifest_stale++;
             }
         }
 
@@ -2245,6 +2423,7 @@ void server_disk_cache::scan() {
 
             std::error_code ec_rm;
             fs::remove(de.path(), ec_rm);
+            n_dropped++;
         };
 
         char magic[8];
@@ -2253,9 +2432,23 @@ void server_disk_cache::scan() {
         uint32_t version = 0;
         uint32_t sig_len = 0;
         if (!disk_cache_read(f, version) || !disk_cache_read(f, sig_len) ||
-                memcmp(magic, DISK_CACHE_MAGIC, sizeof(magic)) != 0 ||
-                version != DISK_CACHE_VERSION) {
+                memcmp(magic, DISK_CACHE_MAGIC, sizeof(magic)) != 0) {
             drop("bad header");
+            continue;
+        }
+
+        if (version != DISK_CACHE_VERSION) {
+            // never reinterpret an older layout as the current one: v7 files have
+            // no packed checksum, so they cannot be validated on read. the cache
+            // is a pure accelerator, dropping and rebuilding it is safe - but the
+            // discard must be stated instead of looking like a corruption
+            SRV_WRN("disk cache: dropping '%s': entry format v%u %s v%u, the cache will be rebuilt\n",
+                    de.path().string().c_str(), (unsigned) version,
+                    version < DISK_CACHE_VERSION ? "is older than" : "is newer than", (unsigned) DISK_CACHE_VERSION);
+            f.close();
+            std::error_code ec_rm;
+            fs::remove(de.path(), ec_rm);
+            n_dropped++;
             continue;
         }
 
@@ -2289,33 +2482,52 @@ void server_disk_cache::scan() {
             continue;
         }
 
-        uint64_t size_main = 0;
-        uint64_t size_drft = 0;
-        uint32_t n_ckpt    = 0;
-        uint64_t created   = 0;
-        uint64_t last_used = 0;
+        uint64_t size_main   = 0;
+        uint64_t size_drft   = 0;
+        uint32_t n_ckpt      = 0;
+        uint64_t created     = 0;
+        uint64_t last_used   = 0;
+        uint64_t crc_main    = 0;
+        uint64_t crc_drft    = 0;
+        uint64_t crc_packed  = 0;
         if (!disk_cache_read(f, size_main) || !disk_cache_read(f, size_drft) ||
                 !disk_cache_read(f, n_ckpt) || !disk_cache_read(f, created) ||
-                !disk_cache_read(f, last_used)) {
+                !disk_cache_read(f, last_used) || !disk_cache_read(f, crc_main) ||
+                !disk_cache_read(f, crc_drft) || !disk_cache_read(f, crc_packed)) {
             drop("truncated header");
             continue;
         }
 
-        e.hash      = disk_cache_hash(e.tokens, e.media_indices, e.media_token_counts, e.media_ids);
-        e.size_main = (size_t) size_main;
-        e.size_drft = (size_t) size_drft;
-        e.last_used = (int64_t) (last_used > 0 ? last_used : created);
-        e.size_file = (size_t) fsize; // stat'ed above, before the header was parsed
+        // the packed metadata is verified here as well: scan is the last point
+        // where a corrupt header can be dropped without a lookup ever seeing it
+        (void) crc_main;
+        (void) crc_drft;
+        if (disk_cache_crc64(packed) != crc_packed) {
+            drop("prompt metadata checksum mismatch");
+            continue;
+        }
+
+        e.hash       = disk_cache_hash(e.tokens, e.media_indices, e.media_token_counts, e.media_ids);
+        e.size_main  = (size_t) size_main;
+        e.size_drft  = (size_t) size_drft;
+        e.last_used  = (int64_t) (last_used > 0 ? last_used : created);
+        e.size_file  = (size_t) fsize; // stat'ed above, before the header was parsed
+        e.packed_crc = crc_packed;
 
         total_size += e.size_file;
         entries.push_back(std::move(e));
+        n_from_header++;
     }
+
+    SRV_INF("disk cache: cache_scan_end: %zu entries (manifest %zu, header %zu, stale index records %zu), %zu dropped, %zu temp removed, %.2f MiB, %.2f ms\n",
+            entries.size(), n_from_manifest, n_from_header, n_manifest_stale, n_dropped, n_removed_tmp,
+            total_size/(1024.0*1024.0), (ggml_time_us() - t_scan_start)/1000.0);
 }
 
 bool server_disk_cache::load_manifest(std::map<std::string, disk_cache_manifest_meta> & out) {
     std::ifstream f(dir + "/" + DISK_CACHE_INDEX_NAME, std::ios::binary);
     if (!f) {
-        return false;
+        return false; // no index from a previous run - a full scan is the normal path
     }
 
     char magic[8];
@@ -2326,44 +2538,76 @@ bool server_disk_cache::load_manifest(std::map<std::string, disk_cache_manifest_
     if (!f || memcmp(magic, DISK_CACHE_INDEX_MAGIC, sizeof(magic)) != 0 ||
             !disk_cache_read(f, version) || version != DISK_CACHE_INDEX_VERSION ||
             !disk_cache_read(f, sig_len) || sig_len != sig.size()) {
+        SRV_INF("disk cache: index rejected (header/v%u/sig mismatch), falling back to a full scan\n",
+                (unsigned) version);
         return false;
     }
 
     std::string entry_sig(sig_len, '\0');
     f.read(entry_sig.data(), (std::streamsize) sig_len);
     if (!f || entry_sig != sig) {
+        SRV_INF("%s", "disk cache: index rejected (different model or context configuration), falling back to a full scan\n");
         return false;
     }
 
+    uint64_t body_size = 0;
+    if (!disk_cache_read(f, body_size) || body_size > (1ull << 32)) {
+        SRV_INF("%s", "disk cache: index rejected (bad body size), falling back to a full scan\n");
+        return false;
+    }
+
+    std::vector<char> body((size_t) body_size);
+    if (body_size > 0) {
+        f.read(body.data(), (std::streamsize) body.size());
+    }
+
+    uint64_t body_crc = 0;
+    if (!f || !disk_cache_read(f, body_crc)) {
+        SRV_INF("%s", "disk cache: index rejected (truncated), falling back to a full scan\n");
+        return false;
+    }
+
+    // the whole record block is checksummed: a torn write or a bit flip in the
+    // index must not feed a wrong token prefix into the lookup. entries are only
+    // an accelerator, so the fallback is a full header scan, not an error
+    if (disk_cache_crc64(body) != body_crc) {
+        SRV_WRN("%s", "disk cache: index checksum mismatch, falling back to a full scan\n");
+        return false;
+    }
+
+    // parse the verified body through an in-memory stream
+    std::string body_str(body.begin(), body.end());
+    std::istringstream bf(body_str, std::ios::binary);
+
     uint32_t n_records = 0;
-    if (!disk_cache_read(f, n_records) || n_records > (1u << 20)) {
+    if (!disk_cache_read(bf, n_records) || n_records > (1u << 20)) {
         return false;
     }
 
     for (uint32_t i = 0; i < n_records; ++i) {
         uint32_t name_len = 0;
-        if (!disk_cache_read(f, name_len) || name_len == 0 || name_len > 256) {
+        if (!disk_cache_read(bf, name_len) || name_len == 0 || name_len > 256) {
             return false;
         }
 
         disk_cache_manifest_meta m;
 
         std::string name(name_len, '\0');
-        f.read(name.data(), (std::streamsize) name_len);
+        bf.read(name.data(), (std::streamsize) name_len);
         uint64_t packed_size = 0;
-        if (!f ||
-                !disk_cache_read(f, m.hash) || !disk_cache_read(f, m.size_file) ||
-                !disk_cache_read(f, m.size_main) || !disk_cache_read(f, m.size_drft) ||
-                !disk_cache_read(f, m.last_used) ||
-                !disk_cache_read(f, packed_size) || packed_size > (1u << 28)) {
+        if (!bf ||
+                !disk_cache_read(bf, m.hash) || !disk_cache_read(bf, m.size_file) ||
+                !disk_cache_read(bf, m.size_main) || !disk_cache_read(bf, m.size_drft) ||
+                !disk_cache_read(bf, m.last_used) || !disk_cache_read(bf, m.packed_crc) ||
+                !disk_cache_read(bf, packed_size) || packed_size > (1u << 28)) {
             return false;
         }
 
         m.packed.resize((size_t) packed_size);
         if (packed_size > 0) {
-            f.read(m.packed.data(), (std::streamsize) m.packed.size());
+            bf.read(m.packed.data(), (std::streamsize) m.packed.size());
         }
-        if (!f) {
+        if (!bf) {
             return false;
         }
 
@@ -2385,6 +2629,7 @@ void server_disk_cache::save_manifest() {
         uint64_t    size_main;
         uint64_t    size_drft;
         int64_t     last_used;
+        uint64_t    packed_crc;
         std::vector<char> packed;
     };
 
@@ -2400,17 +2645,49 @@ void server_disk_cache::save_manifest() {
             continue;
         }
 
-        rec.hash      = e.hash;
-        rec.size_file = (uint64_t) e.size_file;
-        rec.size_main = (uint64_t) e.size_main;
-        rec.size_drft = (uint64_t) e.size_drft;
-        rec.last_used = e.last_used;
+        rec.hash       = e.hash;
+        rec.size_file  = (uint64_t) e.size_file;
+        rec.size_main  = (uint64_t) e.size_main;
+        rec.size_drft  = (uint64_t) e.size_drft;
+        rec.last_used  = e.last_used;
+        rec.packed_crc = e.packed_crc;
 
         records.push_back(std::move(rec));
     }
 
     const std::string path = dir + "/" + DISK_CACHE_INDEX_NAME;
     const std::string tmp  = path + ".tmp";
+
+    // build the record block first so it can be checksummed as a whole
+    std::string body;
+    {
+        auto append = [&](const void * data, size_t size) {
+            body.append(reinterpret_cast<const char *>(data), size);
+        };
+
+        const uint32_t n_records = (uint32_t) records.size();
+        append(&n_records, sizeof(n_records));
+
+        for (const auto & rec : records) {
+            const uint32_t name_len = (uint32_t) rec.name.size();
+            append(&name_len, sizeof(name_len));
+            append(rec.name.data(), rec.name.size());
+            append(&rec.hash, sizeof(rec.hash));
+            append(&rec.size_file, sizeof(rec.size_file));
+            append(&rec.size_main, sizeof(rec.size_main));
+            append(&rec.size_drft, sizeof(rec.size_drft));
+            const uint64_t last_used = (uint64_t) rec.last_used;
+            append(&last_used, sizeof(last_used));
+            append(&rec.packed_crc, sizeof(rec.packed_crc));
+            const uint64_t packed_size = (uint64_t) rec.packed.size();
+            append(&packed_size, sizeof(packed_size));
+            if (!rec.packed.empty()) {
+                append(rec.packed.data(), rec.packed.size());
+            }
+        }
+    }
+
+    const uint64_t body_crc = disk_cache_crc64(reinterpret_cast<const uint8_t *>(body.data()), body.size());
 
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -2423,19 +2700,12 @@ void server_disk_cache::save_manifest() {
         disk_cache_write(f, (uint32_t) DISK_CACHE_INDEX_VERSION);
         disk_cache_write(f, (uint32_t) sig.size());
         f.write(sig.data(), (std::streamsize) sig.size());
-        disk_cache_write(f, (uint32_t) records.size());
-
-        for (const auto & rec : records) {
-            disk_cache_write(f, (uint32_t) rec.name.size());
-            f.write(rec.name.data(), (std::streamsize) rec.name.size());
-            disk_cache_write(f, rec.hash);
-            disk_cache_write(f, rec.size_file);
-            disk_cache_write(f, rec.size_main);
-            disk_cache_write(f, rec.size_drft);
-            disk_cache_write(f, (uint64_t) rec.last_used);
-            disk_cache_write(f, (uint64_t) rec.packed.size());
-            f.write(rec.packed.data(), (std::streamsize) rec.packed.size());
+        const uint64_t body_size = (uint64_t) body.size();
+        disk_cache_write(f, body_size);
+        if (!body.empty()) {
+            f.write(body.data(), (std::streamsize) body.size());
         }
+        disk_cache_write(f, body_crc);
 
         f.flush();
         if (!f) {
@@ -2483,9 +2753,13 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         const auto & ckpts = pending.checkpoints;
 
         // integrity checksums are computed before the payload is written and
-        // stored in the header, so read_entry can verify the bytes it restores
-        const uint64_t crc_main = disk_cache_crc64(*pending.main);
-        const uint64_t crc_drft = disk_cache_crc64(*pending.drft);
+        // stored in the header, so read_entry can verify the bytes it restores.
+        // the token/media metadata gets a checksum of its own: it is the only
+        // thing that ties the KV payload to a prompt, and a corrupted copy would
+        // otherwise be decoded and used to build the restored prompt
+        const uint64_t crc_main   = disk_cache_crc64(*pending.main);
+        const uint64_t crc_drft   = disk_cache_crc64(*pending.drft);
+        const uint64_t crc_packed = disk_cache_crc64(pending.packed);
 
         disk_cache_write(f, (uint64_t) pending.main->size());
         disk_cache_write(f, (uint64_t) pending.drft->size());
@@ -2494,6 +2768,7 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         disk_cache_write(f, (uint64_t) disk_cache_now()); // last_used
         disk_cache_write(f, crc_main);
         disk_cache_write(f, crc_drft);
+        disk_cache_write(f, crc_packed);
 
         for (const auto & c : ckpts) {
             disk_cache_write(f, (int64_t)  c->n_tokens);
@@ -2552,11 +2827,13 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
     return true;
 }
 
-bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp, std::vector<char> & packed, common_state_data & main, common_state_data & drft,
-        std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints) {
+disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp, server_disk_cache_payload & out) {
     std::ifstream f(e.path, std::ios::binary);
     if (!f) {
-        return false;
+        // a missing or locked file is not proof of corruption: keep the entry and
+        // let a later request retry (the startup scan removes vanished files)
+        SRV_WRN("disk cache: cannot open '%s' for reading\n", e.path.c_str());
+        return disk_cache_read_status::io_error;
     }
 
     char magic[8];
@@ -2567,42 +2844,89 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
     if (!disk_cache_read(f, version) || !disk_cache_read(f, sig_len) ||
             memcmp(magic, DISK_CACHE_MAGIC, sizeof(magic)) != 0 ||
             version != DISK_CACHE_VERSION || sig_len != sig.size()) {
-        return false;
+        SRV_WRN("disk cache: '%s' has a mismatching header (v%u, sig %u bytes)\n",
+                e.path.c_str(), (unsigned) version, (unsigned) sig_len);
+        return disk_cache_read_status::corrupt;
     }
 
     std::string entry_sig(sig_len, '\0');
     f.read(entry_sig.data(), (std::streamsize) sig_len);
-    if (entry_sig != sig) {
-        return false;
+    if (!f || entry_sig != sig) {
+        SRV_WRN("disk cache: '%s' was written for a different model or context configuration\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
     }
 
     uint32_t packed_size = 0;
     if (!disk_cache_read(f, packed_size) || packed_size > (1u << 28)) {
-        return false;
+        SRV_WRN("disk cache: '%s' has a bad prompt metadata size\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
     }
 
-    packed.resize(packed_size);
-    f.read(packed.data(), (std::streamsize) packed.size());
+    out.packed.resize(packed_size);
+    if (packed_size > 0) {
+        f.read(out.packed.data(), (std::streamsize) out.packed.size());
+    }
     if (!f) {
-        return false;
+        SRV_WRN("disk cache: '%s' is truncated inside the prompt metadata\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
     }
 
-    uint64_t size_main = 0;
-    uint64_t size_drft = 0;
-    uint32_t n_ckpt    = 0;
-    uint64_t created   = 0;
-    uint64_t last_used = 0;
-    uint64_t crc_main  = 0;
-    uint64_t crc_drft  = 0;
+    uint64_t size_main   = 0;
+    uint64_t size_drft   = 0;
+    uint32_t n_ckpt      = 0;
+    uint64_t created     = 0;
+    uint64_t last_used   = 0;
+    uint64_t crc_main    = 0;
+    uint64_t crc_drft    = 0;
+    uint64_t crc_packed  = 0;
     if (!disk_cache_read(f, size_main) || !disk_cache_read(f, size_drft) ||
             !disk_cache_read(f, n_ckpt) || !disk_cache_read(f, created) ||
             !disk_cache_read(f, last_used) || !disk_cache_read(f, crc_main) ||
-            !disk_cache_read(f, crc_drft)) {
-        return false;
+            !disk_cache_read(f, crc_drft) || !disk_cache_read(f, crc_packed)) {
+        SRV_WRN("disk cache: '%s' is truncated inside the header\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
     }
+    (void) created;
 
     if (size_main != e.size_main || size_drft != e.size_drft || n_ckpt > 1024) {
-        return false;
+        SRV_WRN("disk cache: '%s' does not match its index record (main %" PRIu64 "/%zu, drft %" PRIu64 "/%zu)\n",
+                e.path.c_str(), size_main, e.size_main, size_drft, e.size_drft);
+        return disk_cache_read_status::corrupt;
+    }
+
+    // the packed metadata is validated before anything else is decoded or
+    // restored: it decides which prompt the KV payload belongs to. the checksum
+    // was written by the writer, so this covers corruption that happened before
+    // the entry was indexed - which no read-side hash of the same broken bytes
+    // could ever detect
+    if (disk_cache_crc64(out.packed) != crc_packed) {
+        SRV_WRN("disk cache: prompt metadata checksum mismatch in '%s', dropping it\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
+    }
+
+    // an entry indexed from the startup manifest carries the checksum of the
+    // metadata that was verified at scan time: a mismatch means the index and the
+    // file disagree, which invalidates the prefix the lookup was based on
+    if (e.packed_crc != 0 && e.packed_crc != crc_packed) {
+        SRV_WRN("disk cache: '%s' does not match the prompt metadata in the index (crc %016" PRIx64 " vs %016" PRIx64 ")\n",
+                e.path.c_str(), crc_packed, e.packed_crc);
+        return disk_cache_read_status::corrupt;
+    }
+
+    if (!disk_cache_unpack_ids(out.packed, out.tokens, out.media_indices, out.media_token_counts, out.media_ids)) {
+        SRV_WRN("disk cache: failed to decode the prompt metadata of '%s'\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
+    }
+
+    // the decoded metadata must describe the entry the lookup selected: the
+    // lookup compared prefixes against the indexed token sequence, so a
+    // divergence here means the restored KV would not cover the restored prompt
+    if (out.tokens != e.tokens ||
+            out.media_indices != e.media_indices ||
+            out.media_token_counts != e.media_token_counts ||
+            out.media_ids != e.media_ids) {
+        SRV_WRN("disk cache: '%s' holds a different prompt than the index claims\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
     }
 
     struct ckpt_meta {
@@ -2622,7 +2946,8 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
         if (!disk_cache_read(f, m.n_tokens) || !disk_cache_read(f, m.pos_min) || !disk_cache_read(f, m.pos_max) ||
                 !disk_cache_read(f, m.size_spec) || !disk_cache_read(f, m.size_tgt) || !disk_cache_read(f, m.size_dft) ||
                 !disk_cache_read(f, m.crc_spec) || !disk_cache_read(f, m.crc_tgt) || !disk_cache_read(f, m.crc_dft)) {
-            return false;
+            SRV_WRN("disk cache: '%s' is truncated inside the checkpoint table\n", e.path.c_str());
+            return disk_cache_read_status::corrupt;
         }
     }
 
@@ -2641,29 +2966,30 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
 
     const std::streamoff hdr_end = f.tellg();
 
-    main.resize(size_main);
+    out.main.resize(size_main);
     if (size_main > 0) {
-        f.read(reinterpret_cast<char *>(main.data()), (std::streamsize) size_main);
+        f.read(reinterpret_cast<char *>(out.main.data()), (std::streamsize) size_main);
     }
 
-    drft.resize(size_drft);
+    out.drft.resize(size_drft);
     if (size_drft > 0) {
-        f.read(reinterpret_cast<char *>(drft.data()), (std::streamsize) size_drft);
+        f.read(reinterpret_cast<char *>(out.drft.data()), (std::streamsize) size_drft);
     }
 
     if (!f) {
-        return false;
+        SRV_WRN("disk cache: '%s' is truncated inside the state payload\n", e.path.c_str());
+        return disk_cache_read_status::corrupt;
     }
 
     // verify the payload before it reaches llama_state_seq_set_data_ext: a torn
     // write or a bad disk sector would otherwise be restored silently and produce
     // wrong inference. a mismatch marks the entry for removal by the caller.
-    if (disk_cache_crc64(main) != crc_main || disk_cache_crc64(drft) != crc_drft) {
+    if (disk_cache_crc64(out.main) != crc_main || disk_cache_crc64(out.drft) != crc_drft) {
         SRV_WRN("disk cache: payload checksum mismatch in '%s', dropping it\n", e.path.c_str());
-        return false;
+        return disk_cache_read_status::corrupt;
     }
 
-    checkpoints.clear();
+    out.checkpoints.clear();
     uint64_t ckpt_bytes = 0;
     for (size_t i = 0; i < metas.size(); i++) {
         const auto & m = metas[i];
@@ -2697,8 +3023,9 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
         }
 
         if (!f) {
-            checkpoints.clear();
-            return false;
+            SRV_WRN("disk cache: '%s' is truncated inside the checkpoint payload\n", e.path.c_str());
+            out.checkpoints.clear();
+            return disk_cache_read_status::corrupt;
         }
 
         // the checkpoint payload feeds llama_state_seq_set_data_ext as well, so
@@ -2707,18 +3034,18 @@ bool server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp
                 disk_cache_crc64(ckpt->data_tgt) != m.crc_tgt ||
                 disk_cache_crc64(ckpt->data_dft) != m.crc_dft) {
             SRV_WRN("disk cache: checkpoint checksum mismatch in '%s', dropping it\n", e.path.c_str());
-            checkpoints.clear();
-            return false;
+            out.checkpoints.clear();
+            return disk_cache_read_status::corrupt;
         }
 
-        checkpoints.push_back(ckpt);
+        out.checkpoints.push_back(ckpt);
     }
 
     const uint64_t bytes_read = (uint64_t) hdr_end + size_main + size_drft + ckpt_bytes;
     SRV_TRC("disk cache: read %.2f MiB of %.2f MiB, checkpoints %d/%zu\n",
             bytes_read/1048576.0, e.size_file/1048576.0, want >= 0 ? 1 : 0, metas.size());
 
-    return true;
+    return disk_cache_read_status::ok;
 }
 
 bool server_disk_cache::touch_entry(const server_disk_cache_entry & e) {
@@ -2739,9 +3066,12 @@ bool server_disk_cache::touch_entry(const server_disk_cache_entry & e) {
     const uint32_t sig_len     = *reinterpret_cast<const uint32_t *>(fixed + 12);
     const uint32_t packed_size = *reinterpret_cast<const uint32_t *>(fixed + 16);
 
-    // last_used is the 8 bytes right after size_main/size_drft/n_ckpt/created,
-    // which follow the variable-length signature and packed metadata
-    const std::streamoff off_last_used = (std::streamoff) (DISK_CACHE_HEADER_FIXED - 8 + sig_len + packed_size);
+    // last_used sits after the variable-length signature and packed metadata and
+    // after size_main/size_drft/n_ckpt/created. the offset comes from the same
+    // constants the writer uses: a wrong offset overwrites the checksums that
+    // follow it, which turns every touched entry into a "damaged" entry that has
+    // to be dropped on the next read
+    const std::streamoff off_last_used = (std::streamoff) DISK_CACHE_HDR_LAST_USED_OFFSET + (std::streamoff) sig_len + (std::streamoff) packed_size;
 
     const uint64_t now = (uint64_t) disk_cache_now();
     f.seekp(off_last_used, std::ios::beg);
@@ -2922,7 +3252,8 @@ void server_disk_cache::dedup_prefixes() {
     }
 }
 
-bool server_disk_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_disk_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        prompt_cache_restore_info & info) {
     if (!active) {
         return true;
     }
@@ -2937,32 +3268,69 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
         return true;
     }
 
-    server_disk_cache_entry best;
-    bool found = false;
+    counters.n_lookups++;
 
-    size_t best_lcp = 0;
+    // best lcp over every candidate seen in this call, accepted or not, and the
+    // reason the candidate that got furthest was rejected. this separates "no
+    // entry shares a prefix" from "a candidate existed but was not restorable"
+    size_t              lcp_seen      = 0;
+    cache_reject_reason reject_seen   = cache_reject_reason::no_prefix;
 
-    {
+    auto note_reject = [&](size_t lcp, cache_reject_reason reason) {
+        if (lcp > lcp_seen) {
+            lcp_seen    = lcp;
+            reject_seen = reason;
+        }
+    };
+
+    // select the best candidate that has not been rejected yet in this call. the
+    // callers of this file must never pick an entry outside the lock, but the
+    // multi-gigabyte file IO has to happen without it
+    auto pick = [&](const std::vector<std::string> & skip, server_disk_cache_entry & best_out, size_t & best_lcp_out) {
+        bool found = false;
+
         std::lock_guard<std::mutex> lock(mtx);
 
         SRV_TRC("disk cache: lookup for %zu tokens, %zu entries, min %zu tokens\n", tokens.size(), entries.size(), min_tokens);
 
         for (const auto & e : entries) {
+            if (std::find(skip.begin(), skip.end(), e.path) != skip.end()) {
+                continue;
+            }
+
             const size_t e_size = e.tokens.size();
 
             // an entry shorter than the minimum can never yield a restorable lcp
             if (e_size < DISK_CACHE_MIN_LOOKUP_TOKENS || e_size < min_tokens) {
+                SRV_TRC("disk cache:   - entry with length %7zu skipped: shorter than min %zu tokens\n", e_size, min_tokens);
+                note_reject(0, cache_reject_reason::too_short);
                 continue;
             }
 
             // the lcp cannot exceed either length; if that is below the minimum,
             // skip the whole-token comparison
             if (std::min(e_size, tokens.size()) < min_tokens) {
+                SRV_TRC("disk cache:   - entry with length %7zu skipped: the prompt is shorter than min %zu tokens\n", e_size, min_tokens);
+                note_reject(0, cache_reject_reason::too_short);
                 continue;
             }
 
             size_t lcp = disk_cache_lcp(e.tokens, tokens);
+
+            // the media checks below can only shorten the usable prefix: keep
+            // track of that so a media-limited candidate is not reported as a
+            // plain prefix miss
+            bool media_clamped = false;
+            auto clamp_lcp = [&](size_t value) {
+                if (value < lcp) {
+                    lcp = value;
+                    media_clamped = true;
+                }
+            };
+
             if (e.media_indices.size() != e.media_token_counts.size() || e.media_indices.size() != e.media_ids.size()) {
+                SRV_TRC("disk cache:   - entry with length %7zu skipped: inconsistent media metadata\n", e_size);
+                note_reject(0, cache_reject_reason::media_mismatch);
                 continue;
             }
             for (size_t i = 0; i < e.media_indices.size(); ++i) {
@@ -2972,12 +3340,12 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
                 }
                 const auto it = std::lower_bound(media_indices.begin(), media_indices.end(), idx);
                 if (it == media_indices.end() || *it != idx) {
-                    lcp = std::min(lcp, (size_t) idx);
+                    clamp_lcp((size_t) idx);
                     break;
                 }
                 const size_t j = (size_t) (it - media_indices.begin());
                 if (e.media_token_counts[i] != media_token_counts[j] || e.media_ids[i] != media_ids[j]) {
-                    lcp = std::min(lcp, (size_t) idx);
+                    clamp_lcp((size_t) idx);
                     break;
                 }
             }
@@ -2985,12 +3353,12 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
                 const uint32_t idx = media_indices[i];
                 const auto it = std::lower_bound(e.media_indices.begin(), e.media_indices.end(), idx);
                 if (it == e.media_indices.end() || *it != idx) {
-                    lcp = std::min(lcp, (size_t) idx);
+                    clamp_lcp((size_t) idx);
                     break;
                 }
                 const size_t j = (size_t) (it - e.media_indices.begin());
                 if (media_token_counts[i] != e.media_token_counts[j] || media_ids[i] != e.media_ids[j]) {
-                    lcp = std::min(lcp, (size_t) idx);
+                    clamp_lcp((size_t) idx);
                     break;
                 }
             }
@@ -2998,7 +3366,7 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
                 const size_t start = e.media_indices[i];
                 const size_t end = start + e.media_token_counts[i];
                 if (lcp > start && lcp < end) {
-                    lcp = start;
+                    clamp_lcp(start);
                     break;
                 }
             }
@@ -3011,6 +3379,8 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
             // not apply. min_tokens is the only match-quality guard - it keeps
             // the file read cheaper than the prefill it replaces.
             if (lcp < min_tokens) {
+                SRV_TRC("disk cache:   - entry with length %7zu skipped: lcp %7zu is below min %zu tokens\n", e_size, lcp, min_tokens);
+                note_reject(lcp, media_clamped ? cache_reject_reason::media_mismatch : cache_reject_reason::no_prefix);
                 continue;
             }
 
@@ -3020,39 +3390,130 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
             if (e.size_file > lcp * DISK_CACHE_MAX_BYTES_PER_TOKEN) {
                 SRV_TRC("disk cache:   - skipping entry with length %7zu: lcp %7zu would read %.2f MiB per token\n",
                         e_size, lcp, e.size_file/(1024.0*1024.0)/std::max<size_t>(1, lcp));
+                note_reject(lcp, cache_reject_reason::io_cost);
                 continue;
             }
 
             // the longest shared prefix wins; on a tie the most recently used
             // entry is fresher and the more similar one keeps more of the cache
-            if (!found || lcp > best_lcp || (lcp == best_lcp && e.last_used > best.last_used)) {
-                best_lcp = lcp;
-                best     = e;
-                found    = true;
+            if (!found || lcp > best_lcp_out || (lcp == best_lcp_out && e.last_used > best_out.last_used)) {
+                best_lcp_out = lcp;
+                best_out     = e;
+                found        = true;
             }
+        }
+
+        return found;
+    };
+
+    // a rejected candidate must not force a full prefill while another entry can
+    // still serve part of the prompt: keep trying until the attempts run out or
+    // one entry validates. only read_entry failures land here - once KV state was
+    // written, the caller has to clear the slot instead
+    server_disk_cache_payload payload;
+    server_disk_cache_entry   best;
+    size_t                    best_lcp = 0;
+
+    std::vector<std::string> rejected;
+
+    bool have = false;
+
+    for (int attempt = 0; attempt < DISK_CACHE_MAX_LOAD_ATTEMPTS; attempt++) {
+        best = server_disk_cache_entry();
+        best_lcp = 0;
+
+        if (!pick(rejected, best, best_lcp)) {
+            if (attempt == 0) {
+                SRV_TRC("%s", "disk cache: no candidate shares a long enough prefix\n");
+
+                info.candidate_lcp = lcp_seen;
+                info.reject        = reject_seen;
+                counters.n_candidate_lcp_tokens += lcp_seen;
+                counters.n_reject[(size_t) reject_seen]++;
+            }
+            return true;
+        }
+
+        const float f_keep = float(best_lcp) / best.tokens.size();
+        const float f_sim  = float(best_lcp) / std::max<size_t>(1, tokens.size());
+
+        SRV_TRC("disk cache: candidate '%s' with %zu tokens, f_keep = %.3f, f_sim = %.3f\n",
+                best.path.c_str(), best.tokens.size(), f_keep, f_sim);
+
+        payload = server_disk_cache_payload();
+
+        const int64_t t_read = ggml_time_us();
+
+        const disk_cache_read_status status = read_entry(best, best_lcp, payload);
+        if (status == disk_cache_read_status::ok) {
+            info.read_bytes += best.size_file;
+            info.elapsed_us += ggml_time_us() - t_read;
+            have = true;
+            break;
+        }
+
+        rejected.push_back(best.path);
+
+        if (status == disk_cache_read_status::corrupt) {
+            SRV_WRN("disk cache: dropping the corrupt entry '%s'\n", best.path.c_str());
+            drop_entry(best.path);
+            info.reject = cache_reject_reason::checksum_error;
+        } else {
+            SRV_WRN("disk cache: keeping '%s' after a read error, a later request may succeed\n", best.path.c_str());
+            info.reject = cache_reject_reason::read_error;
         }
     }
 
-    if (!found) {
+    if (!have) {
+        SRV_WRN("disk cache: no restorable entry left for %zu tokens after %d attempt(s), prefilling\n",
+                tokens.size(), DISK_CACHE_MAX_LOAD_ATTEMPTS);
+
+        info.candidate_lcp = std::max(info.candidate_lcp, lcp_seen);
+        if (info.reject == cache_reject_reason::none) {
+            info.reject = reject_seen;
+        }
+        counters.n_candidate_lcp_tokens += info.candidate_lcp;
+        counters.n_reject[(size_t) info.reject]++;
         return true;
     }
 
-    const float f_keep = float(best_lcp) / best.tokens.size();
-    const float f_sim  = float(best_lcp) / std::max<size_t>(1, tokens.size());
-
-    SRV_TRC("disk cache: candidate '%s' with %zu tokens, f_keep = %.3f, f_sim = %.3f\n",
-            best.path.c_str(), best.tokens.size(), f_keep, f_sim);
+    counters.n_candidate_lcp_tokens += best_lcp;
 
     const int64_t t_start = ggml_time_us();
 
-    common_state_data main;
-    common_state_data drft;
-    std::vector<char> packed;
-    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
-    if (!read_entry(best, best_lcp, packed, main, drft, checkpoints)) {
-        SRV_WRN("disk cache: failed to read '%s', dropping it\n", best.path.c_str());
-        drop_entry(best.path);
+    // everything below this point is metadata-only until the state restore, so a
+    // rejection here is still a clean fallback: nothing was written to the contexts
 
+    // the media metadata of the entry must match the request at exactly the same
+    // positions, otherwise the cached KV does not describe the restored prompt
+    try {
+        for (size_t i = 0; i < payload.media_indices.size(); ++i) {
+            const uint32_t idx = payload.media_indices[i];
+            if (idx >= best_lcp || idx >= tokens_new.size() ||
+                    tokens_new.media_chunk_token_count(idx) != payload.media_token_counts[i] ||
+                    tokens_new.media_chunk_id(idx) != payload.media_ids[i]) {
+                throw std::runtime_error("cached media metadata differs from the current prompt");
+            }
+        }
+    } catch (const std::exception & err) {
+        // deterministic media mismatch - drop the entry, it can never match again
+        SRV_WRN("disk cache: cannot use '%s': %s, dropping it\n", best.path.c_str(), err.what());
+        info.reject = cache_reject_reason::media_mismatch;
+        counters.n_reject[(size_t) info.reject]++;
+        drop_entry(best.path);
+        return true;
+    }
+
+    const size_t size_main = payload.main.size();
+    const size_t size_drft = payload.drft.size();
+
+    if (size_drft > 0 && !ctx_dft) {
+        // deterministic: this process has no draft context, the entry can never
+        // be restored here - drop it instead of failing on every matching request
+        SRV_WRN("%s", "disk cache: entry has a draft state but there is no draft context, dropping it\n");
+        info.reject = cache_reject_reason::signature_mismatch;
+        counters.n_reject[(size_t) info.reject]++;
+        drop_entry(best.path);
         return true;
     }
 
@@ -3060,56 +3521,30 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
     // slot.prompt still holds the previous tokens: any failure must return
     // false so the caller clears the slot and prefills from scratch. returning
     // true would leave KV and prompt.tokens mismatched -> silent wrong inference
-    const size_t size_main = main.size();
-    if (llama_state_seq_set_data_ext(ctx_tgt, main.data(), size_main, id_slot, 0) != size_main) {
+    if (llama_state_seq_set_data_ext(ctx_tgt, payload.main.data(), size_main, id_slot, 0) != size_main) {
         // keep the entry: the failure can be transient (e.g. VRAM pressure),
         // and a retry on the next request may succeed
         SRV_WRN("disk cache: failed to restore the target state (size %zu)\n", size_main);
+        info.reject = cache_reject_reason::restore_failed;
+        counters.n_reject[(size_t) info.reject]++;
         return false;
     }
 
-    const size_t size_drft = drft.size();
     if (size_drft > 0) {
-        if (!ctx_dft) {
-            // deterministic: this process has no draft context, the entry can
-            // never be restored here - drop it instead of failing on every
-            // matching request
-            SRV_WRN("%s", "disk cache: entry has a draft state but there is no draft context, dropping it\n");
-            drop_entry(best.path);
-            return false;
-        }
-        if (llama_state_seq_set_data_ext(ctx_dft, drft.data(), size_drft, id_slot, 0) != size_drft) {
+        if (llama_state_seq_set_data_ext(ctx_dft, payload.drft.data(), size_drft, id_slot, 0) != size_drft) {
             SRV_WRN("disk cache: failed to restore the draft state (size %zu)\n", size_drft);
+            info.reject = cache_reject_reason::restore_failed;
+            counters.n_reject[(size_t) info.reject]++;
             return false;
         }
-    }
-
-    llama_tokens restored_tokens;
-    std::vector<uint32_t> restored_media_indices;
-    std::vector<uint32_t> restored_media_token_counts;
-    std::vector<std::string> restored_media_ids;
-    if (!disk_cache_unpack_ids(packed, restored_tokens, restored_media_indices, restored_media_token_counts, restored_media_ids)) {
-        // deterministic corruption of the packed metadata - the entry can
-        // never be restored, drop it instead of failing on every match
-        SRV_WRN("disk cache: failed to decode the cached prompt metadata of '%s', dropping it\n", best.path.c_str());
-        drop_entry(best.path);
-        return false;
     }
 
     try {
-        for (size_t i = 0; i < restored_media_indices.size(); ++i) {
-            const uint32_t idx = restored_media_indices[i];
-            if (idx >= best_lcp || idx >= tokens_new.size() ||
-                    tokens_new.media_chunk_token_count(idx) != restored_media_token_counts[i] ||
-                    tokens_new.media_chunk_id(idx) != restored_media_ids[i]) {
-                throw std::runtime_error("cached media metadata differs from the current prompt");
-            }
-        }
-
         // only the shared prefix (best_lcp tokens) was restored from disk: the
         // remainder of the cached prompt diverges from the current one and must
         // not be kept, otherwise the media-placeholder fill would compare tokens
         // past the prefix and reject the restore
+        llama_tokens restored_tokens = payload.tokens;
         if (best_lcp < restored_tokens.size()) {
             restored_tokens.resize(best_lcp);
         }
@@ -3122,13 +3557,14 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
         prompt.tokens = server_tokens(restored_tokens, tokens_new.has_mtmd);
         prompt.tokens.append_media_placeholders_from(tokens_new);
     } catch (const std::exception & err) {
-        // deterministic media mismatch - same as above, drop the entry
-        SRV_WRN("disk cache: failed to restore prompt metadata of '%s': %s, dropping it\n", best.path.c_str(), err.what());
-        drop_entry(best.path);
+        // the state was already restored, so the caller must reset the slot
+        SRV_WRN("disk cache: failed to rebuild the prompt of '%s': %s\n", best.path.c_str(), err.what());
+        info.reject = cache_reject_reason::restore_failed;
+        counters.n_reject[(size_t) info.reject]++;
         return false;
     }
 
-    prompt.checkpoints = std::move(checkpoints);
+    prompt.checkpoints = std::move(payload.checkpoints);
 
     const int64_t now = disk_cache_now();
 
@@ -3151,6 +3587,15 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
     // note: restored = best_lcp (the usable prefix), not the whole entry -
     // printing the entry length here would make short-prefix hits of long
     // entries look like full restores and corrupt any bpt analysis
+    info.src          = prompt_cache_restore_info::source::disk;
+    info.entry_tokens = best.tokens.size();
+    info.candidate_lcp = best_lcp;
+    info.lcp          = best_lcp;
+    info.elapsed_us  += ggml_time_us() - t_start;
+
+    counters.n_read_bytes += info.read_bytes;
+    counters.n_restore_us += info.elapsed_us;
+
     SRV_DBG("disk cache: restored %zu/%zu tokens (%zu + %zu bytes) in %.2f ms\n",
             best_lcp, best.tokens.size(), size_main, size_drft, (ggml_time_us() - t_start)/1000.0);
 
@@ -3163,6 +3608,7 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
     }
 
     if (state.prompt.tokens.size() < min_tokens) {
+        counters.n_enqueue_rejected++;
         return;
     }
 
@@ -3171,10 +3617,12 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
     if (!disk_cache_pack(state.prompt.tokens, pending.packed, pending.ids,
                 pending.media_indices, pending.media_token_counts, pending.media_ids)) {
         SRV_TRC("%s", "disk cache: prompt metadata cannot be packed, skipping\n");
+        counters.n_enqueue_rejected++;
         return;
     }
 
     if (pending.ids.size() < min_tokens) {
+        counters.n_enqueue_rejected++;
         return;
     }
 
@@ -3184,6 +3632,7 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
     if (limit_size > 0 && pending.bytes > limit_size) {
         SRV_WRN("disk cache: entry of %.2f MiB exceeds the %.2f MiB limit, skipping\n",
                 pending.bytes/(1024.0*1024.0), limit_size/(1024.0*1024.0));
+        counters.n_enqueue_rejected++;
         return;
     }
 
@@ -3195,18 +3644,21 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
         for (const auto & e : entries) {
             if (e.hash == hash && e.tokens.size() == pending.ids.size()) {
                 SRV_TRC("disk cache: %016" PRIx64 " is already stored, skipping\n", hash);
+                counters.n_enqueue_dedup++;
                 return;
             }
         }
 
         if (inflight.count(hash)) {
             SRV_TRC("disk cache: %016" PRIx64 " is already queued, skipping\n", hash);
+            counters.n_enqueue_dedup++;
             return;
         }
 
         if (covered_cheaply(pending.ids)) {
             SRV_INF("disk cache: %zu tokens are covered up to a %zu-token tail by a stored entry, skipping a %.2f MiB write\n",
                     pending.ids.size(), DISK_CACHE_MAX_PREFIX_LAG_TOKENS, pending.bytes/(1024.0*1024.0));
+            counters.n_enqueue_dedup++;
             return;
         }
 
@@ -3214,6 +3666,7 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
                 queue.size() >= DISK_CACHE_QUEUE_MAX_ENTRIES) {
             SRV_WRN("disk cache: write queue is full (%zu entries, %.2f MiB pending), skipping a prompt with %zu tokens\n",
                     queue.size(), queue_bytes/(1024.0*1024.0), pending.ids.size());
+            counters.n_enqueue_rejected++;
             return;
         }
 
@@ -3228,6 +3681,8 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
         queue_bytes    += pending.bytes;
         inflight.insert(hash);
         queue.push_back(std::move(pending));
+
+        counters.n_enqueue_queued++;
     }
 
     cv.notify_one();
@@ -3239,16 +3694,19 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
     }
 
     if (state.prompt.tokens.size() < min_tokens) {
+        counters.n_enqueue_rejected++;
         return false;
     }
 
     const size_t bytes = state.size();
 
     if (limit_size > 0 && bytes > limit_size) {
+        counters.n_enqueue_rejected++;
         return false;
     }
 
     if (budget_left < bytes) {
+        counters.n_enqueue_rejected++;
         return false;
     }
 
@@ -3256,10 +3714,12 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
 
     if (!disk_cache_pack(state.prompt.tokens, pending.packed, pending.ids,
                 pending.media_indices, pending.media_token_counts, pending.media_ids)) {
+        counters.n_enqueue_rejected++;
         return false;
     }
 
     if (pending.ids.size() < min_tokens) {
+        counters.n_enqueue_rejected++;
         return false;
     }
 
@@ -3273,21 +3733,25 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
         // already written, or already waiting in the queue
         for (const auto & e : entries) {
             if (e.hash == hash && e.tokens.size() == pending.ids.size()) {
+                counters.n_enqueue_dedup++;
                 return false;
             }
         }
         if (inflight.count(hash)) {
+            counters.n_enqueue_dedup++;
             return false;
         }
 
         if (covered_cheaply(pending.ids)) {
             SRV_INF("disk cache: %zu tokens are covered up to a %zu-token tail by a stored entry, skipping a %.2f MiB mirror\n",
                     pending.ids.size(), DISK_CACHE_MAX_PREFIX_LAG_TOKENS, pending.bytes/(1024.0*1024.0));
+            counters.n_enqueue_dedup++;
             return false;
         }
 
         if ((queue_bytes_max > 0 && queue_bytes + pending.bytes > queue_bytes_max) ||
                 queue.size() >= DISK_CACHE_QUEUE_MAX_ENTRIES) {
+            counters.n_enqueue_rejected++;
             return false;
         }
 
@@ -3302,6 +3766,8 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
         queue_bytes    += pending.bytes;
         inflight.insert(hash);
         queue.push_back(std::move(pending));
+
+        counters.n_enqueue_queued++;
     }
 
     cv.notify_one();
@@ -3430,6 +3896,9 @@ void server_disk_cache::worker() {
                 e.size_drft = pending.drft->size();
                 e.size_file = size_file;
                 e.last_used = disk_cache_now();
+                // same checksum the writer put into the file header: it binds the
+                // index record to the file it describes
+                e.packed_crc = disk_cache_crc64(pending.packed);
 
                 total_size += size_file;
                 entries.push_back(std::move(e));
@@ -3446,6 +3915,8 @@ void server_disk_cache::worker() {
         }
 
         if (ok) {
+            counters.n_write_bytes += size_file;
+
             SRV_INF("disk cache: stored %zu tokens, %.2f MiB in %.2f ms\n",
                     n_tokens, size_file/(1024.0*1024.0), (ggml_time_us() - t_start)/1000.0);
 
@@ -3503,6 +3974,17 @@ void server_prompt_cache::flush_to_disk() {
     if (n_flushed > 0) {
         SRV_INF("disk cache: mirrored %zu prompt(s) from the RAM cache\n", n_flushed);
     }
+}
+
+void server_prompt_cache::mirror_latest(size_t budget) {
+    if (!disk || !disk->active || states.empty()) {
+        return;
+    }
+
+    // mirror the entry that was just added: the buffers are shared, not copied,
+    // so the write is the only cost. dedup, the size limits and the queue budget
+    // are all checked inside mirror()
+    disk->mirror(states.back(), budget);
 }
 
 size_t server_prompt_cache::size() const {
@@ -3608,7 +4090,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        prompt_cache_restore_info & info) {
     int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -3644,6 +4127,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        const int64_t t_ram = ggml_time_us();
+
         {
             // release the buffer after the restore; if a pending disk mirror
             // still references it, the memory stays alive until the write
@@ -3655,6 +4140,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
+                info.reject = cache_reject_reason::restore_failed;
                 return false;
             }
 
@@ -3672,6 +4158,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
+                    info.reject = cache_reject_reason::restore_failed;
                     return false;
                 }
 
@@ -3686,12 +4173,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
         }
 
+        info.src           = prompt_cache_restore_info::source::ram;
+        info.entry_tokens  = it_best->prompt.tokens.size();
+        info.candidate_lcp = lcp_best;
+        info.lcp           = lcp_best;
+        info.elapsed_us    = ggml_time_us() - t_ram;
+
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
     } else if (disk) {
         // nothing good enough in RAM - try the on-disk tier before prefilling again
-        return disk->load(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot);
+        return disk->load(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, info);
     }
 
     return true;

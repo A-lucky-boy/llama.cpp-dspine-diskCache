@@ -139,22 +139,26 @@ An entry reaches the disk when a RAM entry is evicted, when the session has been
 
 | Part | Content |
 |---|---|
-| Entry file | `pc-<hash>.bin`, format version 7; header holds magic, version, config signature, packed length, main/drft sizes, checkpoint count, timestamps and CRCs |
+| Entry file | `pc-<hash>.bin`, format version 8; header holds magic, version, config signature, packed length, main/drft sizes, checkpoint count, timestamps and CRCs |
 | Payload | `main` (target KV), `drft` (draft KV), and `data_spec / data_tgt / data_dft` per checkpoint |
-| Packed metadata | token id sequence plus media placeholder ranges and identifiers |
-| Checksums | CRC64-ECMA (reflected polynomial `0xC96C5795D7870F42`), slice-by-8; covers main, drft and all three checkpoint blobs |
-| Startup index | `pc-index.dat`, format version 2; hash, `size_file`, `size_main`, `size_drft`, `last_used` and packed metadata |
+| Packed metadata | token id sequence plus media placeholder ranges and identifiers; its own CRC64 is computed on the write side and stored in the entry header |
+| Checksums | CRC64-ECMA (reflected polynomial `0xC96C5795D7870F42`), slice-by-8; covers main, drft, all three checkpoint blobs and the packed metadata |
+| Startup index | `pc-index.dat`, format version 3; per record hash, `size_file`, `size_main`, `size_drft`, `last_used`, the packed CRC and the packed metadata, with a checksum over the whole record block |
 | Config signature | target/draft model path + `size@mtime`, target K/V types, `n_ctx`, `n_parallel`, draft K/V types, `kv_unified`, plus `mmproj:path@size@mtime` when a projector is loaded |
 
-The index is validated first at startup: only when magic, version, signature length and content all match, and every record can be unpacked with its hash recomputed, is the fast path taken; otherwise the scanner falls back to per-file header checks. The index is written as temp-file-plus-rename and rewritten whenever the entry set changes.
+The index is validated first at startup: only when magic, version, signature length and content all match, the record-block checksum is correct, and every record can be unpacked with its hash recomputed, is the fast path taken; otherwise the scanner falls back to per-file header checks. The index is written as temp-file-plus-rename and rewritten whenever the entry set changes.
+
+**The format version is a hard boundary**: older entries (e.g. v7) carry no packed checksum and cannot be validated on read, so the startup scan discards and rebuilds them with an explicit log line (`entry format v7 is older than v8, the cache will be rebuilt`) instead of parsing them as the current layout. The packed CRC recorded in the index is bound to the CRC in the entry header; any mismatch means the index and the file disagree, and the entry is dropped rather than used for a prefix match.
 
 ### 6.3 Lookup and restore
 
 - Matching is by **longest common token prefix**, longest wins; the shared part must be at least `--cache-disk-min-tokens`.
 - A restore is gated on entry size not exceeding `lcp × 768 KiB` (`DISK_CACHE_MAX_BYTES_PER_TOKEN`), which makes `best_lcp ≥ 1` always true; only the checkpoint that does not cross the divergence point is read, the rest are skipped by seek.
 - After a restore, `prompt.tokens` keeps the shared prefix, `seq_rm` drops the KV tail, and `--cache-idle-slots` keeps managing VRAM.
+- Reads always validate before restoring: the stored CRC of the packed metadata, its structural bounds, its consistency with the index record and the CRCs of every state payload are all checked **before** any `llama_state_seq_set_data_ext` call, so a rejection never touches the slot's KV.
 - `load()` contract: any return before the ctx state has been modified is `true` (KV and prompt are still consistent); a failure after KV has been written returns `false`, and the caller clears the slot and re-prefills.
-- Failures are split: entry read failure, draft state without a draft context, packed decode failure and media metadata mismatch delete the entry; possibly transient failures (VRAM pressure) keep it for a retry.
+- Candidate fallback: when one entry fails validation the lookup does not give up, it picks the next best remaining entry (at most 4 per request), so a single bad entry does not throw away a prefix that another entry can still serve.
+- Failures are split: deterministic corruption (CRC/length/signature mismatch, packed metadata that disagrees with the index) deletes the entry; possibly transient failures (file cannot be opened, VRAM pressure) keep it for a retry.
 
 ### 6.4 Invalidation, eviction and write suppression
 
@@ -182,9 +186,26 @@ The index is validated first at startup: only when magic, version, signature len
 | `--cache-disk-idle-flush N` | 60 s | 60 | mirror RAM entries after N idle seconds, `0` disables |
 | `--cache-disk-ttl N` | 0 | 0 | drop entries idle longer than N seconds, `0` never expires |
 | `--cache-disk-queue-max N` | 24576 MiB | 24576 | pending-write byte budget |
+| `--cache-stats` | off | off | per-request breakdown of where the prompt tokens came from, plus the matching /metrics counters |
+| `--cache-boundary-capture none\|input\|output\|both` | none | none | capture a full snapshot at a request boundary |
 | `--n-ctx-checkpoints` | 32 | 32 | per-slot checkpoint cap |
 
-### 6.7 Measured entry composition
+### 6.7 Request boundary capture
+
+Disabled by default (`--cache-boundary-capture none`). When enabled, the cache also takes a full snapshot at two request boundaries, in addition to the existing save-on-eviction and idle-mirror paths:
+
+| Boundary | Fires when | Written to |
+|---|---|---|
+| `input` | the last input token has its KV and sampling is about to start | RAM tier only |
+| `output` | the generation reached a normal stop condition | RAM tier + queued to disk immediately |
+
+- Only the tokens the memory actually holds are claimed: `llama_memory_seq_pos_max` gives the upper bound, so the last sampled token (not decoded yet) is dropped and an entry never claims a prefix whose KV was not computed. A restore still trims the surplus KV tail with `seq_rm`, exactly as before.
+- The `input` boundary is not written through: a normal request reaches the `output` boundary moments later and the longer entry subsumes it, so writing it early would only burn bandwidth. An interrupted request (timeout, cancel, context shift) keeps the RAM entry, and eviction or the idle mirror persists it as usual.
+- Dedup is unchanged: the RAM tier uses the containment check in `alloc()`, the disk tier uses hash / inflight / `covered_cheaply()`, so boundary capture cannot bypass write suppression.
+- Cost: every capture serializes the whole sequence state (about 0.2 s / 506 MiB for 1.4K tokens on this machine), hence it is opt-in and meant for reusing prefixes at turn granularity.
+- It does not replace `--cache-disk-idle-flush`: capture is event driven, the idle flush is time driven.
+
+### 6.8 Measured entry composition
 
 An entry is three parts, not one lump. Measured with the same configuration:
 
@@ -217,12 +238,32 @@ On a mechanical disk the measured write throughput is 130–155 MiB/s and restor
 | `dropping ... different model or context configuration` | WRN | signature mismatch cleanup |
 | `prompt cache effectively disabled: active LoRA ...` | INFO | shared cache unavailable under the current LoRA setup |
 | `write queue is full` | WRN | pending queue hit its byte or entry limit |
+| `cache_stats: prompt = ..., reused_slot/ram/disk = ..., prefill = ...` | INFO | one line per request with `--cache-stats` |
+| `cache_stats: boundary = input/output, captured = yes/no, tokens = ...` | INFO | boundary capture result with `--cache-stats` |
+
+### 7.1 Cache metrics (`/metrics`, requires `--metrics`)
+
+| Metric | Meaning |
+|---|---|
+| `llamacpp:cache_request_prompt_tokens_total` | prompt tokens of the accounted requests (hit-rate denominator) |
+| `llamacpp:cache_request_prompt_tokens_disk_ok_total` | subset whose prompt queried the disk tier (disk hit-rate denominator) |
+| `llamacpp:cache_reused_tokens_slot_total` / `_ram_total` / `_disk_total` | tokens whose prefill was actually avoided, per tier, mutually exclusive |
+| `llamacpp:cache_prefill_tokens_total` | tokens that had to be prefilled |
+| `llamacpp:cache_disk_candidate_lcp_tokens_total` | sum of the best candidate prefix, rejected candidates included |
+| `llamacpp:cache_disk_reject_total{reason}` | why the disk tier could not serve (`no_prefix` / `too_short` / `io_cost` / `media_mismatch` / `checksum_error` / `read_error` / `restore_failed` / `signature_mismatch`) |
+| `llamacpp:cache_disk_enqueue_queued_total` / `_dedup_total` / `_rejected_total` | writes queued, deduplicated away, or refused by the limits |
+| `llamacpp:cache_disk_bytes_read_total` / `_written_total` | bytes read and written |
+| `llamacpp:cache_disk_restore_seconds_total` | read + restore time |
+| `llamacpp:cache_disk_entries` / `_queue_entries` / `_queue_bytes` | entries and pending queue |
+| `llamacpp:cache_disk_manifest_fallback_total` | starts that could not trust the index and rescanned |
+
+Do not mix the three quantities: `candidate_lcp` is the prefix a candidate shares, `restored` is what the entry actually restored, and `reused_*` is what `n_past` still accepted afterwards, i.e. the prefill really avoided (checkpoints and the forced re-evaluation of the last token cut it down). The identity is `prompt = reused_slot + reused_ram + reused_disk + prefill`.
 
 ## 8. Boundaries
 
 - The CUDA backend only supports layer split (`-sm layer`); `-sm row` is rejected at model load.
 - With an active non-aLoRA adapter the shared cache does not write for that slot; the slot's own incremental continuation still works.
-- Packed metadata has no separate CRC; its integrity rests on the startup index self-check (hash recomputation), the media semantic comparison at restore, and the payload CRCs.
+- Packed metadata has its own CRC since v8: the writer stores it in the entry header, the reader verifies it before **any** state is written, and the startup index record is bound to it. When the index cannot be trusted the reader falls back to per-file header validation instead of skipping the checks.
 - Entries match by prefix, so the first request always prefills in full; `-np 1` means one slot serving serially.
 - A forced kill does not run destructors; persistence depends on the idle mirror (60 s) or an eviction.
 - A restore always reads the whole entry file, so a long entry hit at a low ratio reads bytes it does not use; `DISK_CACHE_MAX_BYTES_PER_TOKEN` only catches the extreme cases.

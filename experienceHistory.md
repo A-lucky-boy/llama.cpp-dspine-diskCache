@@ -30,6 +30,13 @@
 | 缓存盘迁移 NVMe、草稿 KV 降阶 | **不纳入考虑** | 部署决策（非技术否决） |
 | 用 `--n-ctx-checkpoints 32→8` 压缩条目 | **无收益** | 实测条目里只有 1–3 个检查点，该参数不是体积来源 |
 | 前缀覆盖时跳过重写（本次已实现） | **有效** | 实测跳过 1907 / 2159 MiB 重复写盘 |
+| 把重启首请求重算归因为「启动期 dedup 与首次查询并发」 | **已否证** | 代码级：`scan/dedup/enforce_limit/save_manifest` 全在构造函数内、`init_disk` 早于服务启动，不存在该竞态 |
+| `touch_entry()` 写错偏移覆盖 `crc_drft` | **已确认为真因并修复** | 代码级推导 + 独立复现程序 + 部署日志 |
+| 磁盘缓存「重启后首请求整段 prefill」 | **已实证（日志），另有未定位签名** | 见 §2.6 |
+| 用 `candidate_lcp` 代表命中量 | **已否证（系统性高估）** | 双卡实测：候选 1385 / 恢复 1385 / 实际复用 1381 |
+| 请求级 token 来源分解（`--cache-stats` + `/metrics`） | **已实现并实测自洽** | 恒等式 `prompt = reused_slot+ram+disk+prefill` 三例成立 |
+| 请求边界捕获（`--cache-boundary-capture`） | **已实现；`input` 只进 RAM** | 双卡实测，output 才写盘 |
+| 边界捕获 / 磁盘恢复后的数值一致性 | **已验证** | 同前缀冷/暖输出逐字节相同（sha256 相同） |
 
 ---
 
@@ -84,6 +91,27 @@ KV 状态中不包含 token id 序列信息，无法反向重建。条目完整�
 ### 2.5 `-lv 3` 观察缓存细节日志（日志级别定义）
 
 `common/log.h` 定义 `TRACE=4`、`DEBUG=5`；`-lv 3` 为默认 INFO。逐条 `entry with length / lcp / f_keep` 是 TRACE，`restored N/M tokens (a + b bytes)` 是 DEBUG，默认级别两者都看不到。
+
+### 2.6 重启后首请求整段 prefill：真因与排查方法
+
+**真因（已修复）**：`server_disk_cache::touch_entry()` 用
+`DISK_CACHE_HEADER_FIXED - 8 + sig_len + packed_size` 定位 `last_used`。v7 固定头 72 字节，`last_used` 实际在 `48 + sig + packed`，`crc_main` 在 56、`crc_drft` 在 64；旧公式得到 `64 + sig + packed`，**正好覆盖 `crc_drft`**。
+
+**触发条件**：`touch_entry()` 只在析构里跑，所以只有**前一轮优雅退出**才会破坏条目。部署脚本 `stop-localModel.ps1` 用的是 `Stop-Process -Force`（等价 TerminateProcess），析构不执行、`save_manifest` 也不执行，用这种方式重启不会触发。判定上一轮是否优雅退出，看强杀前后 `pc-index.dat` 的 mtime：变了说明析构跑过。
+
+链路：某条目在上一轮被命中 → 仅置 `last_used_dirty`（不写盘）→ 优雅退出时 `touch_entry()` 把 8 字节 unix 时间戳写进 `crc_drft` → 下次启动 `scan()` 只校验头部结构、不校验 payload，条目照常入索引 → 首个匹配请求 `read_entry()` 里 `crc(drft) != crc_drft` 必然成立 → 打 `failed to read ... dropping it`、删除文件、返回 `true` → 整段 prefill → 该请求结束时状态又被 `prompt_save` 写回 RAM 缓存 → **第二个请求正常**。
+
+这解释了三件事：只在重启后出现（`touch_entry` 只在析构里跑）、只影响「被用过的条目」、以及与两条前缀关系条目的相关性（`dedup_prefixes` 在启动时删掉短条目，长条目一旦作废，请求短前缀时已无候选可退回）。
+
+**证明方法（可复用）**：
+
+1. 公式推导 + `static_assert`：把偏移改成由 `DISK_CACHE_HDR_PREFIX + HDR_BEFORE_LAST` 派生，编不过就说明布局与文档不一致。
+2. 独立复现：写一个不依赖项目头的程序，按 `write_entry()` 的顺序铺一个假头部，分别用新旧公式各写一次 8 字节，再看哪个字段被改。v7 下实测：`last_used` 未变、`crc_main` 完好、`crc_drft` 从 `0xd00dfeedd00dfeed` 变成 `0x00000000671db480`。
+3. 检查「被破坏的条目不会留在目录里」：破坏发生在读取时，`drop_entry()` 随即删除文件，所以事后扫目录看不到坏文件——**不能用"目录里没有坏条目"证明没发生过损坏**。反过来，对一个仍然活着的缓存目录逐条比对 `size_file / size_main / size_drft / packed` 与 `pc-index.dat`，只能证明索引没有陈旧，不能证明 payload 完好。
+
+**仍开放的签名**：部署日志里同一条目还出现过 `checkpoint checksum mismatch` 和一次无 `read_entry` 告警的静默读失败。静默分支是 v7 的 `return false`（头部/长度/截断类），当时无任何原因输出。这两个签名不由偏移错误解释（偏移错误必然先撞 payload CRC 分支），暂只能怀疑同版本号下不同构建产物的检查点表差异。v8 起每条失败分支都单独打印原因，并用 packed CRC 绑定索引与文件，下一次复现即可定位。
+
+**排查要点**：判断「缓存没命中」必须区分四件事——没有查找、查找无候选、候选被成本/长度闸门拒绝、候选读取失败。v7 的日志只覆盖了其中一部分，v7 的静默 `return false` 会让「文件坏了」看起来像「缓存不存在」。
 
 ---
 
@@ -152,7 +180,7 @@ KV 状态中不包含 token id 序列信息，无法反向重建。条目完整�
 - `--spec-draft-swa`、`p_min`（当前 0.00）、`--cache-disk-ttl`、mmproj 挪到闲置的 2060S
 - `--cache-ram 25600`、`-b 4096` 各自相对旧值的对照基准（`-ub` 与 `n-max` 已测，见 4.1）
 - 压缩 per_round 的 36 ms 固定开销：草稿 block 长度由模型决定，可动的只有特征导出路径与草稿 KV 精度
-- 镜像增量/分段条目、恢复按层偏移切片 + 异步预取、自适应 n_max、Win32 写路径、`/metrics`
+- 镜像增量/分段条目、恢复按层偏移切片 + 异步预取、自适应 n_max、Win32 写路径（缓存层 `/metrics` 已随 `--cache-stats` 落地，其余端点未动）
 - 消费卡之间的 P2P 能力（`-sm row` 失败在更前面，未测到）
 - **生产「120K 上下文 10 t/s」的根因**：合成 ~117K 实测 34.3 t/s，未复现。差异可能来自长 reasoning 生成、真实更长上下文、图文混合或旧配置，仍需在真实流量上定位
 

@@ -340,6 +340,17 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // outcome of the last prompt-cache lookup for this slot: which tier served
+    // the restored state (if any), the candidate lcp and, when nothing was
+    // reused, why. reset when the slot is assigned a new task and read when
+    // the prefill boundary is settled, so --cache-stats reports the tokens
+    // that actually avoided a prefill instead of a candidate lcp
+    prompt_cache_restore_info cache_restore;
+
+    // token count of the snapshot captured at the last request boundary of this
+    // task; guards against serializing the same state twice
+    size_t boundary_captured = 0;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -376,6 +387,52 @@ struct server_slot {
         return true;
     }
 
+    // serialize the state of a request boundary into the prompt cache. the
+    // snapshot is truncated to the tokens the memory actually holds, so an entry
+    // never claims a position whose KV was not computed (e.g. the last sampled
+    // token of a finished generation)
+    bool prompt_capture(server_prompt_cache & prompt_cache, server_prompt && snapshot, bool to_disk) {
+        if (snapshot.tokens.size() == 0) {
+            return false;
+        }
+
+        if (lora_blocks_cache(lora)) {
+            SLT_TRC(*this, "%s", "skipping boundary capture: active LoRA changes the model weights\n");
+            return false;
+        }
+
+        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        auto * cur = prompt_cache.alloc(snapshot, cur_size_tgt, cur_size_dft);
+        if (cur == nullptr) {
+            return false;
+        }
+
+        const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main->data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft->data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        if (n_tgt != cur_size_tgt || n_dft != cur_size_dft) {
+            SLT_ERR(*this, "%s", "failed to save the complete boundary state\n");
+            prompt_cache.states.pop_back();
+            return false;
+        }
+
+        if (to_disk) {
+            // same budget as the idle flush: a quarter of the RAM cache, at least
+            // 1.5 GiB and at most 6 GiB. mirror() applies the dedup, size and
+            // queue-budget checks, so a covered entry is simply not written
+            size_t budget = 1536ull*1024ull*1024ull;
+            if (prompt_cache.limit_size > 0) {
+                budget = std::max<size_t>(budget, prompt_cache.limit_size/4);
+            }
+            budget = std::min<size_t>(budget, 6ull*1024ull*1024ull*1024ull);
+
+            prompt_cache.mirror_latest(budget);
+        }
+
+        return true;
+    }
+
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         // see prompt_save: never pull shared KV while a non-zero LoRA is active.
         // this is a skip, not a failure: the slot KV is kept, so a deployment
@@ -391,7 +448,7 @@ struct server_slot {
             return true;
         }
 
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, cache_restore);
         if (!res) {
             SLT_TRC(*this, "%s", "no reusable prompt in cache\n");
         }
@@ -1880,6 +1937,119 @@ private:
         return nullptr;
     }
 
+    // capture a full prompt snapshot at a request boundary (--cache-boundary-capture).
+    // the state is serialized here, on the inference thread, because the live
+    // context is not safe to read from the writer thread; only the resulting disk
+    // write is asynchronous
+    void capture_boundary(server_slot & slot, int32_t kind) {
+        if ((params_base.cache_boundary_capture & kind) == 0 || !prompt_cache || !slot.task) {
+            return;
+        }
+
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->is_stateless() ||
+                !slot.task->params.cache_prompt) {
+            return;
+        }
+
+        // the positions the memory holds are the only ones a snapshot may claim:
+        // the last sampled token is not decoded yet when the generation stops,
+        // and for hybrid/recurrent memory the tail can be sparse
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max < 0) {
+            return;
+        }
+
+        const size_t n_covered = slot.prompt.tokens.size_up_to_pos(pos_max + 1);
+        if (n_covered == 0 || n_covered == slot.boundary_captured) {
+            return;
+        }
+
+        server_prompt snapshot;
+        snapshot.tokens = slot.prompt.tokens.clone();
+        snapshot.tokens.keep_first(n_covered);
+
+        // a checkpoint that reaches past the captured prefix describes a state
+        // this entry cannot reproduce
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            if (ckpt->pos_max <= (llama_pos) n_covered) {
+                snapshot.checkpoints.push_back(ckpt);
+            }
+        }
+
+        // the input boundary is captured into the RAM tier only: a normal request
+        // reaches the output boundary moments later, and the longer entry then
+        // subsumes the input one, so writing it to disk would only burn bandwidth.
+        // an interrupted request (timeout, cancel, context shift) keeps the RAM
+        // entry, and the usual spill/idle-mirror paths still persist it. the
+        // output boundary is written through because it is the state a follow-up
+        // turn needs after a restart
+        const bool to_disk = kind == COMMON_CACHE_BOUNDARY_OUTPUT;
+
+        const bool ok = slot.prompt_capture(*prompt_cache, std::move(snapshot), to_disk);
+
+        slot.boundary_captured = n_covered;
+
+        if (params_base.cache_stats) {
+            SLT_INF(slot, "cache_stats: boundary = %s, captured = %s, tokens = %zu, pos_max = %d\n",
+                    kind == COMMON_CACHE_BOUNDARY_INPUT ? "input" : "output", ok ? "yes" : "no",
+                    n_covered, (int) pos_max);
+        }
+    }
+
+    // account for one request's prompt tokens: every token is counted exactly
+    // once, either as reused from the slot, the RAM tier or the disk tier, or as
+    // prefilled. n_past is the value that survived every guard (checkpoints,
+    // media boundaries, forced re-evaluation of the last token), so it is the
+    // real avoided work - not the candidate lcp the lookup reported
+    void add_cache_stats(const server_slot & slot, int n_past) {
+        const uint64_t n_prompt = (uint64_t) slot.task->n_tokens();
+        const uint64_t n_reuse  = (uint64_t) std::max(0, n_past);
+
+        metrics.n_cache_req_prompt += n_prompt;
+        metrics.n_cache_prefill    += n_prompt > n_reuse ? n_prompt - n_reuse : 0;
+
+        // the disk tier was queried whenever it answered (source == disk) or
+        // refused the prompt for a reason; a slot/RAM restore never reaches it.
+        // this is the denominator of the disk-only hit rate, so a request whose
+        // prompt was too short to look up is not counted as a disk miss
+        if (slot.cache_restore.src == prompt_cache_restore_info::source::disk ||
+                slot.cache_restore.reject != cache_reject_reason::none) {
+            metrics.n_cache_req_prompt_disk_ok += n_prompt;
+        }
+
+        switch (slot.cache_restore.src) {
+            case prompt_cache_restore_info::source::ram:
+                metrics.n_cache_reused_ram += n_reuse;
+                break;
+            case prompt_cache_restore_info::source::disk:
+                metrics.n_cache_reused_disk += n_reuse;
+                break;
+            case prompt_cache_restore_info::source::none:
+                // no restore happened: whatever is reused comes from the KV the
+                // slot already holds
+                metrics.n_cache_reused_slot += n_reuse;
+                break;
+        }
+
+        if (!params_base.cache_stats) {
+            return;
+        }
+
+        SLT_INF(slot, "cache_stats: prompt = %llu, reused_slot = %llu, reused_ram = %llu, reused_disk = %llu,"
+                " prefill = %llu, source = %s, candidate_lcp = %zu, restored = %zu, entry_tokens = %zu,"
+                " read_bytes = %zu, restore_us = %lld, reject = %s\n",
+                (unsigned long long) n_prompt,
+                (unsigned long long) (slot.cache_restore.src == prompt_cache_restore_info::source::none ? n_reuse : 0),
+                (unsigned long long) (slot.cache_restore.src == prompt_cache_restore_info::source::ram  ? n_reuse : 0),
+                (unsigned long long) (slot.cache_restore.src == prompt_cache_restore_info::source::disk ? n_reuse : 0),
+                (unsigned long long) (n_prompt > n_reuse ? n_prompt - n_reuse : 0),
+                slot.cache_restore.src == prompt_cache_restore_info::source::ram  ? "ram"  :
+                slot.cache_restore.src == prompt_cache_restore_info::source::disk ? "disk" : "slot",
+                slot.cache_restore.candidate_lcp, slot.cache_restore.lcp, slot.cache_restore.entry_tokens,
+                slot.cache_restore.read_bytes, (long long) slot.cache_restore.elapsed_us,
+                cache_reject_reason_name(slot.cache_restore.reject));
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1964,6 +2134,11 @@ private:
         }
 
         if (ret) {
+            // a lookup result describes a single task: clear it for the task that
+            // is being assigned, prompt_load() below fills it when it runs
+            ret->cache_restore = prompt_cache_restore_info();
+            ret->boundary_captured = 0;
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
@@ -3298,6 +3473,12 @@ private:
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
 
+                    // the disk tier keeps its own counters, so they are sampled
+                    // here instead of being folded into server_metrics
+                    if (prompt_cache && prompt_cache->disk) {
+                        res->cache_disk = prompt_cache->disk->stats();
+                    }
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -4497,6 +4678,8 @@ private:
 
                         metrics.add_prompt_cached(n_past);
 
+                        add_cache_stats(slot, n_past);
+
                         slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing
@@ -5026,7 +5209,10 @@ private:
 
                 GGML_ASSERT(slot.task->need_sampling());
 
-                // prompt evaluated for next-token prediction
+                // prompt evaluated for next-token prediction: the last input
+                // token now has its KV, so this is the input boundary
+                capture_boundary(slot, COMMON_CACHE_BOUNDARY_INPUT);
+
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
@@ -5076,7 +5262,10 @@ private:
             }
 
             if (!process_token(result, slot)) {
-                // release slot because of stop condition
+                // release slot because of stop condition. the generation reached a
+                // normal stop, so this is the output boundary
+                capture_boundary(slot, COMMON_CACHE_BOUNDARY_OUTPUT);
+
                 slot.print_timings();
                 send_final_response(slot);
                 slot.release();
@@ -5221,6 +5410,8 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
+                    capture_boundary(slot, COMMON_CACHE_BOUNDARY_OUTPUT);
+
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();

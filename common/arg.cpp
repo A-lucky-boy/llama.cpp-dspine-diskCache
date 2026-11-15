@@ -1750,6 +1750,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_QUEUE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-stats"},
+        {"--no-cache-stats"},
+        "log a per-request breakdown of the prompt tokens that were reused from the slot, the RAM cache or the "
+        "disk cache, the tokens that had to be prefilled and the reason a cache lookup failed; also adds the "
+        "matching cumulative counters to /metrics (default: disabled)",
+        [](common_params & params, bool value) {
+            params.cache_stats = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_STATS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-boundary-capture"}, "{none,input,output,both}",
+        "capture a full prompt snapshot at a request boundary, in addition to the existing save-on-eviction and "
+        "idle-mirror paths: 'input' when the last prompt token has been evaluated, 'output' when the generation "
+        "reaches a normal stop, 'both' for either (default: none). every capture serializes the whole sequence "
+        "state, so this costs latency and RAM",
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.cache_boundary_capture = COMMON_CACHE_BOUNDARY_NONE;
+            } else if (value == "input") {
+                params.cache_boundary_capture = COMMON_CACHE_BOUNDARY_INPUT;
+            } else if (value == "output") {
+                params.cache_boundary_capture = COMMON_CACHE_BOUNDARY_OUTPUT;
+            } else if (value == "both") {
+                params.cache_boundary_capture = COMMON_CACHE_BOUNDARY_INPUT | COMMON_CACHE_BOUNDARY_OUTPUT;
+            } else {
+                throw std::invalid_argument("cache-boundary-capture must be none, input, output or both");
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_BOUNDARY_CAPTURE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
