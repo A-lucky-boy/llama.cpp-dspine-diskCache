@@ -1440,3 +1440,160 @@ write_entry(pending) 成功 → 已获得真实 size_file
 5. `betterModification.md` 只记录本轮修复规划及修改日志，不写实验收益预测、停止条件、报告计算或最终方案裁决。
 
 **交付范围**：本次仅完成容量准入与快照替代的状态一致性修复以及相应可复现用例；不规划新的算法试验或扩大单用户以外的场景。
+---
+
+# 2026-11-15 22-40 - test1_2
+
+## 一、修复定位、目标与已有改动核查
+
+**本节是单用户磁盘缓存既有实现的缺陷修复补充，不启动新的算法实验。** 范围严格限定为本机部署、单用户、单实例、单 slot（`-np 1`），不引入网络鉴权、租户隔离、多 slot 调度或远端 API 防护。需要保持的“API 正确性”仅指本地 KV 序列状态导出/恢复不能改变推理语义，与网络攻击面无关；本轮不修改该 API。
+
+### 1.1 本轮已执行的审查
+
+在规划本次修复前，已首先审阅仓库 `change.md` 中最新的 **`2026-11-15 22-30 - Change Record`**，随后阅读 `projectSummary.md`、交付报告 `2026-11-15-handover-v2-disk-cache-fixes.md`，核对 GitHub `main` HEAD `27994007aadf55ce57fd7089381e9bde1e79ec7d`，核心算法提交 `0e46af42f62b298dfdf80430c1f4874bec685c5a`，并将缓存改造路径与较早 baseline 提交 `eb7681889f44304d2bd5b3e41572f5530af91a1d` 对比。
+
+确认当前实现已有：v8 快照、v3 manifest、CRC、请求级复用统计、请求边界捕获、公共前缀元数据目录、媒体双向匹配、路径所有权判定、只读配额规划以及“先准入后替代”顺序。最新交付报告记录了 37/63/38 条断言、单用户读写与重启回归。但下面两处在新增事务实现中仍存在**代码级风险**，必须先修复，不能继续叠加新缓存算法。
+
+编码人员动手前须在实验机再次执行 `git rev-parse HEAD`、`git status --short`、阅读最新 `change.md`，确认本节列出的代码仍与实际工作树一致，并固定一份可回退的提交。若现场已经有更新提交修复这些问题，应先核对差异，不允许重复改写。
+
+### 1.2 已确认问题 A：`enforce_limit(keep)` 的保护指针可能失效
+
+**位置**：`tools/server/server-task.cpp` 的 `server_disk_cache::worker()`、`server_disk_cache::enforce_limit(const std::vector<const server_disk_cache_entry *> & keep)` 和 `sweep_expired()`。
+
+现有 `worker()` 对新条目入 `entries` 后，扫描 `entries`，把 `&cur` 保存到 `keep`。`entries` 是 `std::vector<server_disk_cache_entry>`。随后 `enforce_limit(keep)` 首先调用 `sweep_expired()`，然后又可在 LRU 淘汰中调用 `entries.erase(it)`。**`std::vector::erase` 会使被删除元素及其后的元素引用/指针失效**。如果删除位于新条目前的旧条目，受保护新条目位置将移动，但 `keep` 中的旧地址不更新。
+
+因此，`std::find(keep.begin(), keep.end(), &*cur)` 不能继续可靠地识别新条目。容量处理可能错误地将本次保护对象纳入淘汰范围，破坏“删除短快照时其替代长快照必须存活”的不变量。这里是基于源码和 C++ 容器规则的静态确认，**不能把尚未运行的端到端故障测试写成已完成**。
+
+**修复要求**：
+
+1. 删除跨 `entries.erase` 保存 `server_disk_cache_entry*` 的保护集合，改用**稳定路径身份**，例如 `std::unordered_set<std::string> protected_paths` 或不可变、唯一的 `snapshot_identity`。选择路径时必须复制字符串，不保存指向 `entries` 内元素的裸指针/`string_view`。
+2. 将 `enforce_limit()`、其 LRU 过滤和 `sweep_expired()` 对保护对象的处理统一到相同的稳定身份。如果 TTL 清扫仍在配额处理前执行，应确保清扫不会删除本次事务受保护的新条目；不能简单地改完 LRU 检查却漏掉前置清扫。
+3. 每次 `entries.erase()` 后重新依据有效身份检查保护，不能拿旧迭代器、旧引用或旧下标推断 `entries` 中新对象的位置。
+4. `worker()` 在最终执行 `drop_prefixes()` 之前，必须再次基于**实际 `entries` 路径**检查新条目未隔离且文件存在。仅靠历史上的 `admitted=true` 或内存旧指针不可作为持久替代证明。
+5. 单用户并不意味着无并发：前台请求与后台 worker 的 `entries` 修改仍须遵守原 `mtx`，`notify_*` 保留锁内同步与单调 `event_epoch`。
+
+建议接口（表达职责，最终签名服从现有代码风格）：
+
+```cpp
+using disk_cache_protected_paths = std::unordered_set<std::string>;
+
+void enforce_limit(const disk_cache_protected_paths & protected_paths);
+void sweep_expired(const disk_cache_protected_paths & protected_paths);
+
+bool is_protected(const server_disk_cache_entry & entry,
+                  const disk_cache_protected_paths & protected_paths);
+```
+
+对于完全独立于 `entries` 的配额规划模块 `server-disk-cache-quota.*`，维持当前只读计划及稳定字符串存储原则；本轮不将 LRU 策略重新设计成热点淘汰算法。
+
+### 1.3 已确认问题 B：新文件回滚删除失败时成为“未记账的孤儿文件”
+
+**位置**：`tools/server/server-task.cpp` 的 `server_disk_cache::worker()` 在 `if (!plan.fits)` 分支中调用 `remove_file(path); counters.n_write_rejected++;`。
+
+当前代码在写入成功、获得真实 `size_file` 之后执行配额试算；若 `plan.fits == false`，尝试删除新文件，但**忽略 `remove_file(path)` 返回的 `removed / already_missing / failed`**。在 Windows 上文件被其他进程持有时，删除可能失败。该文件实际仍占用磁盘，但既未进入 `entries`，也未纳入 `total_size`，同时缺少 manifest 生命周期与路径占用记录。此问题与之前修复的“删除失败不能假装腾出磁盘”不变量相冲突。
+
+**修复要求**：
+
+1. 对试算拒绝后的删除结果作显式分支：`removed` / `already_missing` 代表回滚成功；`failed` 表示文件仍然占用真实字节，**不得假设回滚成功**。
+2. 删除失败时采用已有隔离机制登记此文件：保留真实 `path`、`size_file`、hash、token/media 身份和 `quarantined=true`，计入 `entries` 与 `total_size`；它不能参与 `load()`、`covered_cheaply()`、`worker()` 去重或前缀目录 `persisted` 引用。
+3. 隔离登记必须在磁盘锁内完成，manifest、账本、`cache_disk_quarantined`、路径所有权管理保持一致。已有相同路径记录时必须通过 `claim_path_locked()` 的既有冲突语义处理，禁止重复登记或覆盖。
+4. 如果文件已经不可定位、大小无法可信确认，必须保守记录具体文件系统失败事实和再扫描/回收需求，不得虚报配额已回收；不能将一个未知状态文件作为有效缓存恢复来源。
+5. 与 `claim_path_locked()` 的隔离文件清理路径对接：当文件句柄释放后，可以真实删除，再扣减账面占用和撤销引用；不得把 `write_rejected` 计成成功写入或者 `dedup`。
+6. 不引入另一套异步删除机制或新的磁盘格式；失败处理继续复用 `remove_file()`、`quarantine_entry()`、`save_manifest()` 与既有物理事件通道。
+
+### 1.4 需要随修复核对的问题 C：配额试算与实际删除结果是否一致
+
+`disk_cache_plan_quota()` 是纯元数据规划，它只能判断**假定候选可以删除**时的容量可行性。`enforce_limit()` 实际删除可能失败并把条目隔离，因此 `plan.fits` 本身**不是**“实际配额已经满足”的凭证。本轮应在真实回收后重新核对 `total_size` 与 `limit_size`，并明确两种情形：
+
+- 如果本次尚未删除任何受新文件替代的短快照，且因实际回收失败导致超额，应优先尝试按问题 B 的安全回滚路径处理新文件，保留旧文件；回滚若也失败，要记录隔离账本。
+- 如果事务中已完成会影响可恢复性的替代删除，则不能通过删除唯一替代者来“修平”配额；必须保留真实账本、记录超额并阻止额外无控制写入。不得把这类路径隐式当作正常的 `plan.fits` 已兑现。
+
+本轮不要求重写配额规划器的算法，但必须显式区分“计划可行”和“物理删除兑现”，避免测试仅检查 `plan.fits` 而忽略文件系统错误。
+
+## 二、预期修改文件和精确职责
+
+| 文件 | 修改位置 | 修改内容 |
+|---|---|---|
+| `tools/server/server-task.h` | `enforce_limit()`、`sweep_expired()` 声明与 `worker()` 辅助声明 | 将保护集合从 `server_disk_cache_entry*` 转换为不可随 `entries.erase` 失效的稳定身份 |
+| `tools/server/server-task.cpp` | `worker()` 准入事务、配额拒绝回滚 | 使用稳定保护身份；对回滚 `remove_file()` 结果分支处理；处理隔离记账 |
+| `tools/server/server-task.cpp` | `enforce_limit()`、`sweep_expired()` | 保护检查覆盖 LRU 和 TTL，避免 erase 造成指针失效 |
+| `tools/server/server-task.cpp` | `claim_path_locked()`、`quarantine_entry()`、`save_manifest()` 调用处 | 对回滚失败产生的占用路径建立一致生命周期，不修改正常路径所有权语义 |
+| `tools/server/server-disk-cache-quota.h/.cpp` | 只读计划结构与调用适配（若必要） | 保持稳定身份、隔离占用和受保护对象不淘汰；本轮不改准入策略本身 |
+| `tools/server/tests/unit/test_disk_cache_quota.cpp` | 扩充测试 | 新增顺序删除后保护身份稳定性、不可删除导致实际超额、回滚删除失败的状态机单测 |
+| `test-run/` | 新增或扩充单用户故障注入脚本 | 用可控文件句柄/模拟删除结果复现条目移动和回滚失败，不修改真实生产缓存目录 |
+| `change.md` | 文末追加 | 记录本轮实际代码变更、核查方式、实测与未覆盖项目 |
+| `projectSummary.md` | 快照生命周期和配额不变量章节 | 仅在实现完成后更新已经证实的现有结构 |
+
+**不修改** `src/llama-context.cpp` 的 KV 序列化、模型权重/草稿模型、prompt token、LoRA、采样、DSpine 推理逻辑或 v8/v3 的字段布局。
+
+## 三、算法与预期数据流变更
+
+### 3.1 稳定保护身份
+
+```text
+当前 worker：真实新文件 L 已写入
+  → disk_cache_plan_quota(items, protected=L)
+  → 若 fits：把 L 加入 entries
+  → protected_paths = {L.path}  （独立字符串副本）
+  → enforce_limit(protected_paths)
+       → sweep_expired(protected_paths)
+       → 逐个尝试删除可淘汰旧条目（每次 erase 后仍按 path 判断保护）
+  → 重新验证 L 仍存在、未隔离、磁盘文件存在
+  → 仅在 L 真正有效时调用 drop_prefixes(..., replacement_is_admitted=true)
+```
+
+不得把 `keep` 的 `vector<const server_disk_cache_entry *>` 简单替换成对 `std::vector` 元素的 `string_view`：字符串对象和它所在的 entry 同样可能被 `erase()` 移动或销毁。也不得以 `reserve()` 替代稳定身份方案：`reserve` 只避免扩容，不保证 `erase()` 之后元素地址不变。
+
+### 3.2 回滚删除失败的账本
+
+```text
+配额计划 !fits
+  → remove_file(new.path)
+      ├─ removed / already_missing
+      │      → 新条目不进入 entries；原缓存不变；记录准入拒绝
+      └─ failed
+             → 新文件仍占用真实字节
+             → 在磁盘锁内记录隔离条目（不允许恢复、不允许抑制新写入）
+             → total_size 计入真实 size_file，保存 manifest
+             → 后续真实清理成功后再核减 bytes / 移除条目
+```
+
+### 3.3 保持既有业务语义
+
+- **训练流水线**：无训练，完全不变。
+- **推理流水线**：只更改磁盘缓存的准入/回滚、淘汰保护与账本处理；不改变当前请求的模型执行、KV 位置、logits 或生成文本。
+- **缓存成本**：保留 `768 KiB/token` 读盘成本守卫与 `4096 token` 写入抑制阈值；不把逻辑前缀发现当作 `reused_disk`。
+- **存储协议**：保留 v8 完整快照、v3 manifest、CRC64、target/draft/checkpoint 关联与配置签名，不引入新的数据格式。
+- **适用范围**：本机、单用户、`-np 1`；不增加网络安全配置和多用户调度。
+
+## 四、验证检查清单
+
+### 4.1 指针失效与淘汰保护
+
+- [ ] 在本地锁定版本先运行现有 3 套独立单元测试；记录与 baseline 对应缓存路径的差异。
+- [ ] 创建至少两个先于新条目存入 `entries` 的旧条目，执行删除旧条目、`entries.erase()`、后续继续配额处理，验证新条目仍通过**稳定 path** 被识别为受保护对象。
+- [ ] 验证 `sweep_expired()` 前置清扫不会删除本次事务保护对象；验证 TTL=0 与 TTL>0 两条路径。
+- [ ] 有一个旧条目删除失败并进入隔离时，继续尝试其他淘汰，确认新条目不会因指针失效被当作候选。
+- [ ] 在同一事务中验证短快照被替代删除时，替代长快照在 `entries` 中且未隔离、物理文件存在。
+
+### 4.2 回滚删除失败
+
+- [ ] 直接针对 `plan.fits=false` 构造“新文件写盘成功但 `remove_file` 失败”的故障注入；检查新文件被隔离并计入真实字节。
+- [ ] 确认该隔离文件不进入 `load()`、写入抑制、worker 冗余、精确去重及目录 `persisted` 引用。
+- [ ] 解除句柄占用或撤销注入后，执行合法回收，确认 `total_size` 与物理文件数量同步变化，manifest 不出现重复路径。
+- [ ] 验证计划可行但实际某个候选删除失败的路径；禁止将未满足配额的结果误报为已兑现。
+
+### 4.3 单用户回归
+
+- [ ] `--cache-prefix-discovery` 开启/关闭各运行冷启动、同请求重复、续写扩展、短/长公共前缀、强杀重启与磁盘文件占用场景。
+- [ ] 检查 `prompt = reused_slot + reused_ram + reused_disk + prefill`、`candidate_lcp/restored/reused_disk` 的分层口径及原有输出一致性。
+- [ ] 保持 `test_cache_prefix_index.cpp`、`test_disk_cache_match.cpp`、`test_disk_cache_quota.cpp` 既有断言；增加能定点触发 `entries.erase` 和回滚失败的用例。
+- [ ] 在实验记录中分别标识“静态确认的问题”“故障注入复现”“真实模型端到端验证”，不得以元数据单测代替磁盘恢复测试。
+
+## 五、与既往修改的兼容性和实施顺序
+
+1. 本轮仅修复已经实现的磁盘配额事务与条目状态一致性，不改动公共前缀目录的发现策略。
+2. 开工先查最新 `change.md`、HEAD 与 baseline 差异；如果现场发现不同的新缺陷，先记录位置并修复，不叠加新实验。
+3. 按“稳定保护身份 → 回滚删除记账 → 物理回收后复核 → 单元与单用户回归 → 更新 `change.md` / `projectSummary.md`”的顺序实施。
+4. 现有唯一物理删除函数 `remove_file()`、锁内 `notify_*` 和单调 `event_epoch` 语义不得破坏。
+5. 当前方向保留；本文件只记已有实现的缺陷修复规划，不写预想收益数值、早停要求、计算报告或最终优劣判定，也不在本节规划新的 KV 分块实验。

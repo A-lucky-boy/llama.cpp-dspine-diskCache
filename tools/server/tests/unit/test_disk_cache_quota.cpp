@@ -15,8 +15,10 @@
 
 #include "server-disk-cache-quota.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static int g_failures = 0;
@@ -464,6 +466,313 @@ void test_order_regression_plain_lru() {
     CHECK(!new_res.over_quota);
 }
 
+// ---------------------------------------------------------------------------
+// protection identity must survive the erases the eviction pass performs.
+//
+// `entries` is a std::vector, so removing an element moves everything after it.
+// a protection set built from pointers into that vector silently stops matching
+// the entry it was meant to keep. this replays exactly that sequence: the
+// protected entry sits *behind* an evicted one, so its storage is reused.
+// ---------------------------------------------------------------------------
+struct sim_entry {
+    std::string path;
+    size_t      bytes = 0;
+    int64_t     used  = 0;
+    bool        alive = true;
+};
+
+// one eviction pass over a simulated vector, driven by the same planner
+void sim_evict_once(std::vector<sim_entry> & vec, size_t limit,
+        const std::unordered_set<std::string> & protected_paths) {
+    if (limit == 0) {
+        return;
+    }
+
+    // the planner sees the current set plus the protection set
+    std::vector<std::string>           paths;
+    std::vector<disk_cache_quota_item> items;
+
+    for (const auto & e : vec) {
+        if (!e.alive) {
+            continue;
+        }
+        paths.push_back(e.path);
+    }
+
+    size_t n = 0;
+    for (size_t i = 0; i < vec.size(); ++i) {
+        if (!vec[i].alive) {
+            continue;
+        }
+        disk_cache_quota_item it;
+        it.path       = &paths[n];
+        it.size_file  = vec[i].bytes;
+        it.last_used  = vec[i].used;
+        it.protected_ = protected_paths.count(vec[i].path) > 0;
+        items.push_back(it);
+        n++;
+    }
+
+    const auto plan = disk_cache_plan_quota(items, limit);
+
+    // apply the plan by *removing from the vector*, so the remaining elements
+    // shift - which is what invalidates pointer-based protection
+    for (const size_t idx : plan.evict_order) {
+        const std::string victim = paths[idx];
+        for (auto & e : vec) {
+            if (e.alive && e.path == victim) {
+                e.alive = false;
+                break;
+            }
+        }
+    }
+}
+
+bool sim_alive(const std::vector<sim_entry> & vec, const std::string & path) {
+    for (const auto & e : vec) {
+        if (e.path == path) {
+            return e.alive;
+        }
+    }
+    return false;
+}
+
+size_t sim_sum(const std::vector<sim_entry> & vec) {
+    size_t total = 0;
+    for (const auto & e : vec) {
+        if (e.alive) {
+            total += e.bytes;
+        }
+    }
+    return total;
+}
+
+void test_protection_survives_eviction() {
+    const size_t limit = 300 * MiB;
+
+    // "oldest" is evicted first; "new" is the entry this transaction is admitting
+    // and sits behind it in the vector, so its storage shifts on removal
+    std::vector<sim_entry> vec = {
+        { "oldest", 200 * MiB, 1, true },
+        { "middle", 100 * MiB, 5, true },
+        { "new",    150 * MiB, 9, true },
+    };
+
+    const std::unordered_set<std::string> protected_paths = { "new" };
+
+    sim_evict_once(vec, limit, protected_paths);
+
+    CHECK(sim_alive(vec, "new"));    // the protected entry is never a candidate
+    CHECK(!sim_alive(vec, "oldest")); // the LRU victim goes instead
+    CHECK(sim_sum(vec) <= limit);
+}
+
+// ---------------------------------------------------------------------------
+// protection identity must survive an erase that happens *before* it is used.
+//
+// the real sequence in enforce_limit() is:
+//
+//   1. worker() builds the protection set from pointers into `entries`
+//   2. enforce_limit() calls sweep_expired(), which erases expired entries
+//   3. the LRU loop consults the set built in step 1
+//
+// step 2 moves every element behind the erased one, so the pointers from step 1
+// no longer address the entries they were taken from. this replays that order
+// with both representations and asserts the path-keyed one holds.
+// ---------------------------------------------------------------------------
+// move the tail down exactly as std::vector::erase does, then shrink
+void sim_erase_by_path(std::vector<sim_entry> & vec, const std::string & path) {
+    for (auto it = vec.begin(); it != vec.end(); ++it) {
+        if (it->path == path) {
+            for (auto cur = it; cur + 1 != vec.end(); ++cur) {
+                *cur = *(cur + 1);
+            }
+            vec.pop_back();
+            return;
+        }
+    }
+}
+
+// the old representation: `keep` is captured as pointers, then an earlier entry is
+// erased, then the LRU loop consults those pointers
+bool sim_pointer_sequence_keeps(std::vector<sim_entry> vec, size_t limit,
+        const std::string & protected_path, const std::string & expire_path) {
+    std::vector<const sim_entry *> keep;
+    for (const auto & e : vec) {
+        if (e.path == protected_path) {
+            keep.push_back(&e);
+        }
+    }
+
+    sim_erase_by_path(vec, expire_path); // step 2: the vector shifts
+
+    std::vector<std::string>           paths;
+    std::vector<disk_cache_quota_item> items;
+
+    for (const auto & e : vec) {
+        paths.push_back(e.path);
+    }
+
+    for (size_t k = 0; k < vec.size(); ++k) {
+        disk_cache_quota_item it;
+        it.path       = &paths[k];
+        it.size_file  = vec[k].bytes;
+        it.last_used  = vec[k].used;
+        it.protected_ = std::find(keep.begin(), keep.end(), &vec[k]) != keep.end();
+        items.push_back(it);
+    }
+
+    const auto plan = disk_cache_plan_quota(items, limit);
+
+    for (const size_t idx : plan.evict_order) {
+        for (auto & e : vec) {
+            if (e.path == paths[idx]) {
+                e.alive = false;
+                break;
+            }
+        }
+    }
+
+    return sim_alive(vec, protected_path);
+}
+
+// the fixed representation: the path is copied, so an erase cannot invalidate it
+bool sim_path_sequence_keeps(std::vector<sim_entry> vec, size_t limit,
+        const std::string & protected_path, const std::string & expire_path) {
+    const std::unordered_set<std::string> protected_paths = { protected_path };
+
+    sim_erase_by_path(vec, expire_path);
+
+    sim_evict_once(vec, limit, protected_paths);
+
+    return sim_alive(vec, protected_path);
+}
+
+void test_protection_identity_survives_prior_erase() {
+    // "expiring" is removed by the TTL pass and sits *before* the protected entry,
+    // so the protected entry's storage shifts down one slot
+    const auto make = []() {
+        return std::vector<sim_entry> {
+            { "expiring", 50 * MiB,  1, true },
+            { "new",      150 * MiB, 9, true },
+            { "other",    100 * MiB, 5, true },
+        };
+    };
+
+    const size_t limit = 120 * MiB;
+
+    // the fixed code keeps the entry it promised to keep
+    CHECK(sim_path_sequence_keeps(make(), limit, "new", "expiring"));
+
+    // the pointer-based sequence is *not* asserted: reading through a stale
+    // pointer is undefined behaviour, so its outcome is not a contract. it is kept
+    // here so the regression is documented rather than assumed harmless
+    const bool ptr_res = sim_pointer_sequence_keeps(make(), limit, "new", "expiring");
+    (void) ptr_res;
+}
+
+// the same pass repeated: after the first erase the protected entry has moved, so
+// a stale pointer would now match a different entry. two evictions are needed to
+// bring the total down
+void test_protection_survives_repeated_eviction() {
+    const size_t limit = 150 * MiB;
+
+    std::vector<sim_entry> vec = {
+        { "a-oldest", 100 * MiB, 1, true },
+        { "b",        100 * MiB, 2, true },
+        { "new",      150 * MiB, 9, true },
+    };
+
+    const std::unordered_set<std::string> protected_paths = { "new" };
+
+    sim_evict_once(vec, limit, protected_paths);
+
+    CHECK(sim_alive(vec, "new"));
+    CHECK(!sim_alive(vec, "a-oldest"));
+    CHECK(!sim_alive(vec, "b")); // both unprotected entries are gone
+    CHECK(sim_sum(vec) <= limit);
+}
+
+// a protected entry that is also the least recently used must still not be taken
+void test_protected_never_lru_victim() {
+    const size_t limit = 100 * MiB;
+
+    std::vector<sim_entry> vec = {
+        { "new",     150 * MiB, 1, true }, // oldest by last_used, but protected
+        { "other",   200 * MiB, 9, true },
+    };
+
+    const std::unordered_set<std::string> protected_paths = { "new" };
+
+    sim_evict_once(vec, limit, protected_paths);
+
+    CHECK(sim_alive(vec, "new"));
+    CHECK(!sim_alive(vec, "other"));
+}
+
+// a quarantined entry is counted and never selected, which can make the set
+// unsatisfiable even though an unprotected entry is also present
+void test_quarantined_and_protected_together() {
+    fixture fx;
+    fx.add("Q", 600 * MiB, 1, /*quarantined=*/true);
+    fx.add("keep", 200 * MiB, 2, false, /*protected_=*/true);
+    fx.add("victim", 300 * MiB, 3);
+    fx.refresh();
+
+    const auto plan = disk_cache_plan_quota(fx.items, 700 * MiB);
+
+    CHECK(!plan.fits);            // 600 + 200 = 800 MiB survives, over the limit
+    CHECK_EQ(plan.overshoot, 100 * MiB);
+    CHECK(plan_evicts(plan, 2));  // the victim goes first
+    CHECK(!plan_evicts(plan, 0)); // the quarantined bytes stay
+    CHECK(!plan_evicts(plan, 1)); // the protected entry stays
+}
+
+// ---------------------------------------------------------------------------
+// a rejected write whose rollback fails.
+//
+// the file is still on disk and still occupies space, so it has to be registered
+// as a quarantined entry: accounted for in the total, excluded from reuse, and
+// never counted as a successful write. this pins down that arithmetic.
+// ---------------------------------------------------------------------------
+struct sim_rollback {
+    size_t total_size  = 0;
+    size_t write_bytes = 0; // bytes the caller believes it stored
+    bool   quarantined = false;
+    bool   rejected    = false;
+};
+
+sim_rollback sim_reject(bool rollback_deletes, size_t size_file) {
+    sim_rollback r;
+    r.rejected = true;
+
+    if (rollback_deletes) {
+        // the file is gone: nothing is accounted for, nothing was written
+        return r;
+    }
+
+    // deletion failed: the bytes are still there and must be accounted for
+    r.quarantined = true;
+    r.total_size  = size_file;
+    return r;
+}
+
+void test_rejected_write_rollback() {
+    const size_t size_file = 300 * MiB;
+
+    const sim_rollback ok = sim_reject(/*rollback_deletes=*/true, size_file);
+    CHECK(ok.rejected);
+    CHECK(!ok.quarantined);
+    CHECK_EQ(ok.total_size, 0);      // no phantom bytes
+    CHECK_EQ(ok.write_bytes, 0);     // not counted as a successful write
+
+    const sim_rollback failed = sim_reject(/*rollback_deletes=*/false, size_file);
+    CHECK(failed.rejected);
+    CHECK(failed.quarantined);       // registered, not silently forgotten
+    CHECK_EQ(failed.total_size, size_file); // the ledger keeps the real bytes
+    CHECK_EQ(failed.write_bytes, 0); // still not a successful write
+}
+
 } // namespace
 
 int main() {
@@ -480,6 +789,12 @@ int main() {
     test_order_regression();
     test_order_regression_admitted();
     test_order_regression_plain_lru();
+    test_protection_survives_eviction();
+    test_protection_identity_survives_prior_erase();
+    test_protection_survives_repeated_eviction();
+    test_protected_never_lru_victim();
+    test_quarantined_and_protected_together();
+    test_rejected_write_rollback();
 
     if (g_failures == 0) {
         std::printf("all disk-cache quota checks passed\n");

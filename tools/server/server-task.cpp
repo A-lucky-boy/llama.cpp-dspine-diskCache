@@ -1738,6 +1738,14 @@ std::string server_task_result_metrics::to_metrics() {
             "Entries rolled back because they did not fit the quota",
             (double) cache_disk.n_write_rejected
         }, {
+            "cache_disk_rollback_failed_total",
+            "Rejected writes whose file could not be deleted and became quarantined entries",
+            (double) cache_disk.n_rollback_failed
+        }, {
+            "cache_disk_quota_unreclaimed_total",
+            "Admission transactions that could not really reclaim the quota because a removal failed",
+            (double) cache_disk.n_quota_unreclaimed
+        }, {
             "cache_disk_queue_entries",
             "Number of disk cache writes waiting for the writer",
             (double) cache_disk.n_queue_entries
@@ -3383,9 +3391,10 @@ bool server_disk_cache::covered_cheaply(const disk_cache_prompt_identity & wante
     return false;
 }
 
-void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
+size_t server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
         const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids,
         size_t committed_file_bytes, bool replacement_is_admitted) {
+    size_t dropped = 0;
     // mtx must be held
     if (!replacement_is_admitted) {
         // the long entry exists on disk but its survival in this capacity
@@ -3414,7 +3423,7 @@ void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vecto
                     follow_ups);
         }
 
-        return;
+        return 0;
     }
 
     disk_cache_prompt_identity longer;
@@ -3453,7 +3462,10 @@ void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vecto
         total_size -= size_file;
         notify_invalidated(it->path);
         it = entries.erase(it);
+        dropped++;
     }
+
+    return dropped;
 }
 
 void server_disk_cache::dedup_prefixes() {
@@ -4056,6 +4068,10 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
 }
 
 void server_disk_cache::sweep_expired() {
+    sweep_expired({});
+}
+
+void server_disk_cache::sweep_expired(const disk_cache_protected_paths & protected_paths) {
     namespace fs = std::filesystem;
 
     // mtx must be held
@@ -4066,6 +4082,13 @@ void server_disk_cache::sweep_expired() {
     const int64_t now = disk_cache_now();
 
     for (auto it = entries.begin(); it != entries.end(); ) {
+        // the TTL pass runs before eviction: it must not take the entry this
+        // transaction is trying to admit, however idle it looks
+        if (is_protected(*it, protected_paths)) {
+            ++it;
+            continue;
+        }
+
         if (now - it->last_used > ttl_seconds) {
             const disk_cache_remove_status status = remove_file(it->path);
 
@@ -4127,18 +4150,26 @@ std::vector<disk_cache_quota_item> server_disk_cache::quota_items_locked(const s
     return items;
 }
 
+bool server_disk_cache::is_protected(const server_disk_cache_entry & entry,
+        const disk_cache_protected_paths & protected_paths) {
+    // keyed by path, not by address: `entries` is a vector and every erase() moves
+    // the elements behind the removed one, so a stored pointer or iterator would
+    // silently start referring to a different entry
+    return protected_paths.find(entry.path) != protected_paths.end();
+}
+
 void server_disk_cache::enforce_limit() {
     enforce_limit({});
 }
 
-void server_disk_cache::enforce_limit(const std::vector<const server_disk_cache_entry *> & keep) {
+void server_disk_cache::enforce_limit(const disk_cache_protected_paths & protected_paths) {
     namespace fs = std::filesystem;
 
-    // mtx must be held
-    sweep_expired();
+    // mtx must be held. the TTL pass gets the same protection set: it runs first
+    // and its erase() calls are what would otherwise invalidate a pointer-based
+    // keep list
+    sweep_expired(protected_paths);
 
-    // entries that could not be deleted are quarantined and skipped for the rest
-    // of this pass: picking the same unremovable file again would loop forever
     // entries that could not be deleted are quarantined and skipped for the rest
     // of this pass: picking the same unremovable file again would loop forever
     while (limit_size > 0 && total_size > limit_size && !entries.empty()) {
@@ -4148,7 +4179,9 @@ void server_disk_cache::enforce_limit(const std::vector<const server_disk_cache_
             if (cur->quarantined) {
                 continue;
             }
-            if (std::find(keep.begin(), keep.end(), &*cur) != keep.end()) {
+            // re-checked on every iteration, after every erase: the protection is a
+            // property of the path, so it stays correct as the vector shifts
+            if (is_protected(*cur, protected_paths)) {
                 continue; // this transaction must not lose it
             }
             if (it == entries.end() || cur->last_used < it->last_used) {
@@ -4320,8 +4353,7 @@ void server_disk_cache::worker() {
                 // so: plan the capacity transaction with the new entry protected,
                 // reclaim only what is genuinely reclaimable, and only then decide
                 // about the superseded short snapshots
-                std::vector<std::string>                     path_storage;
-                std::vector<const server_disk_cache_entry *> keep;
+                std::vector<std::string> path_storage;
 
                 std::vector<disk_cache_quota_item> plan_in = quota_items_locked(&e, path_storage);
                 disk_cache_quota_plan              plan    = disk_cache_plan_quota(plan_in, limit_size);
@@ -4330,38 +4362,122 @@ void server_disk_cache::worker() {
                     // even after reclaiming everything reclaimable the new entry
                     // does not fit. roll it back instead of deleting snapshots for
                     // a file that cannot stay
-                    SRV_WRN("disk cache: '%s' (%.2f MiB) does not fit the %.2f MiB limit with %.2f MiB protected, dropping it\n",
+                    SRV_WRN("disk cache: '%s' (%.2f MiB) does not fit the %.2f MiB limit with %.2f MiB protected, rolling it back\n",
                             path.c_str(), size_file/(1024.0*1024.0),
                             limit_size/(1024.0*1024.0), plan.protected_bytes/(1024.0*1024.0));
 
-                    remove_file(path);
+                    const disk_cache_remove_status rolled_back = remove_file(path);
 
                     counters.n_write_rejected++;
+
+                    if (rolled_back == disk_cache_remove_status::failed) {
+                        // the rollback did not free anything: the bytes are still on
+                        // disk. pretending the write never happened would leave an
+                        // untracked file occupying space, so it becomes a
+                        // quarantined entry instead - accounted for, and excluded
+                        // from every reuse path
+                        SRV_ERR("disk cache: could not roll back '%s', keeping it as a quarantined entry (%.2f MiB)\n",
+                                path.c_str(), size_file/(1024.0*1024.0));
+
+                        // the path was claimed before the write, so the new entry
+                        // is its only owner; registering it here keeps the ledger
+                        // and the directory consistent
+                        quarantine_entry(e, "write rejected but the rollback failed");
+
+                        total_size += size_file;
+                        entries.push_back(std::move(e));
+
+                        counters.n_rollback_failed++;
+                    }
                 } else {
                     total_size += size_file;
                     entries.push_back(std::move(e));
 
-                    // the entry is in `entries` now: protect it for this transaction
-                    for (const auto & cur : entries) {
-                        if (cur.path == path) {
-                            keep.push_back(&cur);
-                            break;
-                        }
-                    }
+                    // protect the new entry by path, not by address: `entries` is a
+                    // vector, so a pointer into it goes stale as soon as the quota
+                    // pass erases anything ahead of the new entry
+                    disk_cache_protected_paths protected_paths = { path };
 
                     // reclaim the planned candidates. an entry that refuses to be
                     // deleted is quarantined by the quota pass and its bytes stay
                     // accounted for
-                    enforce_limit(keep);
+                    enforce_limit(protected_paths);
 
-                    // the new entry survived the capacity pass - it is admitted.
-                    // only now may it justify deleting the snapshots it supersedes
-                    const bool admitted =
-                        std::any_of(entries.begin(), entries.end(),
-                                [&path](const server_disk_cache_entry & cur) { return cur.path == path; });
+                    // `plan.fits` says the plan was satisfiable *if every candidate
+                    // could really be removed*. the pass above may have failed to
+                    // remove some of them, so ask the entry set what actually
+                    // happened rather than trusting the plan
+                    bool admitted = false;
+                    for (const auto & cur : entries) {
+                        if (cur.path == path && cur.quarantined == false) {
+                            admitted = true;
+                            break;
+                        }
+                    }
 
-                    drop_prefixes(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids,
+                    if (!admitted) {
+                        SRV_WRN("disk cache: '%s' was evicted during its own admission pass, not using it as a replacement\n",
+                                path.c_str());
+                    }
+
+                    // the new entry is really there and usable - only now may it
+                    // justify deleting the snapshots it supersedes
+                    const size_t superseded = drop_prefixes(pending.ids, pending.media_indices,
+                            pending.media_token_counts, pending.media_ids,
                             size_file, /*replacement_is_admitted=*/admitted);
+
+                    // the plan was only a plan. if the physical pass could not free
+                    // what it counted on, the ledger is now over the limit
+                    if (limit_size > 0 && total_size > limit_size) {
+                        if (superseded == 0) {
+                            // nothing this transaction deleted is required for
+                            // recovery, and the only reason the quota is still
+                            // unmet is a failed removal. undo the whole write
+                            // instead of keeping a file that does not fit
+                            SRV_WRN("disk cache: quota still exceeded after the admission pass (%.2f MiB over), "
+                                    "rolling back '%s' because no superseded snapshot was deleted\n",
+                                    (total_size - limit_size)/(1024.0*1024.0), path.c_str());
+
+                            const disk_cache_remove_status rolled_back = remove_file(path);
+
+                            counters.n_write_rejected++;
+                            counters.n_quota_unreclaimed++;
+
+                            if (rolled_back == disk_cache_remove_status::failed) {
+                                SRV_ERR("disk cache: could not roll back '%s', keeping it as a quarantined entry (%.2f MiB)\n",
+                                        path.c_str(), size_file/(1024.0*1024.0));
+
+                                for (auto & cur : entries) {
+                                    if (cur.path == path) {
+                                        quarantine_entry(cur, "quota unmet and the rollback failed");
+                                        break;
+                                    }
+                                }
+
+                                counters.n_rollback_failed++;
+                            } else {
+                                total_size -= std::min(total_size, size_file);
+
+                                for (auto it = entries.begin(); it != entries.end(); ++it) {
+                                    if (it->path == path) {
+                                        notify_invalidated(it->path);
+                                        entries.erase(it);
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            // this transaction already removed snapshots that only
+                            // the new entry replaces. deleting that replacement now
+                            // would leave the cache strictly worse than before, so
+                            // the over-quota state is kept visible instead
+                            SRV_WRN("disk cache: over the %.2f MiB limit by %.2f MiB after replacing %zu snapshot(s); "
+                                    "keeping the ledger honest and refusing further uncontrolled writes\n",
+                                    limit_size/(1024.0*1024.0), (total_size - limit_size)/(1024.0*1024.0), superseded);
+
+                            counters.n_quota_unreclaimed++;
+                        }
+                    }
                 }
 
                 // the entry set changed - persist the startup index

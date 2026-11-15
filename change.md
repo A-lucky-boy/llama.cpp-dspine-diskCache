@@ -1445,3 +1445,106 @@ limit = 800 MiB
   - **"手工构造完全对称的 Q/S/L 三态"**：本机条目体积由检查点主导（1.4K token 即 505 MiB），无法精确构造"Q+S 在限内、Q+S+L 超限且先删 S 仍超限"的真实文件组合。已用 (a) 单测的旧/新顺序对照模拟与 (b) 端到端的 Q（隔离）+ S + L 三态（账面超额如实显示、无错误替代）双向覆盖
   - **`write_rejected` 分支的端到端触发**：需要新条目单体在配额内但回收全部可回收对象后仍放不下。本机每次写入都是 GB 级、配额以 MiB 计，构造该组合需要缩放条目体积，属于人为注入；该分支由单测 `test_nothing_reclaimable` / `test_limit_below_entry_size` 覆盖，代码路径已静态核对
   - **真实媒体 prompt、多 slot、Linux、中断路径**：本轮范围外
+
+# 2026-11-15 23-15 - Change Record（test1_2 修复轮：稳定保护身份与回滚记账）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-15 22-40 - test1_2` 修复轮要求，修正三处配额事务内的状态一致性问题。基线 HEAD `2799400`，上一轮修复提交 `0e46af4`。
+
+- **A 保护指针失效**：`enforce_limit(keep)` 的 `keep` 是 `std::vector<const server_disk_cache_entry *>`，元素指向 `entries` 内部。`enforce_limit()` 先调 `sweep_expired()`，其 `entries.erase()` 会把被删元素之后的所有元素前移，`keep` 中的地址随即失效；若 TTL 清扫删掉了新条目前面的条目，保护判定就会错位。
+- **B 回滚删除失败成为孤儿**：`if (!plan.fits)` 分支调用 `remove_file(path)` 但忽略返回值。Windows 上文件被占用时删除会失败，该文件仍占磁盘，却既不在 `entries` 也不在 `total_size`。
+- **C 计划与兑现未分离**：`plan.fits` 只表示"假定候选都能删除"时的可行性。`enforce_limit()` 实际删除可能失败并隔离条目，之后 `total_size` 仍可能超额，而代码当时既不回滚也不记录。
+
+本轮只改准入/回滚/淘汰保护与账本；不改变 v8/v3、CRC、`768 KiB/token`、4096-token lag、`load()` 校验顺序、采样与 `n_past`，不新增通知通道。
+
+## 修改文件
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_protected_paths`（新增）、`disk_cache_counters`、`enforce_limit()`、`sweep_expired()`、`is_protected()`、`drop_prefixes()` 返回类型
+- 具体变更：
+  - 新增 `using disk_cache_protected_paths = std::unordered_set<std::string>`，紧邻其他缓存枚举定义
+  - `enforce_limit()` 的无参重载保留，带参重载由 `std::vector<const server_disk_cache_entry *>` 改为 `const disk_cache_protected_paths &`
+  - `sweep_expired()` 新增带保护集的重载；新增静态 `is_protected()`
+  - `drop_prefixes()` 返回 `size_t`（真正删除的条数）
+  - 计数器新增 `n_rollback_failed`、`n_quota_unreclaimed`
+- 修改原因：规划 §一.2 要求删除跨 `erase()` 保存的裸指针；§一.4 要求区分"计划可行"与"物理兑现"
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`is_protected()`（新增）、`sweep_expired()`、`enforce_limit()`、`drop_prefixes()`、`worker()`、`to_metrics()`
+- 具体变更：
+  - **A**：`is_protected(entry, protected_paths)` 按 `entry.path` 查集合；`sweep_expired(protected_paths)` 在 TTL 判定前先跳过受保护条目；`enforce_limit(protected_paths)` 把同一集合传给 `sweep_expired()`，LRU 循环每轮都按路径重新判定（而不是复用旧指针）
+  - **A**：`worker()` 里 `std::vector<const server_disk_cache_entry *> keep` 被删除，改为 `disk_cache_protected_paths protected_paths = { path }`
+  - **B**：`!plan.fits` 分支对 `remove_file(path)` 的返回分支处理。`failed` 时调用 `quarantine_entry(e, ...)`、`total_size += size_file`、入 `entries`、计 `n_rollback_failed`——文件真实字节被记账，同时因 `quarantined` 被排除出 `load()`/写入抑制/去重/`persisted`
+  - **C**：`drop_prefixes()` 返回实际删除数；`worker()` 在物理回收后重新核对 `total_size`：
+    - 仍超额且本次未删除任何被替代短快照 → 回滚新条目，计 `n_write_rejected`/`n_quota_unreclaimed`；回滚若又失败，同样按隔离条目登记
+    - 仍超额但已删除被替代快照 → 保留真实超额账本，记 `n_quota_unreclaimed` 并拒绝进一步不受控写入，不删除唯一替代者
+  - 候选可用性判据从"路径在 `entries` 中"改为"路径在 `entries` 中**且未隔离**"
+  - 指标新增 `cache_disk_rollback_failed_total`、`cache_disk_quota_unreclaimed_total`
+- 修改原因：规划 §一.2、§一.3、§一.4、§三.1、§三.2
+
+### tools/server/tests/unit/test_disk_cache_quota.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_quota.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/tests/unit/test_disk_cache_quota.cpp
+- 修改后路径：同名文件
+- 修改位置：新增保护身份与回滚记账两组用例
+- 具体变更：
+  - `sim_erase_by_path()`：按 `std::vector::erase()` 的语义把尾部元素逐个前移后再收缩，用于真实复现"erase 导致元素移动"
+  - `test_protection_identity_survives_prior_erase()`：受保护条目位于被 TTL 删除条目的**后面**，先构建保护集再 erase，最后判定。断言路径键版本保住受保护条目；指针版本另行记录但不作断言（读失效指针是未定义行为，其结果不构成契约）
+  - `test_protection_survives_eviction/repeated_eviction`：连续淘汰下受保护条目不被选中
+  - `test_protected_never_lru_victim`：受保护条目即使 `last_used` 最旧也不被淘汰
+  - `test_quarantined_and_protected_together`：隔离 + 受保护同时存在时 `fits == false`、`overshoot` 正确、隔离与受保护条目都不进候选
+  - `test_rejected_write_rollback`：回滚成功不计账面字节、回滚失败必须按隔离登记并计入 `total_size`，两种情况都不算成功写入
+  - 修 `sim_alive()` 形参为 `const std::string &`
+- 修改原因：规划 §四.1、§四.2 要求定点触发 `entries.erase` 与回滚失败
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：指标表、行为边界；projectSummary §3.1 不变量表
+- 具体变更：补 `cache_disk_rollback_failed_total`、`cache_disk_quota_unreclaimed_total`；写明"保护身份用路径而非指针"与"计划不等于兑现"
+- 修改原因：规划 §二、§六
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real）多次
+- 检查结果：通过，`0 FAILED`。中途出现两次失败：一次是我误改了 `sweep_expired()` 的无参声明（`C2511`），一次是残留 `llama-server.exe` 占用 `llama-server-impl.dll`（`LNK1104`），均已定位并修复后重建成功；`--version` 为 `0.9.0-dev (build 23, commit 2799400)`
+
+- 已执行检查：配额规划单测 `tools/server/tests/unit/test_disk_cache_quota.cpp`（cl 直接编译，不加载模型）
+- 检查结果：通过（`all disk-cache quota checks passed`）。中途一处 `sim_alive()` 形参类型不匹配（`const std::string` → `const char *`，`C2664`），改为引用形参后通过
+
+- 已执行检查：**端到端复现问题 A 的触发路径**（`test-run/logs/fix5-v1.log`，`--cache-disk-ttl 5`，`--cache-disk-max 1800`，三条不同长度的请求）
+- 检查结果：通过，且确认 TTL 清扫确实在准入 pass 内删除前置条目——`sweep_expire: dropping 'test-run/cache-v1/pc-736f...bin': expired after 7 s idle (505.77 MiB)`（发生在第二条目写入之前），第三次同样是 `expired after 7 s idle (569.49 MiB)` 后 `stored 4038 tokens, 635.30 MiB`。即：每次准入都伴随一次真实 `entries.erase()`，新条目仍正常留存，`entries 1 / bytes 6.66161e+08 / quarantined 0`
+
+- 已执行检查：隔离 + 准入顺序（`test-run/logs/fix5-t1.log` / `fix5-t3.log`，`--cache-disk-max 1400`，Python 持有 `.bin` 句柄）
+- 检查结果：通过。`quarantined ... expired but could not be removed, keeping 505.77 MiB accounted for` → `enforce_limit: over the 1400.00 MiB limit but no removable entry left (1565.57 MiB used)` → `stored 6233 tokens, 1059.80 MiB`。隔离字节与受保护新条目都未被淘汰，超额如实记录，`entries 2 / bytes 1.64161e+09`
+
+- 已执行检查：标准回归（`test-run/logs/fix5-reg.log`，发现开启 + both 捕获，双卡 `-ts 38,62`，语料 `E:\小说\正文.md`）
+- 检查结果：通过。`1385/0`、`4/1381`、`215/1381` 与上一轮逐项相同；输出 sha 相同（`fd7c5bda…`、`03e0e517…`）；`write_rejected 0 / path_conflict 0 / cache_prefix_nodes 3`
+
+- 已执行检查：强杀重启（`test-run/logs/fix5-restart.log`）
+- 检查结果：通过。`1 entries (manifest 1, stale index records 0)`、`1 after dedup/trim`、`prefix discovery ... 1 snapshot(s) registered`；请求恢复 `cache_n=1381`
+
+- 已执行检查：`git status`、临时产物清理
+- 检查结果：通过。测试缓存目录（约 3 GiB）、句柄脚本、临时编译脚本/可执行文件、构建日志、根目录 `.obj` 均已删除；`test-run/` 降至 1011 KB
+
+- 未执行的检查及原因：
+  - **问题 B 的端到端触发（`plan.fits == false`）**：需要新条目单体在配额内，且回收全部可回收对象后仍放不下。本机条目由检查点主导（1.4K token 即 505 MiB），任意两条相加就超过任何可设的 MiB 级配额，无法在真实模型上构造该组合。该分支由单测（`test_rejected_write_rollback`、`test_nothing_reclaimable`、`test_limit_below_entry_size`）与静态核对覆盖
+  - **同一个文件的写入与回滚持有句柄**：回滚失败需要"写入刚完成、临时句柄已关闭、随即被外部进程独占"的时序，本机只能稳定构造 TTL/LRU 阶段的句柄占用，无法在 `remove_file(path)` 调用的瞬间注入占用
+  - **问题 A 的"修复前会失败"对照**：无法在真实服务上运行带失效指针的版本再对比，因为读失效指针是未定义行为、结果不确定。已用单测的路径键/指针键两套序列并列记录，并对路径键版本断言；指针版本只记录不断言
+  - 真实媒体 prompt、多 slot、Linux、中断路径：本轮范围外
