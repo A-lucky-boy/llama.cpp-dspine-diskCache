@@ -292,6 +292,7 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 | `llamacpp:cache_disk_quarantined` | 删除失败后仍留在盘上、已排除出查找的条目数 |
 | `llamacpp:cache_disk_remove_failed_total` | 删除失败的累计次数 |
 | `llamacpp:cache_disk_hash_collision_total` | hash 与长度相同但 token/媒体身份不同而被拒绝写入的次数 |
+| `llamacpp:cache_disk_path_conflict_total` | 因内容寻址路径仍被占用（身份冲突或隔离条目无法移除）而拒绝写入的次数 |
 | `llamacpp:cache_prefix_requests_total` | 已发布观察的请求数 |
 | `llamacpp:cache_prefix_candidates_total` | 返回给调用方的候选前缀数（累计） |
 | `llamacpp:cache_prefix_observed_total` / `_eligible_total` | 进入 `observed` / `eligible` 的累计次数 |
@@ -306,6 +307,8 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 
 - CUDA 后端只支持按层切分（`-sm layer`）；`-sm row` 在模型加载阶段即被拒绝。
 - 生效的非 aLoRA 适配器下，共享缓存对该 slot 不写入；slot 自身的增量续算仍可用。
+- 文件名由内容 hash 决定，因此 **hash 命中就是路径命中**：写入前先在锁内解析该路径的所有者，只有"记录里没有该路径"时才允许覆盖。同名条目身份不同 → 拒绝写入并计数；同名条目已被隔离 → 先真实回收（`remove_file` 成功才释放路径），回收失败则明确拒绝，不覆写。
+- 媒体匹配**两个方向都会扫描**，各自给出最早差异后取 `min`。用短路 `||` 求值会漏掉第二个方向上更早的差异，从而高估可用前缀（已用确定性用例验证：旧写法给 12，正确值为 4）。媒体描述还会先做结构校验（三数组等长、下标严格递增、块非空且在范围内、ID 非空），不合格即按不可验证处理，可用前缀为 0。
 - 「已有条目可替代新条目」有统一定义：token 前缀 + 共享范围内**双向**媒体身份一致 + 该条目按此长度读盘仍满足 `768 KiB/token` 成本守卫。写入抑制、后台冗余判断、长短前缀去重共用这一判定，因此「长条目存在」本身不再构成抑制或删除短条目的理由。
 - hash 与长度只用于挑选候选，条目身份必须逐 token、逐媒体三重（位置/长度/ID）相等才算重复；hash 冲突时拒绝写入并记录，不覆盖原文件。
 - 删除失败（杀软占用、未释放句柄）不会扣减配额：条目被隔离——仍计入 `cache_disk_bytes`、仍留在 `entries`，但不再参与查找与淘汰排序；句柄释放后由下一次 TTL/配额检查重试回收。

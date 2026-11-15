@@ -1727,8 +1727,12 @@ std::string server_task_result_metrics::to_metrics() {
             (double) cache_disk.n_remove_failed
         }, {
             "cache_disk_hash_collision_total",
-            "Writes refused because a hash/length hit had a different token/media identity",
+            "Stored paths holding a different token/media identity than the write that mapped to them",
             (double) cache_disk.n_hash_collisions
+        }, {
+            "cache_disk_path_conflict_total",
+            "Writes refused because the content-addressed path stayed occupied",
+            (double) cache_disk.n_path_conflicts
         }, {
             "cache_disk_queue_entries",
             "Number of disk cache writes waiting for the writer",
@@ -1936,6 +1940,16 @@ const char * disk_cache_remove_status_name(disk_cache_remove_status status) {
         case disk_cache_remove_status::removed:         return "removed";
         case disk_cache_remove_status::already_missing: return "already_missing";
         case disk_cache_remove_status::failed:          return "failed";
+    }
+
+    return "unknown";
+}
+
+const char * disk_cache_path_owner_name(disk_cache_path_owner owner) {
+    switch (owner) {
+        case disk_cache_path_owner::free:      return "free";
+        case disk_cache_path_owner::identical: return "identical";
+        case disk_cache_path_owner::conflict:  return "conflict";
     }
 
     return "unknown";
@@ -2389,6 +2403,66 @@ bool server_disk_cache::is_reusable_entry(const server_disk_cache_entry & e) {
     // a quarantined entry still occupies disk space but may not serve a lookup or
     // stand in for a write; an entry without tokens has nothing to compare
     return !e.quarantined && !e.tokens.empty();
+}
+
+disk_cache_path_owner server_disk_cache::claim_path_locked(uint64_t hash, const std::string & path,
+        const disk_cache_prompt_identity & wanted, const char * what) {
+    // the file name is derived from the content hash, so every entry that maps to
+    // this hash shares the path - possibly with a different identity, and possibly
+    // quarantined. the path has to be resolved before anything is written: the
+    // writer never overwrites a file whose owner it has not identified
+    bool occupied = false;
+
+    for (auto it = entries.begin(); it != entries.end(); ) {
+        if (it->path != path) {
+            ++it;
+            continue;
+        }
+
+        occupied = true;
+
+        if (!is_reusable_entry(*it)) {
+            // a quarantined entry still owns its bytes, but it may not keep a path
+            // that a valid write needs. reclaim it for real: only a confirmed
+            // removal frees the path and adjusts the ledger
+            if (remove_file(path) == disk_cache_remove_status::failed) {
+                SRV_ERR("disk cache: cannot %s to '%s': the path is held by a quarantined entry that could not be removed\n",
+                        what, path.c_str());
+                counters.n_path_conflicts++;
+                return disk_cache_path_owner::conflict;
+            }
+
+            SRV_INF("disk cache: reclaimed '%s' from a quarantined entry (%.2f MiB)\n",
+                    path.c_str(), it->size_file/(1024.0*1024.0));
+
+            total_size -= std::min(total_size, it->size_file);
+            notify_invalidated(path);
+            it = entries.erase(it);
+            save_manifest();
+            continue;
+        }
+
+        if (it->hash == hash &&
+                disk_cache_classify_duplicate(identity_of(*it), wanted, true) == disk_cache_duplicate::identical) {
+            return disk_cache_path_owner::identical;
+        }
+
+        // a usable entry with a different identity holds the same name: refusing is
+        // the only safe answer while the file name is the hash alone
+        SRV_ERR("disk cache: '%s' is held by a different prompt (%zu tokens vs %zu), refusing the %s\n",
+                path.c_str(), it->tokens.size(),
+                wanted.tokens == nullptr ? 0 : wanted.tokens->size(), what);
+        counters.n_hash_collisions++;
+        counters.n_path_conflicts++;
+        return disk_cache_path_owner::conflict;
+    }
+
+    if (occupied) {
+        // every record at this path was reclaimed above
+        return disk_cache_path_owner::free;
+    }
+
+    return disk_cache_path_owner::free;
 }
 
 disk_cache_remove_status server_disk_cache::remove_file(const std::string & path) const {
@@ -2879,7 +2953,7 @@ void server_disk_cache::save_manifest() {
     }
 }
 
-bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out) {
+bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out, bool path_owned) {
     namespace fs = std::filesystem;
 
     const uint64_t hash = disk_cache_hash(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
@@ -2963,9 +3037,30 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         }
     }
 
+    // the caller resolved the ownership of this path under the cache lock
+    // (claim_path_locked) and passes the outcome in. without that proof an
+    // existing file is never removed: it may belong to a record this process has
+    // not classified yet
+    if (!path_owned) {
+        std::error_code ec_exists;
+        if (fs::exists(path, ec_exists)) {
+            SRV_ERR("disk cache: refusing to write '%s': the path is not claimed\n", path.c_str());
+            std::error_code ec_drop;
+            fs::remove(tmp, ec_drop);
+            return false;
+        }
+    }
+
     std::error_code ec;
-    fs::remove(path, ec); // the name is content-addressed, a stale file may exist after a crash
     fs::rename(tmp, path, ec);
+    if (ec) {
+        // renaming over an existing file fails on windows. the path was claimed,
+        // so what is left is an orphan without an `entries` record (a crashed
+        // process); removing it is the only way to complete the commit
+        std::error_code ec_rm;
+        fs::remove(path, ec_rm);
+        fs::rename(tmp, path, ec);
+    }
     if (ec) {
         SRV_ERR("disk cache: failed to rename '%s': %s\n", tmp.c_str(), ec.message().c_str());
         std::error_code ec_rm;
@@ -3286,14 +3381,16 @@ bool server_disk_cache::covered_cheaply(const disk_cache_prompt_identity & wante
 
 void server_disk_cache::drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
         const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids,
-        size_t pending_bytes) {
+        size_t committed_file_bytes) {
     // mtx must be held
     disk_cache_prompt_identity longer;
     longer.tokens             = &ids;
     longer.media_indices      = &media_indices;
     longer.media_token_counts = &media_token_counts;
     longer.media_ids          = &media_ids;
-    longer.file_bytes         = pending_bytes;
+    // the real size of the file that was just admitted, so the cost guard decides
+    // with the same number load() will use
+    longer.file_bytes         = committed_file_bytes;
 
     for (auto it = entries.begin(); it != entries.end(); ) {
         // the shorter entry may only go when the longer one can really serve every
@@ -3743,27 +3840,34 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
     {
         std::lock_guard<std::mutex> lock(mtx);
 
+        // the path is derived from the hash, so a hash hit is a path hit: resolve
+        // the owner first and only then decide between "already stored" and
+        // "conflict". a hash hit with a different identity - including a different
+        // token length - is a conflict, not something to skip
         for (const auto & e : entries) {
-            if (!is_reusable_entry(e)) {
-                continue; // a quarantined entry is not "already stored"
-            }
-
-            const bool same_hash_and_length = e.hash == hash && e.tokens.size() == pending.ids.size();
-            if (!same_hash_and_length) {
+            if (e.hash != hash) {
                 continue;
             }
 
-            // the hash only selects the candidate: the identity decides. a hash
-            // collision with different metadata must not be counted as a
-            // duplicate, and the existing file must not be overwritten
-            if (disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
+            if (is_reusable_entry(e) &&
+                    disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
                 SRV_TRC("disk cache: %016" PRIx64 " is already stored, skipping\n", hash);
                 counters.n_enqueue_dedup++;
                 return;
             }
 
+            if (!is_reusable_entry(e)) {
+                // a quarantined holder is not "already stored": the entry cannot
+                // serve a lookup, so counting this as a duplicate would keep the
+                // prompt permanently uncacheable. the worker resolves the path
+                // before writing (reclaim or refuse)
+                SRV_TRC("disk cache: %016" PRIx64 " is held by a quarantined entry, resolving the path at write time\n", hash);
+                continue;
+            }
+
             counters.n_hash_collisions++;
-            SRV_ERR("disk cache: %016" PRIx64 " collides with '%s' but the token/media identity differs, refusing the write\n",
+            counters.n_path_conflicts++;
+            SRV_ERR("disk cache: %016" PRIx64 " is held by '%s' with a different token/media identity, refusing the write\n",
                     hash, e.path.c_str());
             return;
         }
@@ -3858,22 +3962,24 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
 
         // already written, or already waiting in the queue
         for (const auto & e : entries) {
-            if (!is_reusable_entry(e)) {
+            if (e.hash != hash) {
                 continue;
             }
 
-            const bool same_hash_and_length = e.hash == hash && e.tokens.size() == pending.ids.size();
-            if (!same_hash_and_length) {
-                continue;
-            }
-
-            if (disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
+            if (is_reusable_entry(e) &&
+                    disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
                 counters.n_enqueue_dedup++;
                 return false;
             }
 
+            if (!is_reusable_entry(e)) {
+                // see store(): a quarantined holder is not a stored duplicate
+                continue;
+            }
+
             counters.n_hash_collisions++;
-            SRV_ERR("disk cache: %016" PRIx64 " collides with '%s' but the token/media identity differs, refusing the mirror\n",
+            counters.n_path_conflicts++;
+            SRV_ERR("disk cache: %016" PRIx64 " is held by '%s' with a different token/media identity, refusing the mirror\n",
                     hash, e.path.c_str());
             return false;
         }
@@ -4058,7 +4164,46 @@ void server_disk_cache::worker() {
             continue;
         }
 
-        const bool ok = write_entry(pending, path, size_file);
+        // resolve the ownership of the target path before writing anything. the
+        // name is the content hash, so a quarantined or foreign entry may already
+        // hold it; the writer may not overwrite either of them
+        bool path_ok = false;
+        {
+            const_cast<server_disk_cache *>(this)->path_owner_scratch = disk_cache_path_owner::free;
+
+            std::lock_guard<std::mutex> lock(mtx);
+
+            disk_cache_prompt_identity pending_identity;
+            pending_identity.tokens             = &pending.ids;
+            pending_identity.media_indices      = &pending.media_indices;
+            pending_identity.media_token_counts = &pending.media_token_counts;
+            pending_identity.media_ids          = &pending.media_ids;
+            pending_identity.file_bytes         = bytes;
+
+            const std::string target = dir + "/" + string_format("pc-%016" PRIx64 ".bin", hash);
+            path_owner_scratch = claim_path_locked(hash, target, pending_identity, "write");
+
+            if (path_owner_scratch == disk_cache_path_owner::identical) {
+                // the very same prompt is already stored and usable
+                queue_bytes -= std::min(queue_bytes, bytes);
+                inflight.erase(hash);
+                counters.n_enqueue_dedup++;
+                SRV_TRC("disk cache: %016" PRIx64 " is already stored, skipping\n", hash);
+                continue;
+            }
+
+            path_ok = path_owner_scratch == disk_cache_path_owner::free;
+        }
+
+        if (!path_ok) {
+            std::lock_guard<std::mutex> lock(mtx);
+            queue_bytes -= std::min(queue_bytes, bytes);
+            inflight.erase(hash);
+            counters.n_enqueue_rejected++;
+            continue;
+        }
+
+        const bool ok = write_entry(pending, path, size_file, /*path_owned=*/true);
 
         {
             std::lock_guard<std::mutex> lock(mtx);
@@ -4069,6 +4214,7 @@ void server_disk_cache::worker() {
             if (ok) {
                 server_disk_cache_entry committed;
                 bool                    have_committed = false;
+                bool                    admitted       = false;
 
                 server_disk_cache_entry e;
                 e.path      = path;
@@ -4088,12 +4234,26 @@ void server_disk_cache::worker() {
                 total_size += size_file;
                 entries.push_back(std::move(e));
 
-                // this prompt subsumes any shorter stored prompt that is its
-                // prefix, so those files are dead weight - drop them
-                drop_prefixes(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids,
-                        bytes);
+                // the short snapshots this prompt supersedes may only be deleted
+                // when this file is actually there and admitted. `size_file` is the
+                // real committed size read back from disk - never the pre-write
+                // estimate, which serves the queue budget only
+                for (const auto & cur : entries) {
+                    if (cur.path == path) {
+                        admitted = true;
+                        break;
+                    }
+                }
 
-                enforce_limit();
+                if (admitted) {
+                    drop_prefixes(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids,
+                            size_file);
+
+                    // a quota eviction may already have taken this file away; the
+                    // short snapshots are only gone because the long one was there
+                    // at that moment, so the order matters
+                    enforce_limit();
+                }
 
                 // the entry set changed - persist the startup index
                 save_manifest();

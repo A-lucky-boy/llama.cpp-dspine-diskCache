@@ -117,6 +117,16 @@ void test_media_identity() {
         CHECK(!m.media_compatible);
     }
 
+    // a chunk that only partially covers the other one is not a match either
+    ident p = a;
+    p.idx = { 6 };
+    p.cnt = { 8 }; // [6, 14) versus A's [8, 12)
+    {
+        const auto m = disk_cache_match_prefix(view_of(a), view_of(p));
+        CHECK_EQ(m.usable_lcp, 6);
+        CHECK(!m.media_compatible);
+    }
+
     // one side has no media metadata at all
     ident d = a;
     d.idx.clear();
@@ -162,6 +172,157 @@ void test_media_boundary_clamp() {
     }
 }
 
+// problem A: both directions must be scanned. A's chunk sits later than B's, so
+// the earlier difference is found only by the B->A direction. a short-circuit
+// `||` would return A's later position and over-report the usable prefix
+void test_bidirectional_earliest_difference() {
+    const size_t n = 40;
+
+    // both prompts carry placeholders at 4..8 and 12..16, so every token id is
+    // identical and only the media metadata can diverge. A declares its chunk at
+    // 12, B at 4: the earlier difference is visible only from the B->A direction
+    auto two_chunk_tokens = [&]() {
+        ident x = make_ident(n, 5);
+        for (size_t i = 4; i < 8; ++i) {
+            x.toks[i] = LLAMA_TOKEN_NULL;
+        }
+        for (size_t i = 12; i < 16; ++i) {
+            x.toks[i] = LLAMA_TOKEN_NULL;
+        }
+        return x;
+    };
+
+    ident a = two_chunk_tokens();
+    a.idx = { 12 };
+    a.cnt = { 4 };
+    a.ids = { "later" };
+
+    ident b = two_chunk_tokens();
+    b.idx = { 4 };
+    b.cnt = { 4 };
+    b.ids = { "earlier" };
+
+    {
+        const auto m = disk_cache_match_prefix(view_of(a), view_of(b));
+        CHECK_EQ(m.token_lcp, n);
+        CHECK_EQ(m.usable_lcp, 4);   // the earliest mismatch, discovered by B->A
+        CHECK(!m.media_compatible);
+    }
+    {
+        // argument order must not change the answer
+        const auto m = disk_cache_match_prefix(view_of(b), view_of(a));
+        CHECK_EQ(m.usable_lcp, 4);
+        CHECK(!m.media_compatible);
+    }
+
+    // the mirror image: the earlier difference now lives in the first direction
+    ident c = two_chunk_tokens();
+    c.idx = { 4 };
+    c.cnt = { 4 };
+    c.ids = { "c" };
+
+    ident d = two_chunk_tokens();
+    d.idx = { 12 };
+    d.cnt = { 4 };
+    d.ids = { "d" };
+
+    {
+        const auto m = disk_cache_match_prefix(view_of(c), view_of(d));
+        CHECK_EQ(m.token_lcp, n);
+        CHECK_EQ(m.usable_lcp, 4);
+        CHECK(!m.media_compatible);
+    }
+
+    // several chunks: the earliest disagreement wins over later agreements, in
+    // both argument orders
+    ident e = make_ident(n, 5);
+    for (size_t i = 4; i < 8; ++i)  { e.toks[i] = LLAMA_TOKEN_NULL; }
+    for (size_t i = 20; i < 24; ++i) { e.toks[i] = LLAMA_TOKEN_NULL; }
+    e.idx = { 4, 20 };
+    e.cnt = { 4, 4 };
+    e.ids = { "x", "y" };
+
+    ident f = e; // identical at 4, different at 20
+    f.ids = { "x", "z" };
+    {
+        const auto m = disk_cache_match_prefix(view_of(e), view_of(f));
+        CHECK_EQ(m.usable_lcp, 20);
+        CHECK(!m.media_compatible);
+    }
+
+    ident g = e; // different at 4, identical at 20
+    g.ids = { "w", "y" };
+    {
+        const auto m = disk_cache_match_prefix(view_of(e), view_of(g));
+        CHECK_EQ(m.usable_lcp, 4);
+        CHECK(!m.media_compatible);
+    }
+
+    // fully identical multi-chunk descriptions stay compatible
+    {
+        const auto m = disk_cache_match_prefix(view_of(e), view_of(e));
+        CHECK_EQ(m.usable_lcp, m.token_lcp);
+        CHECK(m.media_compatible);
+    }
+}
+
+// the structural validator, exercised separately from the comparison
+void test_media_structural_validity() {
+    const size_t n = 20;
+
+    ident ok = make_ident(n, 100);
+    for (size_t i = 4; i < 8; ++i) { ok.toks[i] = LLAMA_TOKEN_NULL; }
+    ok.idx = { 4 };
+    ok.cnt = { 4 };
+    ok.ids = { "a" };
+    CHECK(disk_cache_media_valid(view_of(ok)));
+
+    // no media at all is valid
+    CHECK(disk_cache_media_valid(view_of(make_ident(n, 100))));
+
+    ident bad = ok;
+    bad.cnt.clear(); // array sizes disagree
+    CHECK(!disk_cache_media_valid(view_of(bad)));
+
+    bad = ok;
+    bad.ids = { "" }; // empty id
+    CHECK(!disk_cache_media_valid(view_of(bad)));
+
+    bad = ok;
+    bad.cnt = { 0 }; // empty chunk
+    CHECK(!disk_cache_media_valid(view_of(bad)));
+
+    bad = ok;
+    bad.idx = { 18 };
+    bad.cnt = { 5 }; // out of range
+    CHECK(!disk_cache_media_valid(view_of(bad)));
+
+    bad = ok;
+    bad.idx = { 4, 6 };
+    bad.cnt = { 6, 4 };
+    bad.ids = { "a", "b" }; // overlapping
+    CHECK(!disk_cache_media_valid(view_of(bad)));
+
+    bad = ok;
+    bad.idx = { 8, 4 };
+    bad.cnt = { 4, 4 };
+    bad.ids = { "a", "b" }; // out of order
+    CHECK(!disk_cache_media_valid(view_of(bad)));
+
+    bad = ok;
+    bad.idx = { 4, 4 };
+    bad.cnt = { 2, 2 };
+    bad.ids = { "a", "b" }; // duplicate position
+    CHECK(!disk_cache_media_valid(view_of(bad)));
+
+    // an invalid description is never equal to anything, even to itself
+    CHECK(!disk_cache_identity_equal(view_of(bad), view_of(bad)));
+
+    // ... and it produces no usable prefix at all
+    const auto m = disk_cache_match_prefix(view_of(bad), view_of(ok));
+    CHECK_EQ(m.usable_lcp, 0);
+}
+
 void test_cost_guard() {
     const size_t bytes_per_token = DISK_CACHE_MAX_BYTES_PER_TOKEN;
 
@@ -173,6 +334,33 @@ void test_cost_guard() {
     CHECK(!disk_cache_cost_ok(1226ull * 1024 * 1024, 1596));
     // ... but a 506 MiB entry can serve the same prefix: 374 KiB/token
     CHECK(disk_cache_cost_ok(506ull * 1024 * 1024, 1596));
+}
+
+// problem B: the estimate and the real file size agree at the boundary and differ
+// by 1 byte / 1 KiB - the guard must treat all of them through the same expression
+void test_cost_boundary() {
+    const size_t lcp = 1000;
+    const size_t limit = lcp * DISK_CACHE_MAX_BYTES_PER_TOKEN;
+
+    CHECK(disk_cache_cost_ok(limit, lcp));
+    CHECK(!disk_cache_cost_ok(limit + 1, lcp));
+    CHECK(!disk_cache_cost_ok(limit + 1024, lcp));
+    CHECK(disk_cache_cost_ok(limit - 1024, lcp));
+
+    // a canonical replace decision at the boundary
+    ident long_ok = make_ident(5000, 1);
+    ident short_ok = make_ident(lcp, 1);
+
+    long_ok.bytes = limit;
+    CHECK(disk_cache_can_replace(view_of(long_ok), view_of(short_ok), MIN_TOKENS));
+
+    long_ok.bytes = limit + 1;
+    CHECK(!disk_cache_can_replace(view_of(long_ok), view_of(short_ok), MIN_TOKENS));
+
+    // the pre-write estimate (small) must not be used while the real size (over the
+    // limit) is what load() would see
+    long_ok.bytes = limit + 1024;
+    CHECK(!disk_cache_can_replace(view_of(long_ok), view_of(short_ok), MIN_TOKENS));
 }
 
 void test_can_replace() {
@@ -278,6 +466,27 @@ void test_classify_duplicate() {
     ident d = c;
     d.ids = { "img-B" };
     CHECK(disk_cache_classify_duplicate(view_of(c), view_of(d), true) == disk_cache_duplicate::none);
+
+    // a differing token length shares the file name but is never a duplicate
+    ident longer = c;
+    longer.toks.push_back(7);
+    CHECK(disk_cache_classify_duplicate(view_of(c), view_of(longer), true) == disk_cache_duplicate::none);
+    CHECK(disk_cache_classify_duplicate(view_of(longer), view_of(c), true) == disk_cache_duplicate::none);
+
+    // a shorter prefix of the same prompt is not a duplicate either
+    ident shorter = c;
+    shorter.toks.resize(8);
+    shorter.idx.clear();
+    shorter.cnt.clear();
+    shorter.ids.clear();
+    CHECK(disk_cache_classify_duplicate(view_of(c), view_of(shorter), true) == disk_cache_duplicate::none);
+
+    // an unverifiable description can never be classified as identical, even
+    // against itself: the chunk runs past the end of the prompt
+    ident broken = c;
+    broken.cnt = { 20 };
+    CHECK(!disk_cache_media_valid(view_of(broken)));
+    CHECK(disk_cache_classify_duplicate(view_of(broken), view_of(broken), true) == disk_cache_duplicate::none);
 }
 
 void test_suppresses_write() {
@@ -330,7 +539,10 @@ int main() {
     test_plain_prefix();
     test_media_identity();
     test_media_boundary_clamp();
+    test_bidirectional_earliest_difference();
+    test_media_structural_validity();
     test_cost_guard();
+    test_cost_boundary();
     test_can_replace();
     test_can_replace_with_media();
     test_identity_equal();

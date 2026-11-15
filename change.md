@@ -1196,3 +1196,119 @@ GitHub 仓库首页不渲染任何 README：仓库中只有 `README_CN.md` 与 `
   - 多 slot（`-np > 1`）与多用户：本轮明确不实现
   - Linux/POSIX 构建：未执行；本轮未引入平台相关 API
   - 取消/中断路径：未构造用例
+
+# 2026-11-15 21-35 - Change Record（test1_2 修复轮：双向媒体、真实字节、路径所有权）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-15 20-53 - test1_2` 修复轮要求，修正三处可由源码直接定位的风险。基线 HEAD `6f9b0de`（上一轮提交 `0c289e7` 为算法改动）。
+
+- **A 双向媒体匹配被短路**：`disk_cache_match_prefix()` 用 `!media_side_ok(a,b) || !media_side_ok(b,a)`，C++ 短路语义下第一方向发现差异时第二方向不执行，因此 `clamp_to` 不保证是最早的媒体不一致位置。
+- **B 删除短快照时用估算字节**：`worker()` 调 `drop_prefixes(..., bytes)`，其中 `bytes = pending.bytes` 是写前估算；`load()` 的成本守卫用的是 `e.size_file`。估算与实际在阈值附近时可能删掉唯一经济可恢复的短快照。
+- **C hash 相同但 token 长度不同跳过检查**：精确去重只在 `e.hash == hash && e.tokens.size() == …` 时才分类，长度不同直接跳过；而 `write_entry()` 的文件名由 hash 决定并先 `fs::remove(path)` 再 `fs::rename`。另外同名 `quarantined` 条目仍在占路径，新写入可能与其争用同一文件名。
+
+本轮不改变 v8 条目格式、v3 清单、CRC 覆盖、配置签名、`load()` 的校验与恢复顺序、`768 KiB/token` 与 4096-token lag 常量、采样与 `n_past`；不新增开关、不新增第二通知通道、不引入新文件命名协议。
+
+## 修改文件
+
+### tools/server/server-disk-cache-match.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-disk-cache-match.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-disk-cache-match.cpp（上一轮版本）
+- 修改后路径：同名文件
+- 修改位置：匿名命名空间的 `media_structurally_ok` / `media_side_earliest_difference`、`disk_cache_match_prefix()`、`disk_cache_identity_equal()`、`disk_cache_classify_duplicate()`
+- 具体变更：
+  - **A**：`media_side_earliest_difference()` 取代原 `media_side_ok()`，一次调用只负责一个方向并返回该方向的最早差异（或 `limit` 表示一致）。`disk_cache_match_prefix()` 无条件求两个方向，再取 `std::min`，不再有短路
+  - **A 结构校验**：`media_structurally_ok()` 除三数组等长外，还要求下标**严格递增**（顺带拒绝重复与乱序）、块长度非零、ID 非空、区间在 token 数以内且互不重叠；任一不成立时 `usable_lcp = 0`（fail-closed）
+  - **C**：`disk_cache_identity_equal()` 先校验两侧描述结构，不可验证时直接返回 false；新增 `disk_cache_media_valid()` 对外暴露该判断
+  - **C**：`disk_cache_classify_duplicate()` 的形参由 `same_hash_and_length` 改为 `same_hash`，文档说明长度不同也属冲突
+- 修改原因：规划 §一 A、§一 C、§三.1
+
+### tools/server/server-disk-cache-match.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-disk-cache-match.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-disk-cache-match.h
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_media_valid()`（新增）、`disk_cache_classify_duplicate()` 形参说明、`disk_cache_can_replace()` 的 `file_bytes` 语义说明
+- 具体变更：导出结构校验函数；明确 `same_hash` 语义（含长度不同）；明确 `file_bytes` 必须是已提交的真实大小
+- 修改原因：调用方需要区分"未验证描述"与"验证后不相等"
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_path_owner`（新增）、`disk_cache_counters`、`write_entry()` 声明、`drop_prefixes()` 形参、私有 helper
+- 具体变更：新增 `disk_cache_path_owner { free, identical, conflict }` 与 `_name()`；计数器新增 `n_path_conflicts`；`write_entry()` 增加 `path_owned` 形参；`drop_prefixes()` 形参改名 `committed_file_bytes` 并写明来源要求；新增 `claim_path_locked()` 声明与 `path_owner_scratch` 成员
+- 修改原因：规划 §一 C、§三.3
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_path_owner_name()`（新增）、`claim_path_locked()`（新增）、`write_entry()`、`worker()`、`store()`、`mirror()`、`drop_prefixes()`、`to_metrics()`
+- 具体变更：
+  - **C 路径所有权**：新增 `claim_path_locked(hash, path, wanted, what)`，在磁盘锁内解析目标路径：无记录 → `free`；有可用且身份全同的记录 → `identical`（写盘可跳过）；有可用但身份不同 → `conflict`（`n_hash_collisions` + `n_path_conflicts`，拒绝写入）；有隔离记录 → 尝试 `remove_file()`，成功则扣减 `total_size`、`notify_invalidated`、从 `entries` 移除并 `save_manifest()`，然后视为 `free`；失败则 `conflict`（`n_path_conflicts`）
+  - **C worker**：写盘前先调用 `claim_path_locked`；`identical` 按已有语义跳过（计 dedup），`conflict` 计 `n_enqueue_rejected` 并丢弃本次写入；只有 `free` 才继续写
+  - **C write_entry**：新增 `path_owned` 形参。为 false 且目标已存在 → 拒绝写入并删除临时文件；为 true 时 `rename` 失败才回退到"删除后重试"（此时残留只可能是无 `entries` 记录的孤儿），不再无条件 `fs::remove(path)`
+  - **B**：`worker()` 改为在确认新条目已进入 `entries` 之后才调 `drop_prefixes(..., size_file)`，传入的是从磁盘读回的真实 `size_file`（写前估算只用于队列/内存预算）；`drop_prefixes()` 形参更名 `committed_file_bytes`
+  - **C store/mirror**：循环改为对所有 `e.hash == hash` 的条目分类；身份全同**且记录可用**才计 `dedup`；身份不同计哈希冲突并拒绝；隔离条目不算"已存储"（否则同 prompt 会被永久判为重复），交由 worker 在写盘时解析路径
+  - 指标新增 `cache_disk_path_conflict_total`
+- 修改原因：规划 §一 B、§一 C、§三.2、§三.3
+
+### tools/server/tests/unit/test_disk_cache_match.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_match.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/tests/unit/test_disk_cache_match.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 `test_bidirectional_earliest_difference()`、`test_media_structural_validity()`、`test_cost_boundary()`；扩充 `test_media_identity()`、`test_classify_duplicate()`
+- 具体变更：新增两侧差异位置不同的确定性用例（A 的块在 12、B 的块在 4，两方向答案都是 4）并验证参数交换一致；多媒体块下"最早分歧优先"；结构校验的 8 类非法输入（数组不等长、空 ID、零长块、越界、重叠、乱序、重复位置）；部分覆盖的媒体块；成本守卫的等值 / +1 B / +1 KiB 边界；`classify_duplicate` 的"不同长度"与"不可验证描述"分支
+- 修改原因：规划 §一 A 的确定性用例要求、§5.2–§5.4
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：指标表、行为边界；projectSummary §3.1 不变量表与 §8 边界
+- 具体变更：补 `cache_disk_path_conflict_total`；写明"hash 命中就是路径命中"、双向扫描与结构校验、成本守卫用真实字节
+- 修改原因：规划 §二、§六
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real），共 4 次
+- 检查结果：通过，`0 FAILED`；`--version` 为 `0.9.0-dev (build 16, commit 6f9b0de)`
+
+- 已执行检查：**问题 A 的缺陷复现**（`tools/server/tests/unit/test_disk_cache_match.cpp` 新增用例）
+- 检查结果：**确认缺陷存在**。把 `disk_cache_match_prefix()` 临时改回原始 `!A || !B` 形式后重编译，同一用例失败：`usable_lcp == 4` 实际得到 **12**——第一方向在 12 处发现差异后，`||` 短路使第二方向未执行，更早的 4 未被发现。恢复修复版本后 12 组全部通过（`all disk-cache match checks passed`）
+
+- 已执行检查：隔离条目不再阻止同 prompt 重新缓存（`test-run/logs/fix3-w5.log`，`--cache-disk-ttl 2`，句柄持有 `.bin`）
+- 检查结果：**发现新缺陷并修复**。修复前 `store()` 先按 hash+长度判 `identical`，对已被隔离的条目也计 `dedup`，导致该 prompt 永远无法重新落盘（本轮首次尝试即出现）。改为"隔离条目不算已存储"后，同一 prompt 再次写入被 worker 在锁内回收了隔离条目并真实落盘：`stored 1385 tokens, 505.77 MiB`，`cache_disk_enqueue_dedup_total` 未增长
+
+- 已执行检查：路径所有权解析与写入拒绝（同日志，`--cache-disk-max 600`）
+- 检查结果：通过。`expired but could not be removed` → `quarantined ... over quota but could not be removed, keeping 505.77 MiB accounted for` → `failed to remove ... being used by another process`；最终 `cache_disk_entries 1 / cache_disk_bytes 5.30338e+08 / quarantined 1 / remove_failed 1`，长条目（330.03 MiB）被配额淘汰时隔离条目的账面字节未被抹除
+
+- 已执行检查：`write_entry()` 不再无条件删目标文件
+- 检查结果：通过。静态核对 + 上述运行日志中未出现 `refusing to write ... the path is not claimed` 或 `refusing to overwrite` 之外的失败；`rename` 回退分支只在 `path_owned=true` 时可用
+
+- 已执行检查：标准回归（`test-run/logs/fix3-reg.log`，发现开启 + both 捕获，双卡 `-ts 38,62`，语料 `E:\小说\正文.md`）
+- 检查结果：通过。`1385/0`、`4/1381`、`215/1381` 与上一轮逐项相同；输出 sha 相同（`fd7c5bda…`、`03e0e517…`）；`cache_disk_entries 1 / cache_disk_bytes 5.30544e+08 / hash_collision 0 / path_conflict 0`；`cache_prefix_nodes 3`
+
+- 已执行检查：强杀重启（`test-run/logs/fix3-restart.log`）
+- 检查结果：通过。`1 entries (manifest 1, header 0, stale index records 0)`，`1 entries after scan, 1 after dedup/trim`，`prefix discovery: ... 1 snapshot(s) registered`；请求恢复 `cache_n=1381`，无同路径双记录
+
+- 已执行检查：`git status`、临时产物清理
+- 检查结果：通过。8 个测试缓存目录（约 4 GiB）、句柄脚本、临时编译脚本/可执行文件、构建日志均已删除；`test-run/` 降至 809 KB。清理过程中有一个后台 python 进程仍持有 `.bin` 句柄导致 `rm` 失败（`Device or resource busy`），该进程正是测试用的句柄持有者；终止后删除成功——这同时反证了 Windows 上的句柄确实会阻止删除
+
+- 未执行的检查及原因：
+  - **问题 B 的端到端边界复现**：需要在 `pending.bytes` 与真实 `size_file` 之间构造"估算过阈值而实际不过"的差异，并要求该条目对同一短前缀恰好落在 `768 KiB/token` 附近。本机条目体积由检查点主导（1.4K token 条目 505 MiB，检查点占大头），可控地构造该边界需要直接改序列化内容，属于人为注入非真实输入，因此**只做了单元测试覆盖**（`test_cost_boundary` 覆盖等值 / ±1 B / ±1 KiB 与 `can_replace` 的两种结果），代码层面已确保只传 `size_file`
+  - **跨进程 hash 文件名冲突的端到端构造**：无法在合理时间内找到 64 位 hash 碰撞，`claim_path_locked` 的 `conflict` 分支只有单元测试（`classify_duplicate` 的不同长度/不同媒体分支）与静态核对
+  - **真实媒体 prompt**：测试机为纯文本，媒体相关分支全部由单元测试覆盖
+  - 多 slot、Linux、中断路径：本轮范围外

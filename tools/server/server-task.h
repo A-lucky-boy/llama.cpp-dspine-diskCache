@@ -628,6 +628,17 @@ enum class disk_cache_remove_status {
 
 const char * disk_cache_remove_status_name(disk_cache_remove_status status);
 
+// ownership of the file name a write is about to use. the name is derived from
+// the content hash, so a hash hit is a *path* hit: it has to be resolved before
+// anything is written, never overwritten blindly
+enum class disk_cache_path_owner {
+    free,       // nobody holds it, or a quarantined holder was reclaimed
+    identical,  // a usable entry with the very same identity already holds it
+    conflict,   // another prompt, or a quarantined holder that could not be freed
+};
+
+const char * disk_cache_path_owner_name(disk_cache_path_owner owner);
+
 // why a lookup did not reuse any tokens. the names go into the --cache-stats
 // log line and the /metrics label set, so only append new values
 enum class cache_reject_reason : uint8_t {
@@ -678,7 +689,8 @@ struct disk_cache_counters {
     uint64_t n_enqueue_dedup        = 0; // already stored, already queued or covered by a longer entry
     uint64_t n_enqueue_rejected     = 0; // over the size limit or the queue budget
     uint64_t n_remove_failed        = 0; // files that could not be deleted, cumulative
-    uint64_t n_hash_collisions      = 0; // hash/length hit with a different identity, cumulative
+    uint64_t n_hash_collisions      = 0; // stored path with a different identity, cumulative
+    uint64_t n_path_conflicts       = 0; // writes refused because the path stayed occupied, cumulative
     uint64_t n_quarantined          = 0; // entries currently excluded from lookups
     uint64_t n_entries              = 0;
     uint64_t n_bytes                = 0; // accounted disk usage (total_size)
@@ -961,6 +973,10 @@ struct server_disk_cache {
     // monotone sequence of entry state changes, handed to the prefix directory
     uint64_t                event_epoch = 0;
 
+    // outcome of the last claim_path_locked() call, read right after it returns.
+    // only exists to avoid allocating a result object on the worker's hot path
+    disk_cache_path_owner  path_owner_scratch = disk_cache_path_owner::free;
+
     // hashes of entries that are queued or being written, so store() and
     // mirror() do not enqueue the same prompt twice
     std::unordered_set<uint64_t> inflight;
@@ -972,6 +988,13 @@ private:
     // the single deletion primitive: reports whether the bytes are really gone.
     // it does not touch `entries`, `total_size` or the manifest
     disk_cache_remove_status remove_file(const std::string & path) const;
+
+    // resolve the ownership of the path a write of `wanted` (hash `hash`) would
+    // use; mtx must be held. a quarantined holder is reclaimed here when the file
+    // can really be removed, because a quarantined entry must not occupy a path
+    // that a valid write needs
+    disk_cache_path_owner claim_path_locked(uint64_t hash, const std::string & path,
+            const disk_cache_prompt_identity & wanted, const char * what);
     // keep a file that could not be deleted out of the lookup path without
     // pretending its bytes were freed; mtx must be held
     void quarantine_entry(server_disk_cache_entry & e, const char * why);
@@ -979,7 +1002,10 @@ private:
     void notify_committed(const server_disk_cache_entry & e);
     void notify_invalidated(const std::string & path);
 
-    bool write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out);
+    // serialize and atomically commit an entry. `path_owned` tells the writer that
+    // the target name has already been resolved as unowned under the cache lock,
+    // which is the only situation in which an existing file there may be replaced
+    bool write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out, bool path_owned = false);
     // read, validate and decode one entry file. every checksum and the
     // packed<->index consistency are verified here, before the caller restores
     // anything into the contexts
@@ -991,9 +1017,12 @@ private:
     // remove entries whose prompt is a strict prefix of the given prompt
     // (and whose media chunks are a subset of the given ones): the longer
     // entry serves any lookup the shorter one would
+    // `committed_file_bytes` must be the real size of a file that is already on
+    // disk and admitted into `entries` - a pre-write estimate may not decide
+    // whether an existing snapshot is deleted
     void drop_prefixes(const llama_tokens & ids, const std::vector<uint32_t> & media_indices,
             const std::vector<uint32_t> & media_token_counts, const std::vector<std::string> & media_ids,
-            size_t pending_bytes);
+            size_t committed_file_bytes);
     // true when a stored entry already shares all but a short tail of the given
     // prompt **and** could actually be restored for it (media-compatible over the
     // shared prefix, cost guard satisfied), so rewriting would cost more than the

@@ -1094,3 +1094,182 @@ Load：
 - `projectSummary.md`：仅更新整个项目已实现的缓存结构与“可替代条目”的一致性约束。
 - 本文件保持为实验规划和算法修改日志，不收录未来收益预测、测试数值估计、性能计算报告、早停条件或最终性能优劣判定。
 - 此修复完成前，不授权新缓存文件格式、新 KV 分块物理对象或新的前缀自动捕获算法实现。
+
+---
+
+# 2026-11-15 20-53 - test1_2
+
+## 一、实验性质、前置核验与目标
+
+**性质：对当前缓存可替代性实现进行缺陷修复，不启动新的算法实验。** 保留现有全部实验设计记录和代码改进；本轮仅校正媒体前缀匹配、长短快照替代的真实字节代价，以及内容哈希文件名发生冲突或已被隔离文件占用时的写入安全。此任务限定为单用户、单实例、单 slot（`-np 1`），不涉及多租户、分布式或多 slot 调度。
+
+**已核对依据**：在规划前检查仓库 `change.md` 最新 `2026-11-15 20-47` 条目、`projectSummary.md`、本次交付的 `2026-11-15-replacement-semantics-change.md`，以及远程实际实现。当前审阅时 GitHub `main` 为 `6f9b0decd42e2d19368fe83d0f48acf0067b4986`（文档提交），可替代性算法代码在 `0c289e7044f2f9dc18876d7c1a13bd25c9f3e18e`。已将该代码与修复前 `bc0c9c97414022c30fe72f7d363ca2ed9350f888` 以及上游能力改造前的仓库 baseline `eb7681889f44304d2bd5b3e41572f5530af91a1d` 进行提交文件差异检查。特别查看 `tools/server/server-disk-cache-match.cpp/.h`、`tools/server/server-task.cpp`、`tools/server/tests/unit/test_disk_cache_match.cpp` 和 `src/llama-context.cpp` 的序列状态 API。
+
+已确认新匹配模块让写入抑制/去重与 `load()` 的前置筛选共用元数据逻辑，且隔离条目已被过滤；**此前报告的主要修复保留**。但是，当前实现另有以下三处可由源码直接定位的逻辑风险，必须先补齐，才能进一步规划新的物理缓存实验。静态发现不代表已完成实验机动态复现；实验人员应先按下列独立单测构造复现，然后修复。
+
+### 问题 A：双向媒体匹配使用短路 `||`，可能未检查更早的另一侧差异
+
+**代码位置**：`tools/server/server-disk-cache-match.cpp` → `disk_cache_match_prefix()`：
+
+```cpp
+if (!media_side_ok(a, b, res.usable_lcp, &clamp_to) ||
+        !media_side_ok(b, a, res.usable_lcp, &clamp_to)) {
+    res.usable_lcp = clamp_to;
+}
+```
+
+这里的 `||` 具有 C++ 短路求值语义。若第一方向发现不一致，第二方向不会执行；而第二方向可能存在更靠前的差异，当前 `clamp_to` 便不一定是最早的媒体不一致位置。源代码声称进行“双向比较”，但控制流不能保证双向都被扫描。因 `load()` 也使用该结果选择可恢复前缀，本问题优先于任何性能优化。
+
+**必须实现**：
+
+1. 将两方向检查分别计算，并把结果取逻辑与；无论先前方向是否发现不一致，都执行另一个方向。保留同一个 `clamp_to` 作为最小差异位置，或让两个方向分别返回位置再取 `min`。
+2. 把媒体元数据完整性核验与身份比较分开。至少要求三数组形状一致；在 helper 接受的元数据范围内，区间合法、顺序合法、不重叠、数量非零、ID 非空。对无法验证的输入应 fail-closed（可用前缀 0），不能仅因为数组长度一致便信任其结构。
+3. 不允许将媒体身份不同的 token 区间加入可用前缀；媒体分叉边界如落在块内部须钳制到块起点。对于来自真实 `server_tokens` 的正常输入，保留此前相同身份可命中的语义。
+4. 更改应集中于纯元数据 helper；`read_entry()` 的 CRC 校验与 `llama_state_seq_set_data_ext` 的调用顺序完全不变。
+
+**确定性单元测试构造**（不加载模型）：构造同一 token ID 序列、有效的非重叠媒体描述，A 的媒体块在偏后位置（如 12），B 的块在更早位置（如 4），两方向的不匹配位置不同；分别测试 `match(A,B)` 与 `match(B,A)`，确保 `usable_lcp` 均不超过**最早**不匹配的媒体起点，不能依赖参数顺序。再增加多块、同一媒体 ID 但 token_count 不同、块区间部分覆盖、元数据越界/重叠/乱序及空 ID 的输入测试。构造测试时应同时检验源 token placeholder 约束，明确区分“helper 的完整输入域”与“当前模型实际可产生的 prompt”。
+
+### 问题 B：删除短快照时，长快照的恢复成本采用估算字节而非实际文件大小
+
+**代码位置**：`tools/server/server-task.cpp` → `server_disk_cache::worker()`：`write_entry(pending, path, size_file)` 已经得到写入后**真实 `size_file`**，但后续调用 `drop_prefixes(..., bytes)`；其中 `bytes = pending.bytes`。`drop_prefixes()` 随后把该估算值写入 `longer.file_bytes` 并交由 `disk_cache_can_replace()`，而真正的 `load()` 用 `e.size_file` 进入成本守卫。
+
+这不满足“替代性判断必须与实际 load 成本门槛一致”的不变量。哪怕估算与实际只差文件头/packed 元数据的几 KiB，只要位于阈值附近，仍可能删除唯一可以经济恢复的短快照。
+
+**必须实现**：
+
+1. `worker()` 必须向 `drop_prefixes()` 传递当前已成功写入的**真实 `size_file`**，不能传 `pending.bytes`。函数参数命名应改为 `committed_file_bytes` 或等价名称，清楚指示来源。
+2. 如果当前新写文件在 `enforce_limit()` 中被立即淘汰，则不能以它作为替代依据继续移除短快照。应调整提交/去重/配额流程，保证先确认长快照实际存活，再做可能破坏短快照的删除；或者为配额场景保守保留短快照。文件成功落地不等同于它已被最终 manifest 接纳。
+3. 当被保留的长条目来自 `entries`，统一使用 `e.size_file`；当新长条目来自后台写盘结果，统一使用写完后的 `size_file`。写前估算仅允许用于排队、RAM pinned memory 和预配额预算，不允许决定现存可用快照是否应删除。
+4. 执行任何实际文件删除前，还必须核对新长条目未被隔离、未发生 hash 文件名冲突，并且将作为可查询的有效条目存在。
+
+**确定性边界测试**：构造短前缀长度为 `L`，长快照 `pending.bytes` 不超过 `L × 768 KiB`、但实际文件大小 `size_file` 超过该值的情况；检查短条目保留、`load()` 没有被迫使用不可经济恢复的长条目。另测实际字节恰好等于阈值、差 1 B、差 1 KiB 的行为。
+
+### 问题 C：hash 相同但 token 长度不同仍可走相同磁盘路径；隔离条目占用同名文件
+
+**代码位置**：`tools/server/server-task.cpp` → `store()`、`mirror()` 的精确去重循环仅在 `e.hash == hash && e.tokens.size() == pending.ids.size()` 时分类。若相同 hash 但 token 数不同，则直接跳过该检查；而 `write_entry()` 的文件名由 hash 决定，写入时仍先 `fs::remove(path, ec)` 再 `fs::rename(tmp, path, ec)`。这使“hash 不等于身份”的保护存在缺口。
+
+此外，已有 `quarantined` 条目被有意排除在复用和去重之外，但其同名 `.bin` 文件**可能仍然存在且占用配额**。如果新写入的请求与该条目使用相同 hash 路径，必须先解决目录对象所有权，而不能一边保留旧 `entries` 记录、一边覆盖或尝试覆盖相同文件名。
+
+**必须实现**：
+
+1. 对所有 `e.hash == hash` 的已存在条目先进行文件路径/身份冲突分类；只有 token 序列、media 元数据**完整一致且记录可用**时才可判 `identical`。长度不同也属于冲突，不能跳过。
+2. 对 hash 相同但身份不同的情况，立即**安全拒绝写入并记冲突原因**，既不能冒险覆盖同名文件，也不能虚报 `dedup`。本轮不引入新文件命名协议和新的持久化格式。
+3. 对同名已隔离条目：继续保留其真实字节账本。可以先在磁盘锁控制下尝试走现有 `remove_file()` 及引用失效流程；若删除不成功，必须返回“路径仍被占用/无法提交”的明确写入失败，而非覆写。若成功删除，应真实扣减旧条目占用并从 `entries` 移除，再允许新提交；不得出现两个 `entries` 同时指向同一路径。
+4. 后台 worker 写盘前必须再次核验路径保留状态：从 `store()`/`mirror()` 入队到实际写盘之间，索引与磁盘目录可能变化；**只有在确认目标路径所有权清晰时才能删除或替换文件**。不得因为单 worker 就假定前台查找、删除和后台 commit 没有并发。
+5. `write_entry()` 当前无条件尝试 `fs::remove(path, ec)` 的行为应改成受已验证路径所有权前提约束的写入行为；仍然通过临时文件 + 原子提交完成，不能直接写原始 `.bin`。
+6. 如发生文件名冲突，不改变 v8 格式和 manifest v3；保持已持久化快照、`total_size`、quarantined 及索引引用一致。`cache_disk_hash_collision_total` 与路径被隔离占用的情况应可区分，不混为成功去重。
+
+**单测/故障注入**：构造相同 hash、不同 token 长度（不需真正寻找 FNV 碰撞，可向 helper 注入同一个 hash）；相同 hash、相同长度但不同 media；同名 quarantined 文件被 Windows 打开句柄阻止删除；释放句柄后重新写入；后台入队期间旧条目失效；每种情况核验文件字节、`entries` 数量、账面配额、`manifest`、引用 epoch、写入统计。
+
+## 二、预期修改文件
+
+| 文件 | 修改位置和任务 |
+|---|---|
+| `tools/server/server-disk-cache-match.cpp` | 修复双向媒体检查短路；必要时加强媒体结构完整性检查；保留准确的 `usable_lcp` |
+| `tools/server/server-disk-cache-match.h` | 如需扩展 helper 结果状态，在此定义；不改变既有模型 API |
+| `tools/server/server-task.cpp` | `worker()` 向 `drop_prefixes()` 传真实文件字节；修复 hash/路径所有权检查、同名隔离条目安全处理及写入前路径审查 |
+| `tools/server/server-task.h` | 调整 `drop_prefixes()` 语义参数，必要时增加纯状态枚举；继续保留单一磁盘锁和 epoch 通知 |
+| `tools/server/tests/unit/test_disk_cache_match.cpp` | 添加媒体双向最早差异、参数交换一致、非法媒体、真实字节成本边界、同 hash 异长度测试 |
+| `tools/server/tests/unit/`、`test-run/` | 补写盘文件名冲突和隔离路径占用的最小复现与独立回归用例 |
+| `change.md` | 仅追加实际修改、差异、构建和验证记录 |
+| `projectSummary.md` | 仅更新**已落地**的状态/路径所有权不变量与文件删除规则 |
+
+如某一所列文件实际不存在对应实现，以当前 HEAD 为准；禁止新造重复缓存索引或第二条磁盘通知通道。
+
+## 三、算法与数据流的预期修改
+
+### 3.1 前缀匹配
+
+```text
+已有条目 A + 待查询请求 B
+  → raw token LCP
+  → A→B 的媒体差异边界
+  → B→A 的媒体差异边界  【两个方向均执行】
+  → 取最早媒体差异位置
+  → 对两侧媒体块范围进行合法边界钳制
+  → usable_lcp
+  → min_tokens / io_cost 守卫
+  → 旧有文件校验与 KV 状态恢复
+```
+
+不改 `candidate_lcp`、`restored`、`reused` 的定义，不对 token placeholder 做虚假拼接，也不因检出候选就写入模型状态。
+
+### 3.2 长快照替代短快照
+
+```text
+write_entry() 得到 actual_size_file
+  → 检查新条目最终有效性/路径所有权
+  → 用 actual_size_file 与短前缀有效长度进行成本比较
+  → 若能替代，才可通过原 remove_file() 删除短条目
+  → 更新账面字节、manifest、prefix invalidation epoch
+  → 若不能替代，则保留短条目
+```
+
+写入队列 `pending.bytes` 只服务于排队与内存预算，不能决定现有短文件的生死。
+
+### 3.3 文件名冲突与隔离占用
+
+```text
+待提交写入 (hash, token/media identity)
+  → 在磁盘锁保护下查询同名路径及其 entries 状态
+     ├─ 完全相同、有效 → 沿用已提交条目，不重复写入
+     ├─ 同 hash、不同身份 → 冲突拒绝，不触碰旧文件
+     ├─ 同 hash、原条目隔离且文件存在
+     │    → 尝试合法清理并真实调整账本
+     │       ├─ 可移除 → 释放路径后再提交
+     │       └─ 不可移除 → 明确失败，不覆盖、不伪报 dedup
+     └─ 无同名占用 → 临时文件落盘 → 原子提交 → manifest
+```
+
+不能把 hash 冲突判定逻辑混入 `server_prefix_index` 的 `observed/eligible` 状态机；文件路径所有权只由磁盘层负责。
+
+## 四、兼容性与实现纪律
+
+1. 只适配单用户、单实例、单 slot，保留后台 worker 与前台任务线程之间的锁语义。
+2. 继续使用缓存条目 **v8**、索引清单 **v3**、CRC64、现有 target/draft/checkpoint 状态格式和恢复失败清空 slot 的语义。
+3. `--cache-prefix-discovery` 保持元数据观察功能，不可用 `eligible`、`persisted` 替代 `reused_disk`。
+4. 不调整 `768 KiB/token`、4096-token 写入抑制门槛；也不因本轮修复而改变当前 `-np 1` 的选槽与实际 prefill 算法。
+5. 真正删除成功才扣减 `total_size`、撤销物理引用；删除失败时不得伪装为成功或绕过配额。
+6. 前缀索引中的提交/失效通知保持磁盘锁内同步与单调 epoch，不引入线程外第二通道；不允许反向锁调用。
+7. 所有新增候选身份判定以完整 token + media 三元组为准；hash 仅为目录索引键，不是语义等价证据。
+8. 不开发分块 KV、任意 token 区间状态导出、前缀主动重算、独立持久 trie、对象级去重或其他新缓存算法；本轮任务仅限已定位错误的修复与验证。
+
+## 五、验证检查清单
+
+### 5.1 版本与 baseline
+
+- [ ] 在实验机器读取最新 `change.md`、`projectSummary.md`、`git rev-parse HEAD`、`git status --short`，与本文件锁定的提交差异核对；如源码有更新先复核错误位置。
+- [ ] 与改造前 baseline 的磁盘缓存 LCP、选槽、CRC、状态恢复、写入文件路径语义对比；修复只触及匹配判定及磁盘文件提交/删除，不改变计算图。
+
+### 5.2 媒体匹配
+
+- [ ] 新增两侧媒体差异位于不同位置的确定性用例，验证每次都检查 A→B 和 B→A，不因 C++ `||` 短路漏掉较早分歧。
+- [ ] 参数交换、不同媒体 ID、同 ID 不同块长、多媒体块、部分共享媒体、块内前缀、非法区间/重叠/空 ID 分别检查；明确真实 prompt 的占位 token 约束。
+- [ ] 无媒体纯文本与相同媒体输入的历史兼容路径保持原语义；不改变 CRC 和 `read_entry()`。
+
+### 5.3 实际文件大小与短快照保护
+
+- [ ] 构造 pending 估算大小通过而写后真实字节大小未通过成本阈值的边界场景；短快照必须保留。
+- [ ] 真实字节恰好等于阈值、相差 1B、相差 1KiB 三种情况均由同一判断式处理。
+- [ ] 配额淘汰可能影响刚写入的长条目时，不得先不可逆地删除被其替代的短条目。
+- [ ] 可经济替代时原有去重/抑制路径仍可执行，失败删除保持账本真实。
+
+### 5.4 文件名与身份安全
+
+- [ ] 相同 hash 不同 token 长度、相同 hash 同长度不同 token、相同 hash 同 token 不同媒体均拒绝覆盖；不计成功 dedup。
+- [ ] 同名 `quarantined` 文件被句柄锁住时，新写入不能覆盖或产生重复 path 记录；释放句柄后流程可安全恢复。
+- [ ] 对 `write_entry()` 的目标路径存在与 `entries` 状态变化之间的交错做故障注入，确保 manifest、CRC、`total_size` 和 epoch 一致。
+- [ ] 强杀重启后的扫描不出现同一路径两个有效索引条目，不会读到文件内容与元数据对应错误的旧条目。
+
+### 5.5 单用户集成回归
+
+- [ ] `-np 1`、Windows/CUDA、真实 target + draft 组合下，冷启动、完全重复、分叉、追加、输入/输出边界捕获、存盘/读盘、强杀重启、隔离及配额压力测试。
+- [ ] `--cache-prefix-discovery` 开关两种模式下，原有输出一致性测试与 `prompt = reused_slot + reused_ram + reused_disk + prefill` 恒等式仍成立。
+- [ ] 现有纯 CPU 的 prefix-index 和 disk-cache-match 单测保留，不以单元测试替代真正文件/manifest 回归。
+- [ ] 检查 `cache_disk_hash_collision_total`、隔离、写入拒绝、真实文件数量与读盘拒绝原因可区分，不发生候选命中虚报。
+
+## 六、交付记录
+
+- 将实际代码修复、静态定位和已执行验证追加到 **`change.md`**，不要把尚未执行的测试写成已经通过。
+- 仅将项目当前**已经实现**的路径所有权、媒体匹配和快照生存期语义更新到 **`projectSummary.md`**。
+- 本 `betterModification.md` 仅保留规划与修改日志，不加入预想实验结果、停止训练条件、性能计算报告或优劣裁决。

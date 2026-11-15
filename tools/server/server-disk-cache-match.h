@@ -58,6 +58,12 @@ disk_cache_prefix_match disk_cache_match_prefix(const disk_cache_prompt_identity
 // prefix of `usable_lcp` tokens
 bool disk_cache_cost_ok(size_t file_bytes, size_t usable_lcp);
 
+// true when the media description is structurally usable: the three arrays agree
+// in length, indices are strictly increasing, chunks are non-empty, in range and
+// non-overlapping, and ids are non-empty. a description that fails this test is
+// never compared - match_prefix() reports usable_lcp 0 for it
+bool disk_cache_media_valid(const disk_cache_prompt_identity & id);
+
 // true when the two identities describe the same prompt: identical token ids and
 // identical media triples. a hash match alone never implies this
 bool disk_cache_identity_equal(const disk_cache_prompt_identity & a, const disk_cache_prompt_identity & b);
@@ -68,12 +74,13 @@ enum class disk_cache_duplicate {
     identical,  // same tokens and media - the write is redundant
 };
 
-// classify an exact duplicate. `same_hash_and_length` is the cheap index
-// condition the caller already computed; a hash/length hit whose identity differs
-// is reported as `none` so the caller refuses the write instead of treating a
-// collision as a duplicate
+// classify an exact duplicate. `same_hash` is the cheap index condition the caller
+// already computed; any other prompt that maps to the same hash - including one
+// with a different token length, which shares the file name - is reported as
+// `none` so the caller refuses the write instead of treating a collision as a
+// duplicate or overwriting the file
 disk_cache_duplicate disk_cache_classify_duplicate(const disk_cache_prompt_identity & existing,
-        const disk_cache_prompt_identity & wanted, bool same_hash_and_length);
+        const disk_cache_prompt_identity & wanted, bool same_hash);
 
 // true when `existing` already covers all but a short tail of `wanted`, and could
 // actually be restored for it: same media over the shared prefix, the tail within
@@ -84,6 +91,8 @@ bool disk_cache_suppresses_write(const disk_cache_prompt_identity & existing,
 // true when every request that `shorter` could serve would be served at least as
 // well by `longer`: `shorter` is a media-compatible token prefix of `longer`, and
 // restoring `longer` for such a request passes the cost guard. This is the only
-// condition under which a longer entry may supersede or suppress a shorter one
+// condition under which a longer entry may supersede or suppress a shorter one.
+// `longer.file_bytes` must be the real committed file size - a pre-write estimate
+// is not allowed to decide whether an existing snapshot survives
 bool disk_cache_can_replace(const disk_cache_prompt_identity & longer,
         const disk_cache_prompt_identity & shorter, size_t min_tokens);
