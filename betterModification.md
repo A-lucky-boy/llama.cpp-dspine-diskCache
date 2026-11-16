@@ -2440,3 +2440,164 @@ prefix_index::candidates()（只读，不改变观察数）
 第一步核查当前最新 `change.md`/源码与 baseline 差异，确认错误尚未被其他提交处理；第二步完成 token-position 语义修复及媒体门禁；第三步补齐确定性单测；第四步运行单用户纯文本请求、实际重启恢复与关闭态对照；第五步将真实变更追加到 `change.md`，同步项目总体结构至 `projectSummary.md`。
 
 **本轮授权范围只到已有主动前缀物化路径的正确性修复**，不开始新的物理 KV 格式、差量写入或范围读取实现。
+
+---
+
+# 2026-11-16 09-35 - test1_3
+
+## 一、实验目标与问题定位
+
+**本节仅修复当前单用户磁盘前缀缓存中的 in-flight 去重身份判定，不授权实施新的 KV 物理格式、分块持久化、压缩、主动捕获策略或其他缓存算法。** 已完成的前缀主动物化、target/draft 序列位置校验、媒体门禁、配额事务及跨重启恢复全部保留。
+
+目标是保证所有“跳过一条待写入快照”的结论均基于**完整 token/media 身份**，而非仅基于 64-bit 内容 hash。此修复针对的是本地缓存数据与写入队列的正确性，不是公网 API 安全，也无需设计多用户鉴权、多租户或多 slot 调度。项目仍只适配本机、单用户、单实例、`-np 1`；但前台请求与后台 writer 的锁同步要求必须保持。
+
+### 1.1 开始前已检查的版本与 baseline
+
+在提出本轮修复前，已先读取仓库最新 `change.md` 的 `2026-11-16 09-30` 条目、上传的 `2026-11-16-handover-v7-token-position-units.md`、`projectSummary.md`，随后逐一核对 GitHub 源码。
+
+- 仓库：`A-lucky-boy/llama.cpp-dspine-diskCache`。
+- 本次审查时远端 HEAD：`b4b831c29ece3086fb9d5cf9b849b478990bfc17`（说明文档提交）；功能代码提交：`d57d09c31a3f505ab6117f8ea2fdacf781c7970f`。
+- 原始 baseline：`eb7681889f44304d2bd5b3e41572f5530af91a1d`。
+- GitHub 对比显示现有缓存写入/恢复、公共前缀物化和媒体位置校验等功能已经落地。此前发现的 token/position 混用已按 position 域修正，纯文本下的独立前缀快照与重启复用有真实测试记录。
+- **需要指出本次缺陷的来源**：原始 baseline 已有 `std::unordered_set<uint64_t> inflight`，该问题不是最近才引入的；不过现行代码已经强化“hash 不是身份”的落盘条目判定，却尚未让排队中的条目遵守同一身份规则。因此新旧路径存在可明确定位的不一致。
+
+实验人员开始修改前，应在本地重新检查最新 `change.md`、`projectSummary.md`、HEAD、`git status --short`、当前实际构建二进制，并比较上述 baseline 与待改函数。若现场已修复本问题，需先审查差异，不应重复引入新结构。
+
+### 1.2 已确认的控制流缺陷
+
+**文件与位置**：
+
+- `tools/server/server-task.h`：`server_disk_cache::inflight`（当前约 1005 行）定义为 `std::unordered_set<uint64_t>`；
+- `tools/server/server-task.cpp`：`server_disk_cache::store()`（当前约 3933 行）、`server_disk_cache::mirror()`（约 4044 行）均执行 `if (inflight.count(hash)) { n_enqueue_dedup++; return; }`；
+- 同文件后台 `worker()` 多条处理分支使用 `inflight.erase(hash)` 释放占位（当前约 4287–4337 行）。
+
+已提交的磁盘条目会使用 `disk_cache_identity_equal()` / `disk_cache_classify_duplicate()` 对 token 序列与媒体三元组逐项核对；**但等待写入或正在写入的条目没有保存可比较的完整身份**。两个不同的 prompt A、B 若得到同一个 64-bit hash，B 进入 `store()`/`mirror()` 时会被误记为“已经在写入”，直接跳过，而不是被判为路径身份冲突。
+
+该行为的逻辑缺陷由源码确认，可以通过向元数据夹具注入相同 hash、不同 token/media 身份稳定重现；**目前没有证据表明用户实际请求中已经发生 hash 碰撞**，不得把构造性边界风险写成已发生的性能损失或错误恢复事件。
+
+此问题的核心不变量为：
+
+> `hash 相同 + 完整身份相同` 才可以视为 in-flight duplicate；`hash 相同 + 完整身份不同` 必须视为同一路径的身份冲突，安全拒绝而不是计入去重成功。
+
+## 二、预期修改文件
+
+| 文件 | 预期修改 | 目的 |
+|---|---|---|
+| `tools/server/server-task.h` | 将 `inflight` 从 `unordered_set<uint64_t>` 改为保存 hash 到**不可变、拥有自身内存的 token/media 身份**的有界映射；必要时添加私有身份结构 | 保证队列中、worker 已取走但尚未提交的条目都可用完整身份分类 |
+| `tools/server/server-task.cpp` | `store()`、`mirror()` 共用同一 in-flight 身份判断；在占位插入/删除和队列入队/出队处保持一致生命周期 | 相同身份正常去重，不同身份明确冲突，任何分支都不丢失占位或错误去重 |
+| `tools/server/server-disk-cache-match.h/.cpp` | 仅在确有必要时增加可独立测试的 in-flight 身份分类薄函数；优先直接复用已有 `disk_cache_identity_equal()` | 单测与生产路径共用真正的完整身份判定，不额外创造第二份语义 |
+| `tools/server/tests/unit/test_disk_cache_match.cpp` | 追加相同 hash 下的不同长度 token、同长度不同 token、相同 token 不同 media、完全相同身份四种分类测试 | 不依赖制造实际 64-bit 哈希碰撞即可稳定验证判断 |
+| `tools/server/tests/unit/` 或 `test-run/` | 添加最小队列/worker 测试夹具：写任务排队、被 worker 取出后、成功/失败/拒绝/取消清理等阶段 | 验证 `inflight` 占位从提交到释放的完整生命周期 |
+| `change.md` | 仅追加实施人员实际修改文件、代码差异与已执行的验证 | 保持算法修改日志和验证事实分离 |
+| `projectSummary.md` | 修复完成后更新“队列去重也必须匹配完整身份”这一已实现能力 | 项目总体说明只记录已落地事实 |
+
+不修改 `src/llama-context.cpp`、模型/草稿模型、`server-prefix-materialize.*` 的 token/position 语义，不改变文件格式 v8、清单 v3、CRC64、媒体身份编码、`768 KiB/token` 成本守卫及磁盘配额策略。
+
+## 三、算法变更与数据流
+
+### 3.1 保存 in-flight 对象的不可变身份
+
+目前的 `inflight` 仅保留 hash。改造后应保留可独立于 `pending`/`queue` 生命周期存在的轻量身份，例如：
+
+```cpp
+struct disk_cache_inflight_identity {
+    llama_tokens              tokens;
+    std::vector<uint32_t>    media_indices;
+    std::vector<uint32_t>    media_token_counts;
+    std::vector<std::string> media_ids;
+};
+
+std::unordered_map<uint64_t, disk_cache_inflight_identity> inflight;
+```
+
+以上为语义示例，允许使用项目现有轻量类型或 shared-owned immutable metadata，**不得在 map 中存放指向 `queue` 的元素指针、`string_view` 或在 worker `pop_front()` 后失效的引用**。不需要复制主/草稿的 GiB 级 KV buffer；这里只保存 token ID 与媒体块身份，长度由现有写队列数量上限约束。
+
+### 3.2 统一 `store()` 和 `mirror()` 的判定
+
+对已经通过现有 `disk_cache_pack()` 产生合法完整身份的待写对象 `pending`：
+
+```text
+待写入 prompt → 计算 hash + 提取完整 token/media identity
+    → 查询已提交 entries（维持现有完整身份/隔离判据）
+    → 查询 inflight[hash]
+       ├─ 不存在 → 继续既有覆盖抑制、队列预算和入队
+       ├─ 存在，且完整身份相同 → 计入 enqueue_dedup 并跳过
+       └─ 存在，完整身份不同 → 计入 hash collision/path conflict，拒绝该次写入
+```
+
+- 必须复用 `disk_cache_identity_equal()` 或其现有确定性逻辑，媒体三元组必须逐项完全一致；token 数相同或 hash 相同都不足以认定相同内容。
+- 对 hash 冲突只能拒绝当前写入，**不得**在既有 `pc-<hash>.bin` 上覆盖，不得篡改先到达写任务的队列对象；不需要改变 hash 算法或文件命名格式。
+- 对相同身份的正常 in-flight 重复请求仍按原 `n_enqueue_dedup` 语义处理。
+- 不修改先前已通过的 `covered_cheaply()`、配额准入、提交资格、隔离生命周期与前缀目录通知条件。
+
+### 3.3 占位生命周期覆盖 worker 的整个写入过程
+
+`inflight` 需要覆盖两个阶段：
+
+1. **已在队列中**：`queue.push_back()` 后，别的请求必须能看到该条目的完整身份。
+2. **worker 已出队但还没有结束提交/清理**：`pending` 虽已从 deque 移走，`inflight` 的身份仍须存在，直到成功提交或明确失败结束。
+
+每条已有的 `continue`/失败路径都必须释放占位，且释放操作与队列字节计数处于正确的磁盘锁保护之下。还需检查占位插入与 `queue.push_back()` 发生内存分配失败时不会留下“hash 永久占用但没有对应写任务”的状态；可使用小范围 RAII 或显式回滚，不需要另造后台线程。
+
+**并发处理**：只保留现有 `mtx` 及单一后台 writer。若 worker 在提交时从 `inflight` 释放 hash 并登记到 `entries`，必须保证这两个动作在同一个锁保护的不可观测临界区内完成，以免前台看到短暂“既不在 queue/inflight、也不在 entries”的空窗。
+
+### 3.4 与主动前缀物化的兼容
+
+主动前缀物化使用 `server_prompt_cache::materialize()` 导出完整 target/draft 序列，再调用既有 `disk->store()`。本轮不修改它何时在 prefill 安全点执行、如何得到 `expected_position_end`、是否跳过多模态输入，也不改变物化计数；仅让其进入写队列时的“排队中是否已经存在相同快照”的判断更准确。
+
+应补充现有主链路的回归测试，确保 `slot.prompt.tokens.size() < K` 的中间批次仍保持**等待下一批**而非置 `done`；`K == n_past`、`K == input_end` 等安全点仍能正常触发。上述检查是防止影响已实现功能的回归，**不在本轮重新设计捕获状态机**。
+
+## 四、对推理/训练流水线的影响
+
+- **训练**：无训练；不影响模型权重、数据或 checkpoint 训练流程。
+- **推理**：tokenize、选槽、KV 恢复、prefill、采样和 DSpine speculative decoding 不变。
+- **磁盘写入**：只改变 `store()`/`mirror()` 在已入库条目判定之后、写队列入队之前的 in-flight 完整身份比对；worker 负责保持该身份直到所有结果得到处理。
+- **恢复**：仍通过 `server_disk_cache::load()` 校验 CRC、v8 header、manifest 和 target/draft 状态；本轮不修改实际 KV bytes。
+- **统计**：碰撞与真正重复必须分开；不增加 `reused_disk`、`restored` 或前缀目录 `persisted` 的伪成功事件。
+- **部署**：单用户、本机、`-np 1`，不加入 API 权限、多租户和公网防护。
+
+## 五、兼容性与实施边界
+
+1. 默认配置与已有开关的含义保持不变，不增加新 CLI 参数。
+2. 文件命名 `pc-<hash>.bin`、磁盘格式 v8、manifest v3、CRC64、配置签名和 media 身份规则保持不变。
+3. 先到达并有效的 in-flight 条目不被碰撞请求替换；后到达的不等价对象返回可诊断的写入拒绝，而非计成功去重。
+4. in-flight 身份的存储上限与当前磁盘写队列有界容量一致；不另行持有 target/draft 主状态副本。
+5. 现有单调 `event_epoch`、锁内提交/失效通知、路径所有权与隔离记账必须保持。
+6. 当前媒体主动写盘门禁不变；不能借这次 hash 修复扩大未验证媒体 KV 捕获范围。
+7. 本节只修复已经确认的身份不一致缺陷，不启动新的捕获准入预检、物理分块、压缩、差量写入和范围恢复算法。
+
+## 六、验证检查清单
+
+### 6.1 版本与 baseline
+
+- [ ] 先核对当前实验机的 `change.md`、HEAD、工作树状态、二进制版本与 `projectSummary.md`；审阅 `server-task.cpp`/`server-task.h` 的最新实现，确认问题仍在。
+- [ ] 对照原始 baseline 与当前提交，说明 `inflight` 的 hash-only 语义是继承的旧限制，本轮修复只是让它和当前完整身份规则统一。
+- [ ] 确认 `store()`、`mirror()` 的代码只在需要时改动，仍共用相同元数据身份判定。
+
+### 6.2 哈希相同但身份不同
+
+- [ ] 在纯元数据测试夹具中**直接注入相同 hash** 而非寻找真实 hash 碰撞；覆盖：不同 token 长度、同长度不同 token、同 token 不同媒体 ID、同媒体 ID 不同起点/长度、完全一致身份。
+- [ ] 除完全一致身份外，其余同 hash 分支均不得增加 `enqueue_dedup`；必须返回明确的冲突/拒绝原因，不得修改先到达条目的任务和文件。
+- [ ] 真实相同身份的两次入队请求仍正常合并，不重复固定前缀快照写盘。
+
+### 6.3 后台队列状态
+
+- [ ] `queue` 中的 A 在等待时，提交同 hash 且不同身份 B；确认 B 拒绝而非 dedup，A 正常写盘。
+- [ ] worker 已 `pop_front()` 但尚未 `write_entry()` 完成时重复以上测试；不能因队列元素已移走而失去 in-flight 身份。
+- [ ] worker 正常写盘成功后，身份转移为 `entries` 的已提交身份；没有未持有锁的可观测空窗。
+- [ ] 依次注入 write_entry 失败、路径冲突、已被已有条目覆盖、quota 拒绝、回滚失败、worker 停止等分支；核查 map 占位全部按真实任务生命周期释放。
+- [ ] 注入入队内存分配失败或模拟异常，确认不会留下 `inflight` 孤儿 hash 和错误 `queue_bytes` 记账。
+
+### 6.4 单用户现有算法回归
+
+- [ ] 运行已有磁盘媒体身份、quota、prefix-index 与 prefix-materialize 四套独立单测。
+- [ ] 单用户单 slot 的纯文本 `A+B / A+C / A+D` 前缀物化序列，保留中途批次、`K == n_past` 与 `K == input_end` 的正确流转。
+- [ ] 使用现有固定配置重启服务器，确认 `source=disk` / `restored` / `reused_disk` 真实复用；只以真正保存和恢复的文件建立 persisted 引用。
+- [ ] 关闭新物化功能后与开启态对照，验证推理输出一致、`prompt = reused_slot + reused_ram + reused_disk + prefill` 恒等式。
+- [ ] 本轮不要求真实媒体端到端；现有 `media_state_unverified` 的主动捕获门禁继续生效，且多模态正常推理能力不应受影响。
+
+## 七、交接与记录
+
+将实际文件修改、直接定位到的错误分支、确实执行过的单测/故障注入/端到端检查追加到 `change.md`。只有已实现并验证的总体语义写入 `projectSummary.md`。
+
+本 `betterModification.md` 只记录实验规划与算法修改日志，不填写预想的性能数值、未执行的实验结果、训练早停、计算资源报告和最终优劣判定。保留此前的全部规划记录，当前修复完成后再重新核对最新 `change.md` 与 baseline 差异，评估下一项算法实验。

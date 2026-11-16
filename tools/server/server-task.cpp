@@ -3852,6 +3852,45 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
     return true;
 }
 
+// The in-flight table answers one question: a write that wants path `hash` - is
+// that path already spoken for, and by the same prompt?
+//
+// A bare hash cannot distinguish the two outcomes. The same prompt queued twice is
+// a duplicate to merge; a different prompt mapping to the same hash is a conflict,
+// and merging it would silently drop a snapshot that was never written. The
+// identity comparison is the existing `disk_cache_classify_duplicate()`, so the
+// queued case and the stored case agree on what "the same prompt" means.
+server_disk_cache::inflight_verdict server_disk_cache::inflight_check_locked(
+        uint64_t hash, const disk_cache_prompt_identity & wanted) const {
+    const auto it = inflight.find(hash);
+    if (it == inflight.end()) {
+        return inflight_verdict::free;
+    }
+
+    const disk_cache_prompt_identity queued = it->second.view();
+
+    // same_hash = true: the hash only selected the candidate, the identity decides
+    if (disk_cache_classify_duplicate(queued, wanted, true) == disk_cache_duplicate::identical) {
+        return inflight_verdict::duplicate;
+    }
+
+    return inflight_verdict::conflict;
+}
+
+void server_disk_cache::inflight_add_locked(uint64_t hash, const server_disk_cache_pending & pending) {
+    inflight_identity id;
+    id.tokens             = pending.ids;
+    id.media_indices      = pending.media_indices;
+    id.media_token_counts = pending.media_token_counts;
+    id.media_ids          = pending.media_ids;
+
+    inflight[hash] = std::move(id);
+}
+
+void server_disk_cache::inflight_erase_locked(uint64_t hash) {
+    inflight.erase(hash);
+}
+
 void server_disk_cache::store(server_prompt_cache_state && state) {
     if (!active) {
         return;
@@ -3930,10 +3969,26 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
             return;
         }
 
-        if (inflight.count(hash)) {
-            SRV_TRC("disk cache: %016" PRIx64 " is already queued, skipping\n", hash);
-            counters.n_enqueue_dedup++;
-            return;
+        // queued or being written. a hash hit is not yet an answer: the identity
+        // decides whether this write is the same prompt again or a different one
+        // competing for the same path
+        switch (inflight_check_locked(hash, pending_identity)) {
+            case inflight_verdict::duplicate:
+                SRV_TRC("disk cache: %016" PRIx64 " is already queued, skipping\n", hash);
+                counters.n_enqueue_dedup++;
+                return;
+
+            case inflight_verdict::conflict:
+                // a different prompt is on its way to this very path. merging it
+                // would drop this snapshot; writing over it is not allowed either,
+                // so the write is refused and reported
+                counters.n_hash_collisions++;
+                counters.n_path_conflicts++;
+                SRV_ERR("disk cache: %016" PRIx64 " is queued for a different token/media identity, refusing the write\n", hash);
+                return;
+
+            case inflight_verdict::free:
+                break;
         }
 
         if (covered_cheaply(pending_identity)) {
@@ -3958,10 +4013,33 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
         pending.drft        = std::move(state.data.drft);
         pending.checkpoints = state.prompt.checkpoints;
 
+        const size_t queued_bytes = pending.bytes;
+
         pending.hash    = hash;
-        queue_bytes    += pending.bytes;
-        inflight.insert(hash);
-        queue.push_back(std::move(pending));
+        queue_bytes    += queued_bytes;
+
+        // The placeholder goes in under the same lock the reader takes, so there is
+        // no window where the entry is queued but not yet known.
+        //
+        // Both the identity copy and the enqueue can throw. Taking the placeholder
+        // first means a throw from push_back would leave a hash marked in flight
+        // with no task behind it - every later write for that path would be
+        // answered "already queued" and never happen. So the accounting is unwound
+        // as a unit: on failure the placeholder and the byte counter both go back
+        try {
+            inflight_add_locked(hash, pending);
+        } catch (...) {
+            queue_bytes -= std::min(queue_bytes, queued_bytes);
+            throw;
+        }
+
+        try {
+            queue.push_back(std::move(pending));
+        } catch (...) {
+            inflight_erase_locked(hash);
+            queue_bytes -= std::min(queue_bytes, queued_bytes);
+            throw;
+        }
 
         counters.n_enqueue_queued++;
     }
@@ -4041,9 +4119,19 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
                     hash, e.path.c_str());
             return false;
         }
-        if (inflight.count(hash)) {
-            counters.n_enqueue_dedup++;
-            return false;
+        switch (inflight_check_locked(hash, pending_identity)) {
+            case inflight_verdict::duplicate:
+                counters.n_enqueue_dedup++;
+                return false;
+
+            case inflight_verdict::conflict:
+                counters.n_hash_collisions++;
+                counters.n_path_conflicts++;
+                SRV_ERR("disk cache: %016" PRIx64 " is queued for a different token/media identity, refusing the mirror\n", hash);
+                return false;
+
+            case inflight_verdict::free:
+                break;
         }
 
         if (covered_cheaply(pending_identity)) {
@@ -4066,10 +4154,27 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
         pending.drft        = state.data.drft;
         pending.checkpoints = state.prompt.checkpoints;
 
+        const size_t queued_bytes = pending.bytes;
+
         pending.hash    = hash;
-        queue_bytes    += pending.bytes;
-        inflight.insert(hash);
-        queue.push_back(std::move(pending));
+        queue_bytes    += queued_bytes;
+
+        // see store(): the placeholder and the queue entry are unwound together, so
+        // a failed enqueue never leaves a hash marked in flight with nothing behind it
+        try {
+            inflight_add_locked(hash, pending);
+        } catch (...) {
+            queue_bytes -= std::min(queue_bytes, queued_bytes);
+            throw;
+        }
+
+        try {
+            queue.push_back(std::move(pending));
+        } catch (...) {
+            inflight_erase_locked(hash);
+            queue_bytes -= std::min(queue_bytes, queued_bytes);
+            throw;
+        }
 
         counters.n_enqueue_queued++;
     }
@@ -4284,7 +4389,7 @@ void server_disk_cache::worker() {
         if (redundant) {
             std::lock_guard<std::mutex> lock(mtx);
             queue_bytes -= std::min(queue_bytes, bytes);
-            inflight.erase(hash);
+            inflight_erase_locked(hash);
             SRV_TRC("disk cache: skipping %zu tokens, already covered by a stored prompt\n", n_tokens);
             continue;
         }
@@ -4311,7 +4416,7 @@ void server_disk_cache::worker() {
             if (path_owner_scratch == disk_cache_path_owner::identical) {
                 // the very same prompt is already stored and usable
                 queue_bytes -= std::min(queue_bytes, bytes);
-                inflight.erase(hash);
+                inflight_erase_locked(hash);
                 counters.n_enqueue_dedup++;
                 SRV_TRC("disk cache: %016" PRIx64 " is already stored, skipping\n", hash);
                 continue;
@@ -4323,7 +4428,7 @@ void server_disk_cache::worker() {
         if (!path_ok) {
             std::lock_guard<std::mutex> lock(mtx);
             queue_bytes -= std::min(queue_bytes, bytes);
-            inflight.erase(hash);
+            inflight_erase_locked(hash);
             counters.n_enqueue_rejected++;
             continue;
         }
@@ -4334,7 +4439,7 @@ void server_disk_cache::worker() {
             std::lock_guard<std::mutex> lock(mtx);
 
             queue_bytes -= std::min(queue_bytes, bytes);
-            inflight.erase(hash);
+            inflight_erase_locked(hash);
 
             if (ok) {
                 server_disk_cache_entry committed;

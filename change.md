@@ -2147,3 +2147,177 @@ W srv load_model: --cache-prefix-materialize needs a disk cache tier (--cache-di
   - **target/draft 位置不一致的端到端**：运行中 `common_speculative_process()` 之后两者始终对齐，未能自然构造，也未能注入
   - **checkpoint 过滤**：本机 `--checkpoint-min-step` 默认 8192，且还需 `is_user_start` 或 `near_prompt_end`；上一轮用 14990 token 纯文本输入仍未触发任何 checkpoint。本轮同样未触发，**只有单测覆盖**；`tgt_pos_max` 替代 `K-1` 的改动在运行中未被执行
   - **context shift / 取消 / decode 重试**：未构造
+
+# 2026-11-16 10-10 - Change Record（test1_3：in-flight 去重改用完整身份）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 09-35 - test1_3` 修复写队列 in-flight 去重只按 64-bit hash 判定身份的不一致。基线 HEAD `b4b831c`，上一功能提交 `d57d09c`。本轮未改文件格式 v8、manifest v3、CRC64、媒体身份编码、读盘成本守卫与配额策略，也未触碰 `server-prefix-materialize.*` 的 token/position 语义。
+
+### 缺陷来源与性质
+
+`std::unordered_set<uint64_t> inflight` 是**原始 baseline `eb76818` 就有的**，不是新引入。但现行代码已在落盘条目一侧强化了"hash 不是身份"（`disk_cache_classify_duplicate()` / `disk_cache_identity_equal()` 逐项核对 token 与媒体三元组），而排队中的条目仍只看 hash。于是新旧路径对"同一条待写内容"的判定不一致：
+
+- prompt A 已入队
+- prompt B 与 A 得到同一个 64-bit hash，但 token 长度或媒体身份不同
+- B 进入 `store()` / `mirror()` 时被 `inflight.count(hash)` 判为"已经在写"，**计入 `n_enqueue_dedup` 并被静默丢弃**
+
+正确的行为是：hash 相同 + 完整身份相同 = 真正的 in-flight duplicate（合并）；hash 相同 + 完整身份不同 = 同一路径的身份冲突（拒绝并计入碰撞）。
+
+**没有证据表明用户实际请求中已发生 hash 碰撞**。这是由源码确认的逻辑不一致，用元数据夹具注入相同 hash 即可稳定重现。
+
+### 修复一：inflight 保存完整不可变身份
+
+`inflight` 由 `unordered_set<uint64_t>` 改为：
+
+```cpp
+struct inflight_identity {
+    llama_tokens              tokens;
+    std::vector<uint32_t>     media_indices;
+    std::vector<uint32_t>     media_token_counts;
+    std::vector<std::string>  media_ids;
+
+    disk_cache_prompt_identity view() const; // 非拥有视图，供比较使用
+};
+
+std::unordered_map<uint64_t, inflight_identity> inflight;
+```
+
+值**拥有自己的 token/media 内存**，不指向 `queue`：worker 在写完成前就把元素 `pop_front` 了，指向 deque 的指针恰好在最需要判定的时候失效。不保存 target/draft 的 KV buffer，容量由写队列的条目上限（`DISK_CACHE_QUEUE_MAX_ENTRIES = 8`）约束。
+
+### 修复二：store() 与 mirror() 共用同一判定
+
+新增三个私有方法，均在 `mtx` 保护下：
+
+- `inflight_check_locked(hash, wanted)` → `inflight_verdict{free, duplicate, conflict}`，内部调用**现有** `disk_cache_classify_duplicate(queued, wanted, same_hash=true)`——不另造第二份身份语义，队列侧与落盘侧对"同一 prompt"的定义因此一致
+- `inflight_add_locked(hash, pending)`：从 pending 自身数组拷出身份
+- `inflight_erase_locked(hash)`
+
+两处调用点由 `if (inflight.count(hash))` 改为三分支：
+
+- `duplicate` → `n_enqueue_dedup++` 并跳过（原语义不变）
+- `conflict` → `n_hash_collisions++` / `n_path_conflicts++`，记录明确错误并拒绝该次写入。不覆盖已有的 `pc-<hash>.bin`，不改动先到的写任务
+- `free` → 继续原有覆盖抑制、队列预算与入队
+
+### 修复三：占位生命周期与异常回滚
+
+占位覆盖两个阶段（规划 §3.3）：
+
+1. 入队后：`inflight_add_locked()` 与 `queue.push_back()` 在同一 `lock_guard` 内完成，没有"已入队但尚未登记"的窗口
+2. worker 出队后：四处释放点（已被覆盖而跳过、路径被占、路径冲突、写入结束）原本就在锁内伴随 `queue_bytes` 减记，改用 `inflight_erase_locked()` 封装
+
+**成功路径的原子性已核实**：`inflight_erase_locked(hash)` 与 `entries.push_back()` 位于同一个 `lock_guard` 作用域内，不存在规划 §3.3 所述"既不在 inflight、也不在 entries"的可观测空窗。
+
+**新增异常回滚**：`inflight_add_locked()` 与 `queue.push_back()` 都可能抛 `bad_alloc`。若先插占位再入队失败，会留下"hash 被永久占用但没有写任务"的孤儿状态，之后同一路径的每次写入都会被回以"already queued"而永不落盘。现改为两者作为整体回滚——占位与 `queue_bytes` 在任一失败时一并还原后重新抛出。
+
+## 修改文件
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`server_disk_cache::inflight` 声明与其后的新增成员
+- 具体变更：`unordered_set<uint64_t>` → `unordered_map<uint64_t, inflight_identity>`；新增 `inflight_identity` 结构、`inflight_verdict` 枚举、三个 `_locked` 私有方法声明
+- 修改原因：规划 §2、§3.1
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：新增三个 helper（置于 `store()` 之前）；`store()` 与 `mirror()` 的去重判定与入队段；`worker()` 的四处释放点
+- 具体变更：
+  - 三个 helper 的实现
+  - `store()` / `mirror()`：`inflight.count(hash)` 改为 `switch (inflight_check_locked(...))` 三分支；`conflict` 计入碰撞与路径冲突并记录错误
+  - `store()` / `mirror()`：入队段改为 try/catch 回滚，`queued_bytes` 在 move 前取出
+  - `worker()`：四处 `inflight.erase(hash)` → `inflight_erase_locked(hash)`
+- 修改原因：规划 §3.2、§3.3
+
+### tools/server/tests/unit/test_disk_cache_match.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_match.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：新增两组用例与 `<unordered_map>` 引入
+- 具体变更：
+  - `test_inflight_identity_verdict()`（7 组）：完全相同、不同 token 长度、同长度不同 token、同 token 不同 media id、同 media id 不同起点、含媒体但完全一致、hash 不同、结构非法
+  - `test_inflight_lifecycle()`：模拟 in-flight 表，覆盖入队即可见、worker 出队后仍可见、不同身份拒绝且首写者不受扰、相同身份合并、各终态释放后可重新入队、两个无关 hash 独立跟踪
+- 修改原因：规划 §6.2、§6.3、§2
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：行为边界；projectSummary §3.1 不变量表
+- 具体变更：新增"队列去重也须匹配完整身份"不变量
+- 修改原因：规划 §2、§7
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real），本轮 1 次
+- 检查结果：通过，`0 FAILED`。`--version` 为 `0.9.0-dev (build 35, commit b4b831c)`
+
+- 已执行检查：**缺陷复现**（把 `disk_cache_classify_duplicate()` 改回 hash-only 语义，即"同 hash 即 identical"）
+- 检查结果：**确认缺陷存在**，**12 项失败**，其中我本轮新增的 6 项全部命中：
+
+  ```
+  FAIL test_disk_cache_match.cpp:559-560  不同 token 长度（双向）
+  FAIL test_disk_cache_match.cpp:568      同长度不同 token
+  FAIL test_disk_cache_match.cpp:577      同 token 不同 media id
+  FAIL test_disk_cache_match.cpp:586      同 media id 不同起点
+  FAIL test_disk_cache_match.cpp:614      结构非法身份
+  ```
+
+  另有 6 项来自既有 `test_classify_duplicate`。恢复修复版后全部通过
+
+- 已执行检查：**in-flight 生命周期测试**（`test_inflight_lifecycle()`）
+- 检查结果：通过。覆盖入队即可见（`add` 后立即可判定）、worker 出队后仍可见（表中项不受 `pop_front` 影响）、冲突请求被拒且首写者身份未变（拒绝后 A 仍与自身判为 `duplicate`）、各终态释放后同一路径重新可用、两个 hash 独立跟踪。该表使用生产路径同一个 `disk_cache_classify_duplicate()`，不是第二份规则
+
+- 已执行检查：**成功路径原子性静态核实**
+- 检查结果：通过。`worker()` 中提交成功分支的 `inflight_erase_locked(hash)` 与 `entries.push_back()` 在同一个 `std::lock_guard<std::mutex> lock(mtx);` 作用域内，前台不会观察到"既不在 inflight、也不在 entries"的中间态，满足规划 §3.3
+
+- 已执行检查：**端到端核心链路**（`test-run/logs/fix10-x1.log`，`--cache-prefix-materialize`，`--cache-ram 512`，`--cache-disk-min-tokens 256`）
+- 检查结果：通过。
+
+  ```
+  plan_prefix_: materialize = skipped (no_candidates), n_past = 1476
+  plan_prefix_: materialize = scheduled, prefix = 2102 tokens, n_past = 1476
+  materialize_: materialize = exported, prefix = 2102 tokens
+  worker: disk cache: stored 2102 tokens, 538.51 MiB in 539.90 ms
+  metrics: scheduled 2 / exported 2 / cache_disk_entries 1 / persisted_refs 1
+  cache_disk_enqueue_dedup_total 1  (来自 covered_cheaply, 见下)
+  cache_disk_hash_collision_total 0 / cache_disk_path_conflict_total 0
+  ```
+
+  输出 sha 与上一轮逐字节一致：`f283d36a836120c4`、`452bdcadc89d353f`、`ad661337d3aa8896`、`b9febb26949711a2`
+
+- 已执行检查：`enqueue_dedup` 来源定位
+- 检查结果：本轮唯一那次 `enqueue_dedup` 来自第 69 行 `covered up to a 4096-token tail by a stored entry`（即 `covered_cheaply()`），**不是** in-flight 判定。单请求串行场景下 in-flight 冲突未自然触发，符合预期——规划 §6.2 本就要求用元数据夹具注入相同 hash，而非等待真实碰撞
+
+- 已执行检查：**重启后磁盘真实恢复**（`fix10-x1r.log`，同配置重启）
+- 检查结果：通过。`cache_scan_end: 1 entries, 538.51 MiB`、`1 snapshot(s) registered`；恢复 `source = disk, reused_disk = 2102, restored = 2102, read_bytes = 564668394`（与文件大小一致）；恒等式 `0 + 0 + 2102 + 394 = 2496` 成立
+
+- 已执行检查：**开启/关闭态输出一致性**（`fix10-off.log` vs `fix10-x1.log`，各 4 个相同请求）
+- 检查结果：通过。**8 个请求 sha 逐字节一致**。关闭态三个 materialize 指标与 `cache_disk_hash_collision_total` 全为 0、`cache_disk_entries 0`
+
+- 已执行检查：恒等式抽查（`fix10-x1.log`）
+- 检查结果：通过。`2504 = 0+0+0+2504`、`2468 = 1476+0+0+992`、`2506 = 1476+0+0+1030`、`2540 = 1478+0+0+1062`
+
+- 已执行检查：四套独立单测
+- 检查结果：通过。`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`
+
+- 已执行检查：清理
+- 检查结果：通过。测试缓存目录、临时编译脚本与可执行文件、`__pycache__`、根目录 `.obj` 均已删除；`test-run/` 为 1.3 MB
+
+- 未执行的检查及原因：
+  - **真实队列状态注入（规划 §6.3 的故障注入清单）**：`worker` 正常写盘、`write_entry` 失败、路径冲突、已被覆盖、quota 拒绝、回滚失败、worker 停止七个分支的**运行时注入未执行**。这些分支的占位释放已逐一静态核实（四处 `inflight_erase_locked` 均在锁内并伴随 `queue_bytes` 减记），但**没有在真实服务上人为触发过**
+  - **入队分配失败的异常回滚**：新增的 try/catch 回滚路径**只做了静态核对，未注入 `bad_alloc` 验证**。这需要人为制造内存分配失败，本轮未构造
+  - **`inflight` 表在真实多请求并发下的行为**：本机 `-np 1` 单请求串行，两个请求同时进入 `store()` 的情形未构造。`mirror()` 路径（`--cache-idle-slots` / idle flush）本轮未开启，其 in-flight 判定改动的运行验证未执行
+  - **媒体输入**：测试机无多模态模型；media 相关的 in-flight 分类由 `test_inflight_identity_verdict()` 与 `test_inflight_lifecycle()` 的元数据用例覆盖，`media_state_unverified` 主动捕获门禁保持原样，**未在真实媒体请求下验证**
+  - **context shift / 取消 / decode 重试**：未构造

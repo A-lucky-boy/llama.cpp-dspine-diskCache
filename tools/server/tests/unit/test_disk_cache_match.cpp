@@ -11,6 +11,7 @@
 #include "server-disk-cache-match.h"
 
 #include <cstdio>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -533,6 +534,197 @@ void test_suppresses_write() {
     CHECK(!disk_cache_suppresses_write(view_of(existing), view_of(short_wanted), MIN_TOKENS, LAG));
 }
 
+// ---------------------------------------------------------------------------
+// the in-flight table's verdict
+//
+// store() and mirror() both ask the same question about a hash that is already
+// queued: is this the same prompt, or a different one competing for the same path?
+// They ask it with disk_cache_classify_duplicate(queued, wanted, same_hash=true),
+// so the four outcomes are pinned here. The hash itself is deliberately NOT varied:
+// the point is that the hash only selects the candidate and the full identity
+// decides, which is exactly what a constructed hash collision exercises without
+// having to find one.
+// ---------------------------------------------------------------------------
+void test_inflight_identity_verdict() {
+    // identical tokens and no media: the same prompt queued twice -> duplicate
+    {
+        ident a = make_ident(64, 1000);
+        ident b = make_ident(64, 1000);
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), true) == disk_cache_duplicate::identical);
+    }
+
+    // same hash, different token length -> conflict, not duplicate
+    {
+        ident a = make_ident(64, 1000);
+        ident b = make_ident(48, 1000);
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), true) == disk_cache_duplicate::none);
+        CHECK(disk_cache_classify_duplicate(view_of(b), view_of(a), true) == disk_cache_duplicate::none);
+    }
+
+    // same hash, same length, different tokens -> conflict
+    {
+        ident a = make_ident(64, 1000);
+        ident b = make_ident(64, 2000);
+        CHECK_EQ(a.toks.size(), b.toks.size());
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), true) == disk_cache_duplicate::none);
+    }
+
+    // same tokens, different media id -> conflict
+    {
+        ident a = make_ident(64, 1000);
+        ident b = make_ident(64, 1000);
+        a.idx = { 10 }; a.cnt = { 4 }; a.ids = { "img-a" };
+        b.idx = { 10 }; b.cnt = { 4 }; b.ids = { "img-b" };
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), true) == disk_cache_duplicate::none);
+    }
+
+    // same tokens and media ids, different chunk start/length -> conflict
+    {
+        ident a = make_ident(64, 1000);
+        ident b = make_ident(64, 1000);
+        a.idx = { 10 }; a.cnt = { 4 }; a.ids = { "img-a" };
+        b.idx = { 20 }; b.cnt = { 4 }; b.ids = { "img-a" };
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), true) == disk_cache_duplicate::none);
+    }
+
+    // identical tokens AND identical media -> duplicate, even with media present
+    {
+        ident a = make_ident(64, 1000);
+        ident b = make_ident(64, 1000);
+        for (ident * x : { &a, &b }) {
+            x->idx = { 10, 40 }; x->cnt = { 4, 6 }; x->ids = { "img-a", "img-b" };
+        }
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), true) == disk_cache_duplicate::identical);
+    }
+
+    // a differing hash never matches, regardless of identity: unrelated writes are
+    // not classified at all
+    {
+        ident a = make_ident(64, 1000);
+        ident b = make_ident(64, 1000);
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), false) == disk_cache_duplicate::none);
+    }
+
+    // a structurally broken identity is never "identical", even against itself:
+    // the queued entry cannot vouch for a prompt whose media description is invalid
+    {
+        ident broken = make_ident(64, 1000);
+        broken.idx = { 10, 5 };  // out of order
+        broken.cnt = { 4, 6 };
+        broken.ids = { "img-a", "img-b" };
+        CHECK(disk_cache_classify_duplicate(view_of(broken), view_of(broken), true) == disk_cache_duplicate::none);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the in-flight placeholder lifecycle
+//
+// This mirrors what server_disk_cache::inflight does, using the very same
+// classify call the production helpers use, so the decision under test is the real
+// one and not a second copy of the rule. The hash is injected directly: the
+// scenario is "two prompts collide", which must not depend on finding a real
+// 64-bit collision.
+//
+// What it pins down:
+//   * a placeholder is visible from the moment the write is queued
+//   * it stays visible after the worker has taken the element out of the queue
+//   * a different identity is refused, and the first writer is untouched
+//   * the same identity is merged
+//   * the placeholder is released on every terminal path, so a later write of the
+//     same prompt is queued again instead of being answered "already queued"
+// ---------------------------------------------------------------------------
+struct inflight_table {
+    std::unordered_map<uint64_t, ident> live;
+
+    enum class verdict { free, duplicate, conflict };
+
+    verdict check(uint64_t hash, const ident & wanted) const {
+        const auto it = live.find(hash);
+        if (it == live.end()) {
+            return verdict::free;
+        }
+        return disk_cache_classify_duplicate(view_of(it->second), view_of(wanted), true)
+                == disk_cache_duplicate::identical ? verdict::duplicate : verdict::conflict;
+    }
+
+    void add(uint64_t hash, const ident & pending) { live[hash] = pending; }
+
+    void release(uint64_t hash) { live.erase(hash); }
+
+    size_t size() const { return live.size(); }
+};
+
+void test_inflight_lifecycle() {
+    using v = inflight_table::verdict;
+
+    const uint64_t colliding = 0xABCDEF0123456789ull; // deliberately shared by A and B
+
+    ident a = make_ident(64, 1000);
+    ident b = make_ident(48, 1000); // same hash, different length
+
+    inflight_table t;
+
+    // nothing queued yet
+    CHECK(t.check(colliding, a) == v::free);
+
+    // A is queued: its identity is visible right away
+    t.add(colliding, a);
+    CHECK_EQ(t.size(), 1);
+    CHECK(t.check(colliding, a) == v::duplicate); // the same prompt again
+    CHECK(t.check(colliding, b) == v::conflict);  // a different prompt for the same path
+
+    // the worker pops A off the queue. The placeholder must survive that, otherwise
+    // the very window in which a conflicting write is most likely would be blind
+    // (here the pop is modelled by nothing happening to the table at all)
+    CHECK(t.check(colliding, b) == v::conflict);
+
+    // A is committed: the placeholder turns into a stored entry. From the table's
+    // point of view that is a release; the entry side is a separate table
+    t.release(colliding);
+    CHECK_EQ(t.size(), 0);
+
+    // the path is now free for B, which was refused a moment ago
+    CHECK(t.check(colliding, b) == v::free);
+
+    // and A may be queued again too: the placeholder was not left behind
+    t.add(colliding, a);
+    CHECK(t.check(colliding, a) == v::duplicate);
+    t.release(colliding);
+    CHECK_EQ(t.size(), 0);
+
+    // a second, unrelated hash is tracked independently
+    ident c = make_ident(64, 5000);
+    t.add(colliding, a);
+    t.add(colliding + 1, c);
+    CHECK_EQ(t.size(), 2);
+    CHECK(t.check(colliding, b) == v::conflict);
+    CHECK(t.check(colliding + 1, c) == v::duplicate);
+    t.release(colliding);
+    CHECK(t.check(colliding, b) == v::free);
+    CHECK(t.check(colliding + 1, c) == v::duplicate);
+    t.release(colliding + 1);
+    CHECK_EQ(t.size(), 0);
+
+    // rejecting B must not have disturbed A's queued object: A is still exactly the
+    // prompt that was queued, and still merges with itself
+    t.add(colliding, a);
+    (void) t.check(colliding, b);
+    CHECK(t.check(colliding, a) == v::duplicate);
+    t.release(colliding);
+
+    // same tokens, different media: also a conflict, and also leaves the first
+    // writer intact
+    ident m1 = make_ident(64, 1000);
+    ident m2 = make_ident(64, 1000);
+    m1.idx = { 10 }; m1.cnt = { 4 }; m1.ids = { "img-a" };
+    m2.idx = { 10 }; m2.cnt = { 4 }; m2.ids = { "img-b" };
+    t.add(colliding, m1);
+    CHECK(t.check(colliding, m2) == v::conflict);
+    CHECK(t.check(colliding, m1) == v::duplicate);
+    t.release(colliding);
+    CHECK_EQ(t.size(), 0);
+}
+
 } // namespace
 
 int main() {
@@ -547,6 +739,8 @@ int main() {
     test_can_replace_with_media();
     test_identity_equal();
     test_classify_duplicate();
+    test_inflight_identity_verdict();
+    test_inflight_lifecycle();
     test_suppresses_write();
 
     if (g_failures == 0) {

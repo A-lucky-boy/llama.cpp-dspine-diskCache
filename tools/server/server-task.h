@@ -1000,9 +1000,55 @@ struct server_disk_cache {
     // only exists to avoid allocating a result object on the worker's hot path
     disk_cache_path_owner  path_owner_scratch = disk_cache_path_owner::free;
 
-    // hashes of entries that are queued or being written, so store() and
-    // mirror() do not enqueue the same prompt twice
-    std::unordered_set<uint64_t> inflight;
+    // Queued or being-written entries, keyed by hash, so store() and mirror() do
+    // not enqueue the same prompt twice.
+    //
+    // The value is the *complete* token/media identity, owned here rather than
+    // pointing into `queue`: the worker pops an element before it has finished
+    // writing it, so a pointer into the deque would dangle exactly when the check
+    // matters. A hash alone cannot tell "the same prompt is already on its way"
+    // from "a different prompt wants the same path", and the two need opposite
+    // answers.
+    //
+    // Only token ids and media metadata are kept - no KV buffers. The size is
+    // bounded by the write queue's own entry limit.
+    struct inflight_identity {
+        llama_tokens              tokens;
+        std::vector<uint32_t>     media_indices;
+        std::vector<uint32_t>     media_token_counts;
+        std::vector<std::string>  media_ids;
+
+        disk_cache_prompt_identity view() const {
+            disk_cache_prompt_identity id;
+            id.tokens             = &tokens;
+            id.media_indices      = &media_indices;
+            id.media_token_counts = &media_token_counts;
+            id.media_ids          = &media_ids;
+            return id;
+        }
+    };
+
+    std::unordered_map<uint64_t, inflight_identity> inflight;
+
+    // what a hash already in flight means for a write that wants the same path.
+    // `duplicate` is the normal case; `conflict` means the path is spoken for by a
+    // different prompt and the write must be refused, never merged and never
+    // written over the other one
+    enum class inflight_verdict {
+        free,
+        duplicate,
+        conflict,
+    };
+
+    // must be called with mtx held
+    inflight_verdict inflight_check_locked(uint64_t hash, const disk_cache_prompt_identity & wanted) const;
+
+    // must be called with mtx held. copies the identity out of `pending`'s own
+    // arrays, so nothing survives by reference
+    void inflight_add_locked(uint64_t hash, const server_disk_cache_pending & pending);
+
+    // must be called with mtx held
+    void inflight_erase_locked(uint64_t hash);
 
 private:
     // delete a broken entry (file + index + manifest); must not be called with mtx held
