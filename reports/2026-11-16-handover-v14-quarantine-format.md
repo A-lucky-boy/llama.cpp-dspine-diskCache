@@ -4,7 +4,9 @@
 |---|---|
 | 仓库 | `A-lucky-boy/llama.cpp-dspine-diskCache` |
 | 本次交付起点 | `03d806c`（会话前 HEAD，第十五轮交付说明） |
-| 本次交付终点 | 分支 `main` 顶端 |
+| 本次交付终点 | 分支 `main` 顶端（功能提交 `d91d5fc`） |
+| 功能提交 | `d91d5fc`（侧车格式、写前标记、fail-closed、替换语义修复） |
+| 构建产物 | `0.9.0-dev (build 51, commit d91d5fc)`，MSVC 19.44.35226，sm_86-real + sm_89-real |
 | 规划依据 | `betterModification.md` → `2026-11-16 15-22 - test1_5` |
 | 交付性质 | **事务一致性修复轮**（规划 §一：不启动新的存储算法实验） |
 
