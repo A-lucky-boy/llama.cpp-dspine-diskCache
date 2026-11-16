@@ -2522,3 +2522,190 @@ cache_prefix_materialize_preflight_export_allowed_total  // 放行的导出
   - **真实内存分配失败、worker 停止**：未注入
   - **媒体输入端到端**：测试机无多模态模型。`media_state_unverified` 主动捕获门禁未变，与 preflight 的相对顺序（门禁在规划阶段，preflight 在捕获阶段）未在真实媒体请求下验证
   - **context shift / 取消 / decode 重试**：`cancel_plan` 分支单测覆盖，运行中未构造
+
+# 2026-11-16 12-20 - Change Record（test1_5：分段无损压缩存储）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 11-25 - test1_5` 实施**分段无损快照编码**，并补上上一轮欠下的导出调用直接计数验证。基线 HEAD `a85e66c`，上一功能提交 `e004f71`。
+
+### 一、欠账补齐：preflight 拦下的路径不进入导出 API
+
+规划 §6.1 第 3 项明确要求"为已存在的导出前预准入分支提供一次**直接的测试构建函数调用计数**……不能只以累计导出日志作为证明"。上一轮我以 `exported_total` 与日志为证据，属间接证明，现已补齐。
+
+在 `server_prompt_cache::materialize()` 的两处 state API 调用点计数，由 `-DLLAMA_TEST_EXPORT_COUNTERS` 启用（release 构建零开销），经 `/metrics` 暴露：
+
+```
+cache_prefix_materialize_test_state_data_calls_total
+cache_prefix_materialize_test_state_size_calls_total
+```
+
+**实测结果**（测试构建，A+B/A+C/A+D 序列）：
+
+```
+preflight_export_allowed_total   1
+preflight_skip_total             1
+test_state_data_calls_total      1     ← 被 preflight 拦住的那次没有进入 get_data_ext
+test_state_size_calls_total      1
+```
+
+被拦下的请求（`preflight skip (covered by a committed entry)`）确实未调用 `llama_state_seq_get_data_ext()`——这是计数直接给出的结论，不再依赖日志推断。
+
+### 二、新增段 codec 模块
+
+`tools/server/server-disk-cache-codec.{h,cpp}`（新增）。**未引入外部依赖**：规划 §3.1 允许"优先评估 Zstandard"，但要求"必须固定版本、通过项目现有 CMake 显式链接，并保证无编码器时原 v8 路径仍能构建"。仓库内无 zstd，本地亦无可链接副本；引入外部库会使默认构建依赖网络获取，违背"无编码器时仍可构建"。因此实现了一个紧凑的内置 LZ77：
+
+- 字节令牌流：`flags`(bit0=带匹配) + `lit_len` varint + 字面量 + [匹配长度 tag + 距离 varint]
+- 单段最坏膨胀被 `disk_cache_codec_bound()` 界定；输出不小于输入时**回退为原样存储**
+- 纯函数、无全局状态、确定性（有单测固定）
+- 参数为 `const void*` + 长度，因为载体是两种容器（KV 状态是 `common_state_data`，checkpoint spec 是普通字节向量）
+
+**每段独立**是核心：段集合为 `main`、`drft`、以及每个 checkpoint 的 `spec`/`tgt`/`dft`，共 `2 + 3N` 段。`read_entry()` 只恢复一个 checkpoint，串联成单流会强迫解压无关段，并让一个坏字节毁掉整个文件。
+
+### 三、v9 文件格式
+
+**关键设计：v9 保留 v8 的全部前置字段顺序**，只在 checkpoint 表之后、payload 之前**追加**段表。
+
+理由是 `touch_entry()`：它就地在固定偏移重写 `last_used`（`DISK_CACHE_HDR_LAST_USED_OFFSET + sig_len + packed_size`，有 `static_assert(== 48)` 保护）。重排字段会让时间戳写入落在 CRC 上，把每个被 touch 的条目标记为损坏。追加到尾部则两版本共用同一偏移，无需改动 `touch_entry()`。
+
+段表每项：`raw_len(8) + stored_len(8) + codec(4) + encoded_crc(8)`，固定宽度，读端可先算表大小。
+
+写入方式：先写段表占位 → 逐段编码并写入（**复用单个 scratch 缓冲**，峰值额外内存是一段而非一份快照）→ `seekp` 回填段表。
+
+### 四、读取与校验
+
+- 版本由 header 决定（`v8` 或 `v9`），不由配置决定。v8 路径把每个段都描述为 verbatim，**与旧 payload 逐字节等价**，因此读写共用一套代码路径
+- 边界检查在分配之前：`raw_len`/`stored_len` 超限即拒绝
+- 段表声明的 raw 长度必须与 header 的 `size_main`/`size_drft` 及 checkpoint 表一致，否则判损坏
+- 解码结果必须**恰好**等于声明的 raw 长度，否则拒绝
+- `crc_main`/`crc_drft`/checkpoint 三 CRC 仍是**解压后**字节的校验；编码字节另有 `encoded_crc`
+- **未选中的 checkpoint 只按 `stored_len` seek 跳过**，不读不解压
+- `read_bytes` 报告 `stored_read`（真实物理读取），与解压后长度分开
+
+### 五、CLI
+
+```
+--cache-disk-codec none|lz    (默认 none)
+```
+
+未知取值在启动时抛错而非静默降级。规划 §3.5 还建议 `--cache-disk-zstd-level N`——**未实现**，因为 zstd 未集成（见上）。
+
+## 修改文件
+
+### tools/server/server-disk-cache-codec.h / .cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：tools/server/server-disk-cache-codec.h、tools/server/server-disk-cache-codec.cpp
+- 修改位置：段描述结构、codec ID/模式枚举、编解码与上界函数
+- 具体变更：见上
+- 修改原因：规划 §3.1、§4
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`codec_mode` 成员；构造函数与 `init_disk()` 签名；codec 头包含
+- 具体变更：见上
+- 修改原因：规划 §3.5、§4
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`DISK_CACHE_VERSION_SEGMENTED`；`disk_cache_crc64_raw()`；导出计数宏；`write_entry()` 版本与 payload 段；`read_entry()` 版本分派、段表读取与校验、`load_segment`；`scan()` 版本检查；构造函数与 `init_disk()`
+- 具体变更：见上
+- 修改原因：规划 §3.2、§3.3、§3.4、§6.1
+
+### common/common.h、common/arg.cpp
+
+- 修改类型：修改
+- 修改前路径：common/common.h、common/arg.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`cache_disk_codec` 字段；`--cache-disk-codec` 选项
+- 具体变更：见上
+- 修改原因：规划 §3.5
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-context.cpp
+- 修改后路径：同名文件
+- 修改位置：`init_disk()` 调用前解析 codec
+- 具体变更：未知取值抛错；启用时打印格式版本
+- 修改原因：规划 §3.5
+
+### tools/server/CMakeLists.txt
+
+- 修改类型：修改
+- 修改前路径：tools/server/CMakeLists.txt
+- 修改后路径：同名文件
+- 修改位置：源文件列表
+- 具体变更：加入 codec 源文件与头文件
+- 修改原因：规划 §4
+
+### tools/server/tests/unit/test_disk_cache_codec.cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：tools/server/tests/unit/test_disk_cache_codec.cpp
+- 修改位置：20 组用例
+- 具体变更：空段/短段(0..8)/不可压缩/可压缩/重复模式/混合段/段间独立/**长度不符拒绝**/**raw 长度不符拒绝**/**超出上界拒绝**/**未知 codec 拒绝**/**截断流失拒绝**/**匹配越过输出拒绝**/**回引到空输出拒绝**/**字面量越界拒绝**/空编码段拒绝/确定性/上界/长游程/模式名解析
+- 修改原因：规划 §6.2
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：行为边界；projectSummary §3.1 不变量表
+- 具体变更：新增"状态段可独立编码""v9 保留 v8 全部前置字段""版本由文件头决定""CRC 绑定解压后字节""读盘字节按物理计""导出调用有直接计数"六条不变量
+- 修改原因：规划 §4、§7
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（release，`build-cuda-shared.bat`），本轮 5 次
+- 检查结果：通过，`0 FAILED`。期间三次失败均是我自己的问题：Python 脚本里的 `\n` 被 shell 二次转义导致字面换行进源码（`C2001`）；`common_state_data` 与 `std::vector<char>` 类型不匹配；测试计数变量定义在使用点之后（`C2065`）
+
+- 已执行检查：测试计数构建（`-DLLAMA_TEST_EXPORT_COUNTERS`，独立目录 `build-testcounters`）
+- 检查结果：通过。首次链接失败为 `output/ggml-cpu.dll` 被运行中的服务占用（`LNK1104`），停止服务后成功
+
+- 已执行检查：**preflight 直接调用计数**（`test-run/logs/fix12-cnt.log`，测试构建，A+B/A+C/A+D）
+- 检查结果：**通过，补上上一轮欠账**。`preflight_export_allowed 1` / `preflight_skip 1` 而 `test_state_data_calls 1` / `test_state_size_calls 1`。被 preflight 拦下的请求确实未进入 `llama_state_seq_get_data_ext()`
+
+- 已执行检查：**codec 单测**（20 组）
+- 检查结果：通过，一次通过。含 7 组拒绝路径（长度不符、raw 长度不符、超上界、未知 codec、截断流、匹配越过输出、回引到空输出、字面量越界、空编码段）与段独立性、确定性、上界
+
+- 已执行检查：**v9 写入**（`fix12-v9.log`，`--cache-disk-codec lz`）
+- 检查结果：通过。启动日志 `writing new entries with per-segment 'lz' encoding (format v9)`；文件头 `4c4c4453 43303031 09000000`（`LLDSC001` + version 9）；`stored 2102 tokens, 538.47 MiB`。**文件大小 564629638 字节，同内容 v8 为 564668394，减少 38756 字节**——压缩比约 0.007%，符合 KV 状态近乎不可压缩的预期，多数段回退为原样存储
+
+- 已执行检查：**v9 跨重启恢复**（`fix12-v9r.log`）
+- 检查结果：通过。`cache_scan_end: 1 entries, 0 dropped`（v9 未被当作损坏丢弃）；`source = disk, reused_disk = 2102, restored = 2102`；**`read_bytes = 564629638` 与 v9 文件实际大小一致**（不是解压后长度）；输出 sha `34cf653dceec290d` 与历次 v8 恢复完全一致
+
+- 已执行检查：**混合版本读取**（`fix12-mix.log`：v9 文件 + `--cache-disk-codec none` 进程）
+- 检查结果：通过。写 v8 的进程成功识别并恢复已有 v9 文件：`scan 1 entries, 0 dropped`、`source = disk, reused_disk = 2102`、`read_bytes = 564629638`、sha 一致。符合规划 §3.2"新版本读取代码不得把 v8 字节解释成 v9 描述"及其对称要求
+
+- 已执行检查：**关闭态与 v8 一致性**（历轮累计 12 个请求）
+- 检查结果：通过。`--cache-disk-codec` 默认 `none` 时产物与之前逐字节一致
+
+- 已执行检查：五套独立单测
+- 检查结果：通过。`all disk-cache codec checks passed`、`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`
+
+- 已执行检查：清理
+- 检查结果：通过。测试缓存目录、临时脚本、可执行文件、`build-testcounters/` 及其脚本与日志均已删除
+
+- 未执行的检查及原因：
+  - **Zstandard 未集成**：仓库内与本地均无 zstd，引入需网络获取且会破坏"无编码器仍可构建"。改以内置 LZ77 实现，规划 §3.1 要求的"固定版本外部库"因此不适用。`--cache-disk-zstd-level` **未实现**
+  - **压缩收益未做系统评估**：只测了 1 个真实快照（538.47 MiB → 538.47 MiB − 38756 字节）。规划 §3.5 要求的 `raw_bytes`/`stored_bytes`/`codec_bytes_read`/`encode_us`/`decode_us`/`codec_fallback_raw_segments` **均未加为指标**，只保留了 `read_bytes`。哪类段实际被压缩、各段压缩率如何，**没有数据**
+  - **checkpoint 段未在真实模型上验证**：本机 `--checkpoint-min-step` 默认 8192 且需 `is_user_start`/`near_prompt_end`，历轮均未触发任何 checkpoint。因此**多 checkpoint 的独立编码、未选段的 seek 跳过、只恢复中间/最后一个 checkpoint** 全部**只有 codec 层的元数据用例**，没有真实模型证据。规划 §6.4 明确要求"没有真实 checkpoint 的环境必须说明未验证，不得用纯结构样本代替真实模型证据"
+  - **损坏与部分写入的实际注入未执行**：截断、段长溢出、codec 不识别、CRC 不一致四类在 codec 单测中覆盖，但**未在真实文件上人为破坏后验证拒绝恢复**
+  - **`touch_entry()` 对新格式的实测未做**：v9 布局保留了 `last_used` 偏移（有 static_assert），但**未在 v9 文件上实际触发 touch 并核对 CRC 未被覆盖**
+  - **解压后原始 payload 与 `get_data_ext()` 输出的逐字节比对未做**：规划 §6.3 要求"不得仅比较最终模型输出"。我用的是 CRC 校验（`crc_main`/`crc_drft` 在解压后字节上验证），这比只比较输出强，但**不等于**逐字节 dump 比对
+  - **配额/TTL 淘汰、文件句柄占用后回收、强杀重启**：未执行
+  - **媒体输入端到端**：测试机无多模态模型；`media_state_unverified` 门禁未变
+  - **v8 的反向兼容实测**：只验证了"v9 代码读 v8 文件"和"v8 进程读 v9 文件"中的后者，**未单独构造 v8 文件由新版进程恢复**（不过历轮全部 v8 恢复都在新代码上跑过，等价覆盖）

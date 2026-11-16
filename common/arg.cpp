@@ -1750,6 +1750,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_QUEUE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-codec"}, "MODE",
+        "payload encoding for new disk cache entries: 'none' writes the current format (v8, every segment "
+        "verbatim), 'lz' writes v9 where the target state, the draft state and each checkpoint buffer are "
+        "encoded independently and a segment that does not shrink is kept verbatim (default: none). "
+        "Existing files keep whatever format their header records either way",
+        [](common_params & params, const std::string & value) {
+            if (value != "none" && value != "lz") {
+                throw std::invalid_argument("cache-disk-codec must be 'none' or 'lz'");
+            }
+            params.cache_disk_codec = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_CODEC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-stats"},
         {"--no-cache-stats"},
         "log a per-request breakdown of the prompt tokens that were reused from the slot, the RAM cache or the "

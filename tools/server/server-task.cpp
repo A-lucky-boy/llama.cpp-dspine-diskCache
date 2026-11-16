@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-disk-cache-codec.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -21,6 +23,25 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+// Direct evidence that the pre-export admission check actually spares the export.
+//
+// The cumulative export counter cannot show this: it says an export finished, not
+// whether the state API was entered. A log line is worse - the absence of a log is
+// not the absence of a call. So the calls themselves are counted, at the two state
+// APIs.
+//
+// Off unless the build defines LLAMA_TEST_EXPORT_COUNTERS, so a release build pays
+// nothing. `llama_state_seq_get_size_ext` is counted separately from
+// `llama_state_seq_get_data_ext`: sizing allocates nothing and is cheap, while
+// getting the data is the copy this round exists to avoid.
+//
+// Defined at file scope rather than inside the anonymous namespace below, because
+// the metrics table that reports them appears earlier in the file.
+#ifdef LLAMA_TEST_EXPORT_COUNTERS
+std::atomic<uint64_t> g_test_state_size_calls { 0 };
+std::atomic<uint64_t> g_test_state_data_calls { 0 };
+#endif
 
 //
 // task_params
@@ -1817,6 +1838,16 @@ std::string server_task_result_metrics::to_metrics() {
             "cache_prefix_materialize_preflight_export_allowed_total",
             "Pre-export admission checks that let the state export proceed",
             (double) n_preflight_allowed
+#ifdef LLAMA_TEST_EXPORT_COUNTERS
+        }, {
+            "cache_prefix_materialize_test_state_data_calls_total",
+            "TEST BUILD ONLY: direct llama_state_seq_get_data_ext calls from prefix materialization",
+            (double) g_test_state_data_calls.load()
+        }, {
+            "cache_prefix_materialize_test_state_size_calls_total",
+            "TEST BUILD ONLY: direct llama_state_seq_get_size_ext calls from prefix materialization",
+            (double) g_test_state_size_calls.load()
+#endif
         },
     };
 
@@ -2009,6 +2040,16 @@ namespace {
 constexpr char     DISK_CACHE_MAGIC[8] = { 'L', 'L', 'D', 'S', 'C', '0', '0', '1' };
 constexpr uint32_t DISK_CACHE_VERSION  = 8;
 
+// v9 keeps every v8 field in place and appends a segment table before the payload.
+// That is deliberate: `touch_entry()` rewrites `last_used` in place and its offset is
+// fixed by the fields before it, so reordering them would make a timestamp write land
+// on the checksums. Adding to the tail costs nothing and keeps one offset constant
+// for both versions.
+//
+// Only the payload encoding differs. A v9 file may hold verbatim segments, encoded
+// ones, or a mix: the segment table records which, per segment.
+constexpr uint32_t DISK_CACHE_VERSION_SEGMENTED = 9;
+
 // version 5 added the last_used field, version 6 added the crc_main/crc_drft
 // integrity checksums, version 7 added per-checkpoint checksums, version 8 adds
 // crc_packed - the writer-side checksum of the token/media metadata, which is the
@@ -2027,6 +2068,10 @@ constexpr size_t DISK_CACHE_HEADER_FIXED      = DISK_CACHE_HDR_PREFIX + DISK_CAC
 // offset of the last_used field relative to the start of the file, excluding the
 // variable-length signature and packed metadata
 constexpr size_t DISK_CACHE_HDR_LAST_USED_OFFSET = DISK_CACHE_HDR_PREFIX + DISK_CACHE_HDR_BEFORE_LAST;
+
+// one segment-table entry as it sits on disk: raw length, stored length, codec id,
+// encoded-CRC. fixed width so a reader can size the table before reading it
+constexpr uint64_t DISK_CACHE_SEGMENT_DESC_BYTES = 8 + 8 + 4 + 8;
 
 static_assert(DISK_CACHE_HEADER_FIXED == 80, "the fixed header size must match the layout documented above");
 static_assert(DISK_CACHE_HDR_LAST_USED_OFFSET == 48, "touch_entry depends on this offset");
@@ -2135,6 +2180,12 @@ uint64_t disk_cache_crc64(const T & data) {
 }
 
 // the packed token/media metadata is kept as raw chars
+// a span that is neither a std::vector<char> nor a common_state_data: the codec
+// works with raw pointers, so the segment paths need this form
+inline uint64_t disk_cache_crc64_raw(const void * data, size_t size) {
+    return size == 0 ? 0 : disk_cache_crc64(reinterpret_cast<const uint8_t *>(data), size);
+}
+
 inline uint64_t disk_cache_crc64(const std::vector<char> & data) {
     return data.empty() ? 0 : disk_cache_crc64(reinterpret_cast<const uint8_t *>(data.data()), data.size());
 }
@@ -2325,8 +2376,8 @@ bool disk_cache_read(std::istream & f, T & v) {
 
 } // namespace
 
-server_disk_cache::server_disk_cache(const std::string & dir, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib)
-    : dir(dir), sig(sig) {
+server_disk_cache::server_disk_cache(const std::string & dir, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib, disk_cache_codec_mode codec_mode)
+    : dir(dir), sig(sig), codec_mode(codec_mode) {
     namespace fs = std::filesystem;
 
     limit_size = limit_size_mib < 0 ? 0 : (size_t) limit_size_mib * 1024ull * 1024ull;
@@ -2696,14 +2747,18 @@ void server_disk_cache::scan() {
             continue;
         }
 
-        if (version != DISK_CACHE_VERSION) {
-            // never reinterpret an older layout as the current one: v7 files have
-            // no packed checksum, so they cannot be validated on read. the cache
-            // is a pure accelerator, dropping and rebuilding it is safe - but the
-            // discard must be stated instead of looking like a corruption
+        if (version != DISK_CACHE_VERSION && version != DISK_CACHE_VERSION_SEGMENTED) {
+            // never reinterpret an older layout as a current one: v7 files have no
+            // packed checksum, so they cannot be validated on read. the cache is a
+            // pure accelerator, dropping and rebuilding it is safe - but the discard
+            // must be stated instead of looking like a corruption.
+            //
+            // both v8 and v9 are accepted here: which one a file uses is recorded in
+            // its header, not in this process's configuration, so a directory written
+            // before the codec was enabled still loads
             SRV_WRN("disk cache: dropping '%s': entry format v%u %s v%u, the cache will be rebuilt\n",
                     de.path().string().c_str(), (unsigned) version,
-                    version < DISK_CACHE_VERSION ? "is older than" : "is newer than", (unsigned) DISK_CACHE_VERSION);
+                    version < DISK_CACHE_VERSION ? "is older than" : "is newer than", (unsigned) DISK_CACHE_VERSION_SEGMENTED);
             f.close();
             std::error_code ec_rm;
             fs::remove(de.path(), ec_rm);
@@ -3001,8 +3056,13 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
             return false;
         }
 
+        // `segmented` decides both the version stamp and the payload encoding, so
+        // the two cannot disagree - a file claiming v8 while holding an encoded
+        // payload, or the reverse, is not representable
+        const bool segmented = codec_mode != disk_cache_codec_mode::none;
+
         f.write(DISK_CACHE_MAGIC, sizeof(DISK_CACHE_MAGIC));
-        disk_cache_write(f, (uint32_t) DISK_CACHE_VERSION);
+        disk_cache_write(f, (uint32_t) (segmented ? DISK_CACHE_VERSION_SEGMENTED : DISK_CACHE_VERSION));
         disk_cache_write(f, (uint32_t) sig.size());
         f.write(sig.data(), (std::streamsize) sig.size());
         disk_cache_write(f, (uint32_t) pending.packed.size());
@@ -3041,22 +3101,92 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
             disk_cache_write(f, (uint64_t) disk_cache_crc64(c->data_dft));
         }
 
-        if (!pending.main->empty()) {
-            f.write(reinterpret_cast<const char *>(pending.main->data()), (std::streamsize) pending.main->size());
+        // Every independent carrier is encoded on its own: the target state, the
+        // draft state, and each checkpoint's three buffers. Per segment, because
+        // read_entry() restores exactly one checkpoint - joining them into one
+        // stream would force decoding the ones it does not need, and would make one
+        // damaged byte fail the whole file instead of one segment.
+        //
+        // A segment that does not shrink is written verbatim. That is the common
+        // case for opaque state that happens to be incompressible, and it is not an
+        // error: the table records the choice per segment, so one file may hold both.
+        //
+        // The table has to precede the payload for a reader to locate anything, but
+        // the stored lengths are only known after encoding. So the table is reserved
+        // and filled in at the end: one blank entry per segment, payload written
+        // segment by segment, then a seek back to rewrite the table. The alternative
+        // - encoding everything into memory first - would hold a second copy of the
+        // whole snapshot, which for a target state is hundreds of MiB.
+        const size_t n_segments = 2 + 3 * ckpts.size();
+
+        const std::streamoff off_table = f.tellp();
+        for (size_t i = 0; i < n_segments; i++) {
+            const uint64_t blank[3] = { 0, 0, 0 };
+            f.write(reinterpret_cast<const char *>(blank), sizeof(blank));
+            disk_cache_write(f, (uint32_t) 0);
         }
-        if (!pending.drft->empty()) {
-            f.write(reinterpret_cast<const char *>(pending.drft->data()), (std::streamsize) pending.drft->size());
-        }
+
+        // one reusable buffer: the encoder's output for the segment in hand, then
+        // reused for the next. Peak extra memory is one segment, not one snapshot
+        std::vector<char> scratch;
+        std::vector<disk_cache_segment_desc> seg_table;
+        seg_table.reserve(n_segments);
+
+        // The carriers live in two different container types - the KV states are
+        // `common_state_data` and the checkpoint buffers are too - so the lambda
+        // takes a raw span. That keeps the codec call site free of any conversion.
+        auto emit = [&](const void * src_ptr, size_t src_len) {
+            const char * const srcp = (const char *) src_ptr;
+
+            disk_cache_segment_desc d;
+            d.raw_len = src_len;
+
+            if (!segmented || src_len == 0) {
+                d.stored_len  = src_len;
+                d.codec       = disk_cache_codec_id::raw;
+                d.encoded_crc = disk_cache_crc64_raw(srcp, src_len);
+                f.write(srcp, (std::streamsize) src_len);
+                seg_table.push_back(d);
+                return;
+            }
+
+            const disk_cache_codec_id id = disk_cache_codec_encode(srcp, src_len, scratch);
+
+            if (id == disk_cache_codec_id::lz && scratch.size() < src_len) {
+                d.stored_len  = scratch.size();
+                d.codec       = disk_cache_codec_id::lz;
+                d.encoded_crc = disk_cache_crc64_raw(scratch.data(), scratch.size());
+                f.write(scratch.data(), (std::streamsize) scratch.size());
+            } else {
+                d.stored_len  = src_len;
+                d.codec       = disk_cache_codec_id::raw;
+                d.encoded_crc = disk_cache_crc64_raw(srcp, src_len);
+                f.write(srcp, (std::streamsize) src_len);
+            }
+
+            seg_table.push_back(d);
+        };
+
+        emit(pending.main->data(), pending.main->size());
+        emit(pending.drft->data(), pending.drft->size());
         for (const auto & c : ckpts) {
-            if (!c->data_spec.empty()) {
-                f.write(reinterpret_cast<const char *>(c->data_spec.data()), (std::streamsize) c->data_spec.size());
+            emit(c->data_spec.data(), c->data_spec.size());
+            emit(c->data_tgt.data(),  c->data_tgt.size());
+            emit(c->data_dft.data(),  c->data_dft.size());
+        }
+
+        // the payload is in place; fill in what each segment really turned out to be
+        if (segmented) {
+            f.seekp(off_table, std::ios::beg);
+
+            for (const auto & d : seg_table) {
+                const uint64_t pair[2] = { d.raw_len, d.stored_len };
+                f.write(reinterpret_cast<const char *>(pair), sizeof(pair));
+                disk_cache_write(f, (uint32_t) d.codec);
+                disk_cache_write(f, d.encoded_crc);
             }
-            if (!c->data_tgt.empty()) {
-                f.write(reinterpret_cast<const char *>(c->data_tgt.data()), (std::streamsize) c->data_tgt.size());
-            }
-            if (!c->data_dft.empty()) {
-                f.write(reinterpret_cast<const char *>(c->data_dft.data()), (std::streamsize) c->data_dft.size());
-            }
+
+            f.seekp(0, std::ios::end);
         }
 
         f.flush();
@@ -3121,13 +3251,21 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
 
     uint32_t version = 0;
     uint32_t sig_len = 0;
+    // both versions are read by this code, and every field up to the segment table
+    // is identical between them - a v9 file only appends a table and changes what
+    // the payload bytes mean. A v8 file is never reinterpreted as v9 or the other
+    // way round: `segmented` is derived from the version in the header, not from
+    // any configuration, so an existing file restores the way it was written
     if (!disk_cache_read(f, version) || !disk_cache_read(f, sig_len) ||
             memcmp(magic, DISK_CACHE_MAGIC, sizeof(magic)) != 0 ||
-            version != DISK_CACHE_VERSION || sig_len != sig.size()) {
+            (version != DISK_CACHE_VERSION && version != DISK_CACHE_VERSION_SEGMENTED) ||
+            sig_len != sig.size()) {
         SRV_WRN("disk cache: '%s' has a mismatching header (v%u, sig %u bytes)\n",
                 e.path.c_str(), (unsigned) version, (unsigned) sig_len);
         return disk_cache_read_status::corrupt;
     }
+
+    const bool segmented = version == DISK_CACHE_VERSION_SEGMENTED;
 
     std::string entry_sig(sig_len, '\0');
     f.read(entry_sig.data(), (std::streamsize) sig_len);
@@ -3244,26 +3382,157 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
         want = 0;
     }
 
+    // A v9 file carries one table entry per independent segment, in the order the
+    // writer laid them out: main, drft, then each checkpoint's spec/tgt/dft. The
+    // table is read whole (it is tiny next to the payload), then each segment is
+    // located by the stored lengths it declares.
+    //
+    // For v8 the table is empty and every segment is treated as verbatim, which is
+    // exactly what the old payload was. One code path below handles both: the only
+    // difference is where each segment's bytes are described.
+    std::vector<disk_cache_segment_desc> seg_table;
+
+    if (segmented) {
+        const size_t expected = 2 + 3 * metas.size();
+
+        seg_table.resize(expected);
+
+        for (auto & d : seg_table) {
+            uint64_t raw_len    = 0;
+            uint64_t stored_len = 0;
+            uint32_t codec      = 0;
+            uint64_t enc_crc    = 0;
+
+            if (!disk_cache_read(f, raw_len) || !disk_cache_read(f, stored_len) ||
+                    !disk_cache_read(f, codec) || !disk_cache_read(f, enc_crc)) {
+                SRV_WRN("disk cache: '%s' is truncated inside the segment table\n", e.path.c_str());
+                return disk_cache_read_status::corrupt;
+            }
+
+            // bounds first: a corrupt table must not become a huge read or a huge
+            // allocation. the raw length is what the segment decodes to, the stored
+            // length what it occupies, and neither may be absurd
+            if (raw_len > DISK_CACHE_SEGMENT_RAW_MAX ||
+                    stored_len > DISK_CACHE_SEGMENT_COMPRESSED_MAX) {
+                SRV_WRN("disk cache: '%s' declares an out-of-range segment (raw %" PRIu64 ", stored %" PRIu64 ")\n",
+                        e.path.c_str(), raw_len, stored_len);
+                return disk_cache_read_status::corrupt;
+            }
+
+            d.raw_len     = raw_len;
+            d.stored_len  = stored_len;
+            d.codec       = (disk_cache_codec_id) codec;
+            d.encoded_crc = enc_crc;
+        }
+
+        // the declared raw lengths must reconstruct the sizes the index and the
+        // header already state: the file would otherwise claim a state size that
+        // does not match the prompt it was indexed under
+        if (seg_table[0].raw_len != size_main || seg_table[1].raw_len != size_drft) {
+            SRV_WRN("disk cache: '%s' segment table disagrees with the header state sizes\n", e.path.c_str());
+            return disk_cache_read_status::corrupt;
+        }
+
+        for (size_t i = 0; i < metas.size(); i++) {
+            const auto & m = metas[i];
+
+            if (seg_table[2 + 3*i + 0].raw_len != m.size_spec ||
+                    seg_table[2 + 3*i + 1].raw_len != m.size_tgt ||
+                    seg_table[2 + 3*i + 2].raw_len != m.size_dft) {
+                SRV_WRN("disk cache: '%s' segment table disagrees with the checkpoint table\n", e.path.c_str());
+                return disk_cache_read_status::corrupt;
+            }
+        }
+    } else {
+        // the v8 payload, described the same way so the reader below needs no branch
+        seg_table.resize(2 + 3 * metas.size());
+        seg_table[0].raw_len = seg_table[0].stored_len = size_main;
+        seg_table[1].raw_len = seg_table[1].stored_len = size_drft;
+
+        for (size_t i = 0; i < metas.size(); i++) {
+            const auto & m = metas[i];
+            for (int k = 0; k < 3; k++) {
+                const uint64_t n = k == 0 ? m.size_spec : (k == 1 ? m.size_tgt : m.size_dft);
+                seg_table[2 + 3*i + k].raw_len    = n;
+                seg_table[2 + 3*i + k].stored_len = n;
+            }
+        }
+    }
+
     const std::streamoff hdr_end = f.tellg();
 
-    out.main.resize(size_main);
-    if (size_main > 0) {
-        f.read(reinterpret_cast<char *>(out.main.data()), (std::streamsize) size_main);
-    }
+    // how many physical bytes this read actually consumed. it is reported for the
+    // trace below and must stay the *stored* count: an encoded segment occupies less
+    // on disk than it decodes to, and calling the latter "bytes read" would
+    // overstate the IO
+    uint64_t stored_read = 0;
 
-    out.drft.resize(size_drft);
-    if (size_drft > 0) {
-        f.read(reinterpret_cast<char *>(out.drft.data()), (std::streamsize) size_drft);
-    }
+    // The decoded bytes land in a plain buffer first and are moved into the state
+    // container only once they are known to be exactly the declared length. A
+    // partially decoded segment must never reach a container the caller will hand
+    // to llama_state_seq_set_data_ext.
+    // the carriers are two different container types (common_state_data for the
+    // KV states, a plain byte vector for the checkpoint spec), so this is a
+    // template rather than one signature that would need converting at each call
+    auto load_segment = [&](const disk_cache_segment_desc & d, auto & out, const char * what) -> bool {
+        std::vector<char> stored;
 
-    if (!f) {
-        SRV_WRN("disk cache: '%s' is truncated inside the state payload\n", e.path.c_str());
+        if (d.stored_len > 0) {
+            stored.resize((size_t) d.stored_len);
+
+            f.read(stored.data(), (std::streamsize) stored.size());
+
+            if (!f) {
+                SRV_WRN("disk cache: '%s' is truncated inside the %s segment\n", e.path.c_str(), what);
+                return false;
+            }
+
+            // the encoded bytes get their own checksum, so a flip inside an encoded
+            // stream is caught before the decoder sees it. It does not replace the
+            // caller's CRC, which is what proves the *decoded* bytes
+            if (d.codec != disk_cache_codec_id::raw &&
+                    disk_cache_crc64_raw(stored.data(), stored.size()) != d.encoded_crc) {
+                SRV_WRN("disk cache: '%s' has a damaged %s segment\n", e.path.c_str(), what);
+                return false;
+            }
+        }
+
+        stored_read += d.stored_len;
+
+        std::vector<char> decoded;
+
+        if (!disk_cache_codec_decode(stored.data(), stored.size(), d, decoded)) {
+            SRV_WRN("disk cache: '%s' cannot decode the %s segment\n", e.path.c_str(), what);
+            return false;
+        }
+
+        // decoding must land exactly on the declared size
+        if (decoded.size() != (size_t) d.raw_len) {
+            SRV_WRN("disk cache: '%s' decoded the %s segment to %zu bytes, expected %" PRIu64 "\n",
+                    e.path.c_str(), what, decoded.size(), d.raw_len);
+            return false;
+        }
+
+        out.assign(decoded.begin(), decoded.end());
+        return true;
+    };
+
+    // nothing reaches llama_state_seq_set_data_ext until every segment it needs has
+    // been read, decoded and verified
+    if (!load_segment(seg_table[0], out.main, "target state")) {
+        return disk_cache_read_status::corrupt;
+    }
+    if (!load_segment(seg_table[1], out.drft, "draft state")) {
         return disk_cache_read_status::corrupt;
     }
 
     // verify the payload before it reaches llama_state_seq_set_data_ext: a torn
     // write or a bad disk sector would otherwise be restored silently and produce
     // wrong inference. a mismatch marks the entry for removal by the caller.
+    //
+    // this is the CRC of the *decoded* bytes, so it covers the encoder too: a
+    // codec bug that produced different bytes would fail here rather than be
+    // restored
     if (disk_cache_crc64(out.main) != crc_main || disk_cache_crc64(out.drft) != crc_drft) {
         SRV_WRN("disk cache: payload checksum mismatch in '%s', dropping it\n", e.path.c_str());
         return disk_cache_read_status::corrupt;
@@ -3275,11 +3544,14 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
         const auto & m = metas[i];
 
         if ((int) i != want) {
-            f.seekg((std::streamoff) (m.size_spec + m.size_tgt + m.size_dft), std::ios::cur);
+            // the segments not being restored are skipped by their stored lengths -
+            // not read, not decoded. this is the property that made per-segment
+            // encoding worth doing: one checkpoint costs one checkpoint
+            for (int k = 0; k < 3; k++) {
+                f.seekg((std::streamoff) seg_table[2 + 3*i + k].stored_len, std::ios::cur);
+            }
             continue;
         }
-
-        ckpt_bytes = m.size_spec + m.size_tgt + m.size_dft;
 
         auto ckpt = std::make_shared<common_prompt_checkpoint>();
 
@@ -3289,24 +3561,14 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
         ckpt->pos_min  = m.pos_min;
         ckpt->pos_max  = m.pos_max;
 
-        ckpt->data_spec.resize(m.size_spec);
-        if (m.size_spec > 0) {
-            f.read(reinterpret_cast<char *>(ckpt->data_spec.data()), (std::streamsize) m.size_spec);
-        }
-        ckpt->data_tgt.resize(m.size_tgt);
-        if (m.size_tgt > 0) {
-            f.read(reinterpret_cast<char *>(ckpt->data_tgt.data()), (std::streamsize) m.size_tgt);
-        }
-        ckpt->data_dft.resize(m.size_dft);
-        if (m.size_dft > 0) {
-            f.read(reinterpret_cast<char *>(ckpt->data_dft.data()), (std::streamsize) m.size_dft);
-        }
-
-        if (!f) {
-            SRV_WRN("disk cache: '%s' is truncated inside the checkpoint payload\n", e.path.c_str());
+        if (!load_segment(seg_table[2 + 3*i + 0], ckpt->data_spec, "checkpoint spec") ||
+                !load_segment(seg_table[2 + 3*i + 1], ckpt->data_tgt,  "checkpoint target") ||
+                !load_segment(seg_table[2 + 3*i + 2], ckpt->data_dft,  "checkpoint draft")) {
             out.checkpoints.clear();
             return disk_cache_read_status::corrupt;
         }
+
+        ckpt_bytes = m.size_spec + m.size_tgt + m.size_dft;
 
         // the checkpoint payload feeds llama_state_seq_set_data_ext as well, so
         // it gets the same integrity check as the main/draft states
@@ -3321,9 +3583,14 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
         out.checkpoints.push_back(ckpt);
     }
 
-    const uint64_t bytes_read = (uint64_t) hdr_end + size_main + size_drft + ckpt_bytes;
-    SRV_TRC("disk cache: read %.2f MiB of %.2f MiB, checkpoints %d/%zu\n",
-            bytes_read/1048576.0, e.size_file/1048576.0, want >= 0 ? 1 : 0, metas.size());
+    (void) ckpt_bytes;
+
+    // `stored_read` is what came off the disk; `size_main + size_drft` would be the
+    // decoded size and must not be reported as IO
+    const uint64_t decoded_read = (uint64_t) hdr_end + size_main + size_drft + ckpt_bytes;
+    SRV_TRC("disk cache: read %.2f MiB stored (%.2f MiB decoded) of %.2f MiB, checkpoints %d/%zu%s\n",
+            (double) stored_read/1048576.0, decoded_read/1048576.0, e.size_file/1048576.0,
+            want >= 0 ? 1 : 0, metas.size(), segmented ? ", segmented" : "");
 
     return disk_cache_read_status::ok;
 }
@@ -4800,8 +5067,8 @@ void server_disk_cache::worker() {
     }
 }
 
-void server_prompt_cache::init_disk(const std::string & path, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib) {
-    disk = std::make_unique<server_disk_cache>(path, sig, limit_size_mib, min_tokens, ttl_seconds, queue_max_mib);
+void server_prompt_cache::init_disk(const std::string & path, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib, disk_cache_codec_mode codec_mode) {
+    disk = std::make_unique<server_disk_cache>(path, sig, limit_size_mib, min_tokens, ttl_seconds, queue_max_mib, codec_mode);
 }
 
 void server_prompt_cache::spill(server_prompt_cache_state & state) {
@@ -4858,6 +5125,10 @@ bool server_prompt_cache::materialize(const server_prompt & prompt, llama_contex
         return false;
     }
 
+#ifdef LLAMA_TEST_EXPORT_COUNTERS
+    g_test_state_size_calls++;
+#endif
+
     const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -4879,6 +5150,10 @@ bool server_prompt_cache::materialize(const server_prompt & prompt, llama_contex
     // sizes are taken first and the written counts are checked against them: a
     // short write would produce a file whose claimed token range has no complete
     // state behind it
+#ifdef LLAMA_TEST_EXPORT_COUNTERS
+    g_test_state_data_calls++;
+#endif
+
     const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt,
             out.data.main->data(), out.data.main->size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft,

@@ -71,6 +71,12 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| 状态段可独立编码 | `--cache-disk-codec lz` 写 v9：target 状态、draft 状态、每个 checkpoint 的 spec/tgt/dft 共 2+3N 个独立段各自编码，压缩后不缩小则原样存。**不串联成单一流**——`read_entry()` 只恢复一个 checkpoint，串联会强迫解压无关段。每段有自己的原始长度/磁盘长度/编码器 ID/编码字节 CRC |
+| v9 保留 v8 全部前置字段 | 段表**追加**在 checkpoint 表之后、payload 之前。这是为了 `touch_entry()`：它就地重写 `last_used`，偏移由前置字段决定，重排会让时间戳写坏 CRC。两版本共用同一偏移常量（有 static_assert 保护） |
+| 版本由文件头决定 | 读端按 header 里的 version 分派，不由当前配置决定。`--cache-disk-codec none` 的进程能正常读取已有的 v9 文件，反之亦然。v8 与 v9 都通过 `scan()` 的版本检查 |
+| CRC 绑定解压后字节 | `crc_main`/`crc_drft`/checkpoint 三个 CRC 都是**解压后**字节的校验，编码器出错会在此失败而非被恢复。编码字节另有 `encoded_crc` 用于提前发现编码流内的翻转。所有校验在 `set_data_ext` 之前完成 |
+| 读盘字节按物理计 | `read_bytes` 是真实从磁盘读取的**存储**字节（含段表），不是解压后的原始长度。配额与成本守卫仍用真实 `size_file` |
+| 导出调用有直接计数 | 测试构建（`-DLLAMA_TEST_EXPORT_COUNTERS`）在 `get_size_ext`/`get_data_ext` 两处计数并经 `/metrics` 暴露。被 preflight 拦下的路径不进入 `get_data_ext`——这由计数直接证明，不靠日志推断 |
 | 导出前先做元数据准入 | `server_disk_cache::preflight_materialize()` 在完整 KV 状态导出**之前**回答"这次导出是否值得"：只读、同步、持磁盘锁期间仅做 token/media 元数据比对，不碰 context、不做文件 IO、不做大分配。判定顺序为已提交身份 → in-flight 身份 → 成本合格覆盖；先查身份再查覆盖，否则同 hash 冲突会被误报成覆盖 |
 | 准入判定与写入判定同源 | 已提交条目判定抽为 `committed_check_locked()`，preflight、`store()`、`mirror()` 三处共用；隔离条目不终止扫描（同 hash 可能另有可用条目），只有可复用条目才决定结果 |
 | 保存的是被省下的导出数 | `cache_prefix_materialize_preflight_skip_total` 计 preflight 挡下的导出，`_export_allowed_total` 计放行的；两者都不是缓存命中，也不计入 `enqueue_dedup`、`restored` 或 `reused_disk` |

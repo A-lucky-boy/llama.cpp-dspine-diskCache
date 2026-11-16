@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "server-disk-cache-codec.h"
 
 #include <string>
 #include <unordered_set>
@@ -933,7 +934,7 @@ struct disk_cache_manifest_meta {
 // cache are written in the background and restored when a new prompt shares a
 // long enough prefix with them. Survives restarts.
 struct server_disk_cache {
-    server_disk_cache(const std::string & dir, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib);
+    server_disk_cache(const std::string & dir, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib, disk_cache_codec_mode codec_mode = disk_cache_codec_mode::none);
     ~server_disk_cache();
 
     // restore the best matching entry (if any) into the contexts
@@ -1068,6 +1069,12 @@ public:
 
 private:
     std::unordered_map<uint64_t, inflight_identity> inflight;
+
+    // how this tier writes the payload of a new entry. `none` keeps v8: every
+    // segment verbatim and no segment table, which is the layout the previous
+    // releases produce anywhere. anything else writes v9, where each independent
+    // carrier is encoded on its own
+    disk_cache_codec_mode codec_mode = disk_cache_codec_mode::none;
 
     // what a hash already in flight means for a write that wants the same path.
     // `duplicate` is the normal case; `conflict` means the path is spoken for by a
@@ -1218,7 +1225,7 @@ struct server_prompt_cache {
     }
 
     // attach the second-level on-disk tier
-    void init_disk(const std::string & path, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib);
+    void init_disk(const std::string & path, const std::string & sig, int32_t limit_size_mib, int32_t min_tokens, int32_t ttl_seconds, int32_t queue_max_mib, disk_cache_codec_mode codec_mode = disk_cache_codec_mode::none);
 
     std::list<server_prompt_cache_state> states;
 

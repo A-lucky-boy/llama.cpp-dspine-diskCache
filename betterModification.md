@@ -2818,3 +2818,175 @@ eligible K → 精确 K 的 target/draft 安全点
 本文件只记录本次独立实验的目标、修改位置、算法与数据流、对推理/训练流水线的影响、与既有实现的兼容性及验证检查清单。不写假定收益数字、尚未发生的实验结果、训练早停要求、计算报告或最终优劣判定规则。
 
 开发人员将**实际修改**记入 `change.md`，将**项目已落地的总体结构**写入 `projectSummary.md`；本规划不能替代实际代码提交或执行日志。
+
+---
+
+# 2026-11-16 11-25 - test1_5
+
+## 一、实验目标与技术定位
+
+**实验名称：面向完整 KV 序列状态的可逆分段压缩存储（Segmented Lossless Snapshot Codec）。**
+
+当前单用户磁盘提示缓存已经能够在合法的 prefill 边界导出 target/draft 的完整序列状态，通过已提交缓存文件跨重启恢复；导出之前的元数据准入也已能避免确定无效的完整 KV 导出。但对于真正需要写盘的状态，现有 `server_disk_cache::write_entry()` 仍将 `main`、`drft` 与每个 checkpoint 的 `spec/tgt/dft` 字节缓冲区直接原样存盘；`read_entry()` 则从文件读回完整主/草稿状态，并仅读取本次恢复所需的一个 checkpoint。
+
+本实验只改进**磁盘上如何无损保存和取回上述 opaque 数据**。目标是探索是否能够在不改变 tokenizer、模型计算、DSpine 投机解码、完整序列状态 API、前缀身份或可恢复 token 语义的前提下，让磁盘条目按独立段选择无损压缩。压缩必须完全可逆：传入 `llama_state_seq_set_data_ext()` 的每一字节都与当前 `llama_state_seq_get_data_ext()` 的原始输出一致。
+
+**不进行 token 范围 KV 切割。** 本节中的“段”只表示已有文件中自然独立的字节载体：`main state`、`draft state` 以及各 checkpoint 的 `spec/tgt/dft`，不是从 opaque state 内推断 token 边界，也不支持只恢复某个 token 子区间。本机单用户、单实例、`-np 1` 是唯一部署范围；不涉及鉴权、多租户或公网服务。
+
+## 二、规划前核验与 baseline 对比
+
+在制定本实验前，已首先检查远端 `change.md` 最近的 `2026-11-16 11-10 - Change Record`，随后阅读《2026-11-16-handover-v9-preflight-admission.md》、`projectSummary.md`，并核对实际 GitHub 源码。审查时仓库 `A-lucky-boy/llama.cpp-dspine-diskCache` 的 `main` HEAD 为 `a85e66c870030eefe25bbf58b87cbc2c1eeff698`（交接文档提交），功能代码提交为 `e004f717f3b0a12069325fe964d3e26c8718967e`；原始项目 baseline 为 `eb7681889f44304d2bd5b3e41572f5530af91a1d`。
+
+当前源码核对结论：
+
+- `tools/server/server-context.cpp::materialize_prefix()` 在 target/draft 位置精确到达边界后调用 `server_disk_cache::preflight_materialize()`，只在准入结果需要导出时进入 `server_prompt_cache::materialize()`。生产路径直接使用 `disk_cache_decide_materialize_action()`；无明显阻断性代码缺陷。
+- `tools/server/server-task.cpp::server_prompt_cache::materialize()` 仍使用 `llama_state_seq_get_size_ext/get_data_ext` 生成完整 target/draft 字节串。磁盘队列的 `server_disk_cache_pending` 通过 `shared_ptr` 持有这些不可变缓冲，不通过实时 `llama_context` 写盘。
+- `write_entry()` 当前 v8 文件含 magic/version、配置签名、packed token/media 身份、主/草稿大小、checkpoint 数量、时间、CRC64；随后依次原样写出 `main`、`drft` 和 checkpoint 的 `spec/tgt/dft`。文件先写 `.tmp`，再提交目标路径。
+- `read_entry()` 校验 packed 身份与 CRC，再把完整主/草稿缓冲读入内存；对于 checkpoint 已经通过偏移跳过本次恢复不使用的段，且只将选择到的 checkpoint 数据读入并校验。新增编码不能破坏这一特性。
+- 原始 baseline 已具有完整序列状态文件机制；当前相较 baseline 的新增能力集中于前缀捕获、物化准入、完整身份、可替代性与磁盘生命周期治理。本实验不重新实现这些机制，只增加文件内部的可选无损编码与兼容读写。
+
+**实验机开工硬性核查**：先读本机当前 `change.md`、`projectSummary.md`，核对 `git rev-parse HEAD`、`git status --short` 与实际编译二进制版本；再次逐函数比较 `write_entry/read_entry/scan/load/touch_entry` 和 baseline 对应路径。若发现现有修改有新的明显错误，应立即优先修复并记录，暂停本实验的物理格式修改。此前交付中尚未直接完成的导出 API 调用计数验证须通过测试夹具补齐，不得把间接计数当作直接证明。
+
+## 三、单项算法变更：按自然状态段进行可逆压缩
+
+### 3.1 编码单元与判定
+
+使用**无损、可流式处理**的块压缩器作为唯一新算法变量，优先评估 Zstandard（Zstd）实现。编码器必须显式声明固定版本/配置；不要依赖机器隐式安装的随机 DLL。开发人员首先核对当前 Windows/CUDA 构建是否已有可链接且许可证兼容的压缩实现；如需集成依赖，必须固定版本、通过项目现有 CMake/构建脚本显式链接，并保证无编码器时原 v8 路径仍能构建。
+
+以下每个段**独立压缩或原样存储**，每段有自己的原始字节长度、磁盘字节长度、编码器类型以及 CRC：
+
+1. 当前 target 完整序列状态 `main`；
+2. 当前 draft 完整序列状态 `drft`；
+3. 每个 `checkpoint` 的 `data_spec`；
+4. 每个 `checkpoint` 的 `data_tgt`；
+5. 每个 `checkpoint` 的 `data_dft`。
+
+当压缩后的段连同必要的编码元数据**不小于**原段时，该段可以按原始方式存储；允许同一快照同时包含原始与压缩段。是否压缩只影响编码字节，不改变 checkpoint 的数量、顺序和状态含义。
+
+每段独立编码尤为重要：`read_entry()` 只选择一个 checkpoint；不得把所有 checkpoint 串联进同一压缩流并要求解压不相关 checkpoint 才能取出目标。对 `main` 和 `drft` 也分别编码，不将不同模型上下文混成一个不可独立校验的流。
+
+### 3.2 文件协议与兼容性
+
+- 引入**明确的新条目格式版本 v9**（仅对编码开启时的新写入使用）。**默认配置继续写 v8**，因此关闭功能时与当前源码的文件布局和物理恢复路径等价。
+- 新格式的固定头继续包含：magic、version、配置签名、完整 token/media packed 元数据及其 CRC、源数据段的原始长度、时间字段和源数据 CRC。另增加每段的编码器编号、原始长度和磁盘长度，保证读取端能无歧义定位全部 payload。
+- `pc-<hash>.bin` 的名称算法不变；同一身份在磁盘已存在时继续由 preflight/store/worker 的现有去重逻辑处理，不尝试为了将旧文件升级为压缩格式而覆盖它。
+- 对 v8 文件必须继续按原来的无压缩读法恢复；新版本读取代码不得把 v8 字节解释成 v9 描述。`scan()`、`read_entry()`、`touch_entry()`、配额与日志必须明确区分版本，不因默认写入策略关闭而无法读取已经存在的 v9 文件。
+- manifest 仍优先使用 v3：它继续记录**原始 main/draft 长度**、文件物理大小、packed CRC 和身份；只要启动扫描与读盘可无歧义识别版本且所有原索引不变量成立，就不需要为本实验擅自升级 manifest。如果经实际源码审查发现其字段无法承载必要信息，先说明冲突位置，最小增补版本支持，不能静默重解释旧字段。
+- 注意 `touch_entry()` 对 `last_used` 的偏移读写：新布局如能保留旧前置字段顺序，就保持该字段位置；否则必须为 v8/v9 独立解析偏移，避免写时间戳覆盖 CRC 或段表。
+- 不对 v8 目录执行原位迁移。不同编码写策略可在单目录内读已有合法条目，但正式对照应使用独立目录，避免“先有同 hash v8 条目”使新压缩试验无法入库。
+
+### 3.3 写入数据流
+
+```text
+有效前缀边界 → 既有 preflight → 完整 target/draft 状态导出
+  → 既有 store()/inflight/队列（RAM 持有的是原始 payload）
+  → 后台 worker 通过原路径所有权与冗余检查
+  → 将每个自然段独立进行无损编码（流式/有限工作缓冲）
+  → 写入 v9 段描述 + 编码 payload 到 .tmp
+  → 根据真实文件 size_file 执行既有配额准入/替代判断
+  → 完成提交、manifest、回调与可恢复引用登记
+```
+
+写侧必须保留以下既有约束：
+
+1. 编码阶段只能访问 `server_disk_cache_pending` 已经持有的不可变数据，不允许 worker 访问 live `llama_context`。
+2. 压缩使用有界流式工作缓冲；不能一次额外复制整个数百 MiB `main/drft` 段进行“先压缩到内存，再整体写入”的巨量分配。
+3. `pending.bytes` 继续按**原始状态内存大小**计算队列内存占用；不允许因为磁盘可压缩而低报内存或预先突破入队预算。现有写入前的保守 `limit_size` 校验可保持原义；本轮只采用成功提交后实际 `size_file` 作配额与读盘成本判定。
+4. 所有 `CRC64` 必须明确绑定到**原始解压后的字节**；可另外校验编码片段的封装 CRC，但不得以“压缩流有效”替代原始状态完整性校验。
+5. 如果压缩失败、编码器不可用或输出发生错误，采取明确的写入失败路径并清理临时文件；不能提交只有部分段的 v9 文件。
+6. 文件仍用临时路径完整写入、刷新并原子提交；压缩编码不允许绕过当前 `claim_path_locked()`、回滚隔离、`event_epoch` 或 `notify_committed()`。
+
+### 3.4 读取与恢复数据流
+
+```text
+磁盘候选选择（完整 token/media 身份 + 原现存 size_file 成本守卫）
+  → read_entry() 检查文件头与版本，读取 packed 元数据并校验 CRC
+  → 按段表定位 main/drft 以及所有 checkpoint
+  → main/drft：读取物理段，解压到完整原始缓冲并校验原始 CRC
+  → checkpoint：选中需要的一项，仅读取/解压该项的 spec/tgt/dft
+  → 所有必需段通过校验后，沿用原 set_data_ext 恢复
+  → 原有 draft/target、checkpoint、n_past 与输出逻辑保持
+```
+
+1. **不得先恢复 KV 再做校验**：包括解压失败、CRC 不匹配、声明长度与实际输出长度不符、分段偏移越界、codec ID 不可识别等情况，一律在 `set_data_ext` 之前拒绝该候选，沿用现有安全回退。
+2. 对 `raw_len/stored_len/segment_count` 做文件长度、整数溢出、项目内存预算与协议上限检查，避免损坏头造成错误分配。不依赖网络攻击场景，保护的是本机输入/缓存文件结构正确性。
+3. 不能因“只解压一个 checkpoint”而改变原选择规则；对未选中的 checkpoint 只作元数据范围检查与 `seek`，不强制读取/解压，保持已有按需读取能力。
+4. `read_bytes` 统计**本次真正从磁盘读取的压缩字节和相关元数据**，与 `file_bytes` 的完整物理文件大小区分。不可用“解压后的原始长度”冒充读盘 IO；`restored` 与 `reused_disk` 仍按真实 token 复用计算。
+5. 已存在快照的 `disk_cache_cost_ok()` 以实际压缩后的完整物理 `size_file` 与可用 token 数判定，仍使用现有 `768 KiB/token` 门槛。这一门槛不因压缩实验调整。
+
+### 3.5 控制变量与可观测性
+
+建议新增可选配置：
+
+```text
+--cache-disk-codec none|zstd       # 默认 none；none = 保留 v8 写盘
+--cache-disk-zstd-level N         # 固定、显式并受限的 level；只在 zstd 模式使用
+```
+
+本实验只改变一种机制——物理状态段是否经过可逆编码。参数水平是同一机制的实现参数，不得在同一改动中另外调整 `--cache-disk-min-tokens`、4096-token 写入抑制、热点淘汰、前缀发现频率、target/draft 模型配置或 KV 量化方式。
+
+新增观察口径（使用已有统计框架或受控测试日志）：`raw_bytes`、`stored_bytes`、`codec_bytes_read`、`encode_us`、`decode_us`、`codec_fallback_raw_segments`、文件格式版本；现有 `cache_disk_bytes` 必须继续代表实际物理占用。诊断值不得改动 `reused_disk`、`restored` 或 `candidate_lcp` 的定义。
+
+## 四、预期修改文件
+
+| 文件 | 预期修改 |
+|---|---|
+| `common/common.h`、`common/arg.cpp` | 新增默认关闭的 codec 配置和受限级别参数；与已有缓存命令行风格保持一致 |
+| `tools/server/server-disk-cache-codec.h/.cpp`（新增） | 定义独立段描述、codec ID、流式编码/解码与无损校验辅助；不接触模型推理状态 |
+| `tools/server/server-task.h` | 扩展必要的私有 v9 文件段元数据及统计；保持 token/media 身份、pending 原始内存预算语义 |
+| `tools/server/server-task.cpp` | 调整 `write_entry()`、`read_entry()`、`scan()`、`touch_entry()` 及文件版本识别；在原磁盘 worker 提交路径接入编码和解码，保留 CRC、配额、路径所有权与隔离语义 |
+| `tools/server/CMakeLists.txt` 与相关依赖构建文件（按实际仓库确认） | 添加固定版本 codec 依赖、编译选择与 Windows/CUDA 链接，保证默认关闭态可构建 |
+| `tools/server/tests/unit/` | 新增独立段 codec 与 v8/v9 兼容读写测试，包含损坏头、长度边界、CRC、未选 checkpoint 跳过等用例 |
+| `test-run/` | 追加单用户、单 Slot 的真实 KV 快照纯文本对照、混合版本重启以及读盘恢复脚本 |
+| `README.md`、`README_EN.md` | 仅在功能已实现后记录具体开关、依赖、格式兼容与已知限制 |
+| `change.md` | 实施人员填写实际代码修改与完成的检查 |
+| `projectSummary.md` | 仅在落地后更新当前总体结构、格式和数据流；不写未实现承诺 |
+
+## 五、与既往变更的兼容性
+
+- 原始 v8 主/草稿完整状态与 checkpoint 恢复必须继续工作。新写 v9 仅在 codec 显式开启时发生；功能关闭后原始序列化 API、文件写入和模型输出路径保持不变。
+- `server_disk_cache::preflight_materialize()`、`committed_check_locked()`、`inflight_check_locked()`、`covered_cheaply()`、`disk_cache_can_replace()`、配额事务与同步提交/失效通知不改身份和状态语义。
+- 目标和草稿恢复仍必须消费与原 state API 完全相同的原始字节；checkpoint 的保存范围/选择逻辑不变。
+- 目录只登记真实、完整、已提交并符合有效资格的条目；codec 编码成功不等于已经 `persisted`，预检查跳过更不是缓存命中。
+- `server_tokens::pos_next(K)` 与位置端点判定不改；媒体主动捕获仍处于 `media_state_unverified` 门禁，不能借此实验解除。
+- 多媒体输入的既有完整缓存恢复保持原有规则，但本实验在没有真实媒体环境时不得宣称其新格式兼容性已由端到端验证。
+- **不新增多用户、公网 API、安全鉴权或多 slot 调度能力**。
+
+## 六、验证检查清单
+
+### 6.1 开工前
+
+- [ ] 确认当前 `change.md`、`projectSummary.md`、源码 HEAD 与原 baseline 差异，以及本地构建产物实际版本。
+- [ ] 验证 `--cache-disk-codec none` 的 v8 写入与原始二进制布局、元数据 CRC、last_used 偏移、manifest v3 与缓存命中一致。
+- [ ] 为已存在的导出前预准入分支提供一次**直接的测试构建函数调用计数**：被 preflight 拦住的路径不得进入 `llama_state_seq_get_data_ext()`；不能只以累计导出日志作为证明。该检查不属于新算法变量。
+
+### 6.2 单段纯函数和文件布局
+
+- [ ] 空段、短段、不可压缩段、可压缩段、混合 codec/raw 段的编码-解码逐字节完全相等。
+- [ ] 多个 checkpoint 独立段：只选择其中一个时，其余段无需读取/解压，但段偏移与边界必须可验证。
+- [ ] 固定元数据与 CRC 的 v8 样本由新读端正常识别和恢复；v9 样本由新读端按段表独立校验，不尝试使用 v8 字段偏移解析 v9。
+- [ ] 新版时间戳 touch 不覆盖大小、CRC、段描述；读写时间字段前后的文件内容按预期不变。
+- [ ] 当压缩数据损坏、部分写入、段长溢出、codec 不认识或 CRC 不一致时，拒绝恢复且不得先写入 target/draft 上下文。
+
+### 6.3 真实 KV 状态与跨重启恢复
+
+- [ ] 固定相同模型、draft、KV 类型、上下文与输入序列，分别在独立目录中运行旧版 v8 和新 v9 的相同请求；每条路径在关闭/开启物化时保持原有 token 分解口径。
+- [ ] 首次真实导出后检查 raw/stored 物理字节来源、CRC、段数；以文件系统实际大小核对 `size_file` 和 `cache_disk_bytes`。
+- [ ] 强制退出并重启，对 v8、v9 及同目录混合版本进行实际 `source=disk` 恢复；`restored`、`reused_disk` 和 `prompt = reused_slot + reused_ram + reused_disk + prefill` 仍符合原定义。
+- [ ] 在输出对照中检查逐字节生成结果一致，且 `set_data_ext()` 接收的解压后原始 KV payload 与 `get_data_ext()` 导出的 bytes 一致；不得仅比较最终模型输出。
+- [ ] 核对 v8/v9 的 `read_bytes` 为真实物理读取字节，`decode_us` 仅表示编码器恢复耗时，与磁盘 IO 分离。
+- [ ] 比较正常 prefill、正常重复、公共前缀分叉、磁盘配额/TTL 淘汰、文件被 Windows 句柄占用后回收、强杀重启等路径；不改变原文件所有权与删除失败隔离机制。
+
+### 6.4 checkpoint、媒体和异常
+
+- [ ] 构造多个有效 checkpoint，分别恢复可选择首个、中间、最后一个的请求，验证 checkpoint 选择与恢复所需数据等价；没有真实 checkpoint 的环境必须说明未验证，不得用纯结构样本代替真实模型证据。
+- [ ] 验证原始/压缩段混存、未选 checkpoint 的 seek、解压失败后完整状态回退、rollback 删除失败和配额拒绝时的 manifest/目录状态。
+- [ ] 媒体身份元数据、边界与完整缓存不变量仍被严格检查；真实 mtmd 模型不可用时，保持门禁且明确注明未做真实端到端。
+- [ ] 不调用任何任意 token 区间的 KV blob 切片；禁止因低成本读盘而绕过 checkpoint、CRC 或 target/draft 完整恢复校验。
+
+## 七、交付记录与范围
+
+- 本文件只记录**当前这一个算法修改**的实验规划和修改日志，不写预想提升值、训练早停、计算资源报告、最终性能裁决规则。
+- 本项目无训练过程；训练流水线不变。推理仅增加对既有完整状态字节的无损分段编码/解码，关闭态不受影响。
+- 实验人员在实际改动后追加 `change.md`；`projectSummary.md` 只描述真实已实现的架构和格式。
+- 若编码实验需要修改 llama.cpp 底层状态导出 API 才能实现，立即记录阻塞位置，保留既有 v8 缓存路径，不在同一实验中转向另一套 KV 状态切分算法。

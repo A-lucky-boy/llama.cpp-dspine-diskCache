@@ -659,6 +659,7 @@ struct common_params {
     int32_t     cache_disk_idle_flush = 60;   // mirror the RAM cache to disk after N seconds of inactivity, 0 = disable
     int32_t     cache_disk_ttl       = 0;     // --cache-disk-ttl: drop entries unused for N seconds, 0 = never expire
     int32_t     cache_disk_queue_max_mib = 24576; // --cache-disk-queue-max: pending disk-cache write budget (MiB), -1 = no limit
+    std::string cache_disk_codec     = "none";  // --cache-disk-codec: "none" keeps v8, "lz" writes v9 with per-segment encoding
 
     // optional per-request breakdown of where the prompt tokens came from
     // (slot, RAM tier, disk tier, actual prefill) and why a lookup failed

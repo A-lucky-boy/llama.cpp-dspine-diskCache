@@ -1759,13 +1759,31 @@ private:
                 cache_config_sig = sig;
 
                 if (!params_base.cache_disk_path.empty()) {
+                    // the codec decides the on-disk layout of new entries only. An
+                    // unknown name is refused here rather than falling back, because
+                    // a write in the wrong format is not something a log line can undo
+                    disk_cache_codec_mode codec = disk_cache_codec_mode::none;
+
+                    if (!disk_cache_codec_mode_parse(params_base.cache_disk_codec.c_str(), codec)) {
+                        throw std::invalid_argument(string_format(
+                                    "unknown --cache-disk-codec '%s' (expected 'none' or 'lz')",
+                                    params_base.cache_disk_codec.c_str()));
+                    }
+
+                    if (codec != disk_cache_codec_mode::none) {
+                        SRV_INF("disk cache: writing new entries with per-segment '%s' encoding (format v%d); "
+                                "existing files keep the format their header records\n",
+                                disk_cache_codec_mode_name(codec), 9);
+                    }
+
                     prompt_cache->init_disk(
                             params_base.cache_disk_path,
                             cache_config_sig,
                             params_base.cache_disk_max_mib,
                             params_base.cache_disk_min_tokens,
                             params_base.cache_disk_ttl,
-                            params_base.cache_disk_queue_max_mib);
+                            params_base.cache_disk_queue_max_mib,
+                            codec);
                 }
             }
 
