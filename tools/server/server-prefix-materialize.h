@@ -52,15 +52,38 @@ struct disk_cache_materialize_plan {
     size_t prefix_tokens = 0; // the position the prefill batch must stop at
 };
 
+// one media chunk, as a half-open token range [start, end)
+struct disk_cache_media_chunk {
+    size_t start = 0;
+    size_t end   = 0;
+};
+
+// true when token index `k` falls strictly inside one of the chunks.
+//
+// The endpoints are deliberately *not* inside a chunk: a chunk occupies its whole
+// range at once, so a prefix that ends exactly where a chunk starts, or exactly
+// where one ends, still describes a complete state over the tokens before it.
+// Only a prefix ending between a chunk's first and last token has no boundary to
+// stop at.
+//
+// `chunks` must be non-overlapping and ordered; the caller validates that first.
+bool disk_cache_prefix_in_media(size_t k, const std::vector<disk_cache_media_chunk> & chunks);
+
+// structural validation of the chunk list taken from the request. A malformed
+// list must refuse materialization rather than be treated as "no media": the
+// alternative would be capturing a prefix whose media boundary is unknown
+bool disk_cache_media_chunks_valid(const std::vector<disk_cache_media_chunk> & chunks, size_t n_tokens_total);
+
 // inputs describing this request, all of them already known before prefill starts
 struct disk_cache_materialize_request {
     bool   enabled             = false;
     size_t min_tokens          = 0; // the disk tier's own minimum, not the directory's
     size_t n_input_tokens      = 0; // tokens the task wants to process
     int64_t n_past             = -1; // how much of the prompt is already in the KV
-    bool   has_media           = false;
-    size_t media_chunk_start   = 0; // start token of the first media chunk, if any
-    size_t media_chunk_end     = 0; // one past its end
+    // the request's real media chunks. an ordered, non-overlapping list, not one
+    // span from the first to the last: a prefix ending between two chunks is a
+    // legal boundary and must not be refused
+    std::vector<disk_cache_media_chunk> media_chunks;
 };
 
 // pick the longest eligible candidate that is both long enough for the disk tier
@@ -68,3 +91,56 @@ struct disk_cache_materialize_request {
 disk_cache_materialize_plan disk_cache_plan_materialize(const disk_cache_materialize_request & req,
         const std::vector<disk_cache_materialize_candidate> & candidates,
         disk_cache_materialize_skip & skipped);
+
+//
+// where a capture stands, in terms of the two contexts' real sequence endpoints
+//
+// `end` is "one past the highest position the sequence holds", i.e. the number of
+// positions it covers - the same quantity `llama_memory_seq_pos_max() + 1` gives.
+// It is compared against the planned prefix length, so the comparison is in
+// tokens on both sides.
+//
+enum class disk_cache_capture_bounds : uint8_t {
+    exact = 0,     // both endpoints sit on the prefix: this is the only exportable state
+    target_short,  // the target has not reached the prefix yet
+    target_past,   // the target has moved beyond it
+    draft_short,   // the draft lags the target
+    draft_past,    // the draft has moved beyond it
+    draft_missing, // a draft context is configured but holds no positions
+};
+
+const char * disk_cache_capture_bounds_name(disk_cache_capture_bounds bounds);
+
+// A snapshot pairs the target and the draft state, so both must end exactly on
+// the prefix. "the batch was cut at K" makes this true for the target but says
+// nothing about the draft: speculative decoding advances it on its own path, and
+// a state copied across two contexts that disagree would describe a prompt that
+// was never executed.
+//
+// `has_draft == false` keeps the target-only path: a deployment without a draft
+// model has one context to check.
+disk_cache_capture_bounds disk_cache_check_capture_bounds(size_t prefix_tokens,
+        int64_t target_end, bool has_draft, int64_t draft_end);
+
+// select the checkpoints that may travel with a prefix snapshot.
+//
+// A checkpoint covers positions [pos_min, pos_max] and `n_tokens` tokens. The
+// snapshot has two bounds, and they are not the same number: it holds
+// `prefix_tokens` tokens, and its KV ends at position `prefix_pos_max`.
+//
+// With text only, positions and token indices coincide up to the off-by-one:
+// `prefix_tokens` tokens occupy positions [0, prefix_tokens), so the highest
+// covered position is `prefix_tokens - 1`. Comparing a checkpoint's `pos_max`
+// against `prefix_tokens` therefore admits one position too many - a checkpoint
+// whose KV the entry cannot account for.
+//
+// With media chunks the two bounds diverge further, since a chunk occupies more
+// positions than its token count. Each field is checked against its own bound.
+struct disk_cache_checkpoint_view {
+    int64_t pos_min  = 0;
+    int64_t pos_max  = 0;
+    int64_t n_tokens = 0;
+};
+
+bool disk_cache_checkpoint_fits(const disk_cache_checkpoint_view & ckpt,
+        size_t prefix_tokens, int64_t prefix_pos_max);

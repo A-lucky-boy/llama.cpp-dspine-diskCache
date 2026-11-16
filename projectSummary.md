@@ -71,6 +71,10 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| 物化边界须成对 | 捕获要求 target 与 draft 的序列端点都**恰好等于** K；缺 draft 配置时保持 target-only 路径。draft 落后/超前均只取消本次可选物化，不重算、不裁剪 opaque state |
+| 输入末端可捕获 | K 等于本次输入终点时，最后一个 prefill 批次会使 slot 转入 `DONE_PROMPT`；判定依据是实际序列端点而非 slot 状态，故该安全点同样可导出 |
+| 媒体区间按块判定 | 媒体约束是有序互不重叠的真实块集合，仅当 K 严格落在某块内部（`start < K < end`）才拒绝；块起点、块终点、块之间、全部块之后均为合法边界。结构不合法的块列表直接拒绝而非当作无媒体 |
+| checkpoint 双边界 | checkpoint 的 `n_tokens` 与 `pos_max` 分别对齐"快照声称的 token 数"与"实际 KV 末端位置"。文本下 K 个 token 占位置 `[0, K)`，因此位置上界是 `K-1`；原 `pos_max <= K` 的写法会多接纳一个位置。物化路径与通用 `capture_boundary()` 共用同一判定 |
 | 公共前缀主动物化 | `--cache-prefix-materialize`（默认关闭）：查询只读候选目录，把 prefill 批次精确截断在 `eligible` 前缀结束处，在两处上下文同步后用 `llama_state_seq_get_size_ext/get_data_ext` 导出完整序列状态，经 `server_prompt_cache::materialize()` 绕过 RAM 容量准入直入磁盘写队列。只有真实提交后目录才登记 `persisted` |
 | 物化四层计数不互冒充 | 规划（scheduled）、导出（exported）、物理提交（`cache_disk_entries`/`persisted_refs`）、真实复用（`reused_disk`）分别统计；候选、导出成功都不等于命中 |
 | 隔离条目绝不产生持久化引用 | 提交事件只发给 `is_reusable_entry()` 为真的条目；被拒绝且回滚失败的隔离条目留在 `entries` 仅为记账，前缀目录不会登记它。运行时与启动登记的资格判定一致，不会出现"运行期 persisted、重启后消失" |

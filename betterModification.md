@@ -2017,3 +2017,229 @@ tokenize / 已知本次请求 token-media 身份
 - 不更改模型计算图、采样概率、tokenizer、DSpine 逻辑或训练参数。
 - 若实际状态 API 在所需位置无法产出可完整恢复的 target/draft 状态，应如实记录具体 API、函数、位置和失败现象，不允许把不完整 blob 当作快照写入磁盘。
 - 不要求重新运行基线训练；对照基于同配置、同请求、相同服务端开关关闭的原有推理路径完成。
+
+---
+
+# 2026-11-16 01-12 - test1_3
+
+## 1. 本轮目标与实施约束
+
+**本节是既有公共前缀主动物化实现的正确性修复和必要回归补充，继续保留本方向全部设计记录；不是新缓存算法实验。** 当前已实现的“前缀目录 → 精确 prefill 安全点 → 完整 target/draft 序列状态导出 → 现有磁盘队列 → 有效提交 → 跨重启恢复”链路继续保留。现在的任务是收紧状态边界和输入边界，不能在尚有明显实现缺口时直接建设 KV 分块或增量存储。
+
+部署边界：单用户、本机、单实例、`-np 1`；不开发登录鉴权、网络安全、多租户缓存隔离或多 slot 调度。**模型状态一致性是算法正确性，不是网络 API 安全机制**，仍属于本轮必检内容。
+
+本轮只处理以下四个问题：
+
+1. draft 状态可能越过捕获前缀边界却未被拒绝；
+2. 捕获前缀恰好等于当前完整输入末尾时，slot 状态切换会跳过物化；
+3. 多个媒体块之间的合法边界可能被单个粗粒度区间错误拒绝；
+4. checkpoint 端点存在需要确定性确认的边界包含关系，防止超出被捕获前缀的检查点进入快照。
+
+另外补齐已有开关依赖说明，不允许静默无效；该配置处理属于兼容性修正，非新算法方向。
+
+## 2. 前置核对与 baseline 对比
+
+本次规划前已先检查仓库 `change.md` 最新 `2026-11-16 01-05 - Change Record`，检查上传的《2026-11-16-handover-v5-prefix-materialize.md》，核对 `projectSummary.md` 以及 GitHub 上相关模块源码：
+
+- 仓库：`A-lucky-boy/llama.cpp-dspine-diskCache`；检查时 `main` HEAD 为 `010c68ad4675cbde1c2c7c303ab5d1ba11459546`（本轮交付报告提交），对应实际功能代码提交 `ab6bac21c1d87e4c63aa9e6e673b0134cb14d61b`。
+- 功能起点 `147001c920436d03688428bf6388db77e75472e3`，原始改造前 baseline `eb7681889f44304d2bd5b3e41572f5530af91a1d`。已用提交对比核查新增修改集中于 `server-context.cpp`、`server-task.cpp/.h`、`server-prefix-materialize.*`、参数与文档；原始 baseline 没有主动前缀物化与捕获计划。
+- 已检查 `server_prompt_cache::materialize()` 的完整状态导出：使用 `llama_state_seq_get_size_ext/get_data_ext`，检查 target/draft 实际写入字节数与预计大小相等，复用 `disk->store()`。该链路没有实施序列化 blob 的任意 token 切片。
+- 已检查 `server_context::plan_prefix_materialize()`、`materialize_prefix()`、prefill 填充循环与 `post_decode()` 的状态迁移；下面三个缺口均定位于新增逻辑。报告所述单用户纯文本主路径已有端到端与关闭态测试，因此不推翻已实现的路径。
+
+编码人员开工**先再次阅读本地最新 `change.md`，再核对工作树与 baseline 差异**。记录本地 `git rev-parse HEAD`、`git status --short`、构建二进制版本、当前 `projectSummary.md`；若远端又有变化，先确认本节缺陷是否已经修复。若发现额外的明显错误，先处理错误，不同时引入新的缓存策略。
+
+## 3. 缺陷 A：draft 序列上界未检查
+
+### 3.1 位置及成因
+
+文件：`tools/server/server-context.cpp`，`materialize_prefix(server_slot & slot)`。
+
+主模型执行：
+
+```cpp
+const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+// pos_max + 1 == K 才导出
+```
+
+草稿模型当前只排除：
+
+```cpp
+if (dft_pos_max < 0 || (size_t) dft_pos_max + 1 < K) {
+    // reject
+}
+```
+
+缺少 `dft_pos_max + 1 > K` 分支。即便常规 `common_speculative_process()` 应使两者对齐，也不能把“调用成功”直接等同于“两个 seq 的边界必然相同”；当前接口已经检查 draft 位置，就应检查**完整等值关系**。这是可以直接从分支条件确认的静态正确性缺口，但尚未证明常规测试环境会自然产生 draft 超前状态。
+
+### 3.2 修改要求
+
+1. 导出前计算 `target_end`、`draft_end`，要求当前序列的捕获端点都严格等于 `K`；对 `pos_max < 0`、`pos_max + 1 < K`、`pos_max + 1 > K` 分别处理。
+2. **target 已到 K 而 draft 尚未到 K**：不得导出不成对状态；记录缺失同步条件，保守取消本次物化或交由已经存在、受控的状态同步流程完成，不能为了缓存自行重算已算 token。
+3. **draft 超过 K**：必须拒绝当前捕获，不能从 draft opaque state 中按字节裁剪；若后续使用了正式的 seq truncate API，也必须先证明该调用不会影响正在执行的真实推理任务，本轮优先拒绝。
+4. 当 `ctx_dft == nullptr` 时保持 target-only 原路径，不把草稿检查误作为强制前置条件。
+5. 在生成 `server_prompt_cache_state` 之前完成所有边界检查，避免无效状态造成 GiB 级内存申请与文件排队。
+
+建议引入可独立测试的状态边界判定函数，供生产 `materialize_prefix()` 直接调用，单测不要复制另一套相似条件。
+
+## 4. 缺陷 B：当 K 等于输入终点时可能漏掉合法捕获
+
+### 4.1 位置及成因
+
+`tools/server/server-context.cpp` 的 prefill batch 构造和 `decode()` 中 `post_decode()` 之后的物化循环。
+
+当前物化循环仅处理 `SLOT_STATE_PROCESSING_PROMPT`；对 `SLOT_STATE_DONE_PROMPT` 且 `K <= slot.prompt.n_tokens()` 的计划直接置 `done` 并统计 skipped。对于被目录识别出的合法前缀 `K == slot.task->n_tokens()`，最后一个 prefill batch 结束时 slot 正好转为 `DONE_PROMPT`，从而跳过独立物化。现有 `capture_boundary(INPUT)` 可以在某些配置下保存 RAM 状态，但功能默认 `none` 时不能依赖它自动生成独立磁盘快照。
+
+### 4.2 修改要求
+
+1. 不得把 `SLOT_STATE_DONE_PROMPT` 统称“已经越过 K”。要依据**实际 target/draft 状态端点**判断是 `==K` 还是 `>K`。
+2. 对 `K == 本次输入终点`，应在模型状态已经准确计算到 K、尚未采样新 token、且 target/draft 同步的安全点捕获一次；复用 `materialize_prefix()`，不得复制第二套状态导出和写盘代码。
+3. 需核对与现有 `post_decode()` 内 `capture_boundary(INPUT)`、`observe_prefix()`、`SLOT_STATE_GENERATING` 状态变更的顺序，确保物化发生在生成前且本请求仍持有正确 token/media 身份。
+4. 对 `K < 本次输入终点` 的已测中间批次流程保持原状；如果 DONE_PROMPT 时 `pos_max + 1 > K`，必须保守跳过，不能把更长序列写成 K 快照。
+5. `n_past == K` 的已修复路径应维持直接捕获，不应再次进入空批次循环；`K == n_input` 与 `n_past == K` 可同时发生，须避免重复导出和双计数。
+6. 对取消、任务切换及同一任务的 prompt 重试，利用已有 request-scoped `task_id/armed/done` 防止旧计划在 slot 复用后触发。
+
+## 5. 缺陷 C：多媒体块被当成单个连续媒体区间
+
+### 5.1 位置及成因
+
+`tools/server/server-context.cpp::plan_prefix_materialize()` 当前把 `media_indices.front()` 到 `media_indices.back() + media_token_counts.back()` 作为单个范围，填入 `disk_cache_materialize_request.media_chunk_start/end`。`server-prefix-materialize.cpp` 则只检查这一段。
+
+对于媒体块 `[10, 20)` 与 `[40, 50)`，位于 `K=30` 的真实前缀终点**不在任何一个媒体块内部**，却落在 `[10, 50)` 的聚合区间内部，从而被误拒绝。该问题是过度保守的误拒绝，不能据此声称有错误 KV 被恢复。报告中的真实媒体端到端测试尚未覆盖。
+
+### 5.2 修改要求
+
+1. 将请求侧的单一 `media_chunk_start/end` 改为**有序、互不重叠的真实媒体块区间集合**，来源于当前任务的 `media_chunk_indices()` / `media_chunk_token_counts()`。
+2. 对任意 K，只有当存在实际媒体块满足 `start < K < end` 时拒绝。位于块起点、块终点、两个媒体块之间或全部媒体块之后的 K，在这项边界检查中均应视为合法；其能否形成完整状态仍由真实 target/draft 安全点检查决定。
+3. 输入校验要求区间端点计算无溢出、块长度非零、范围不越过 token 序列长度、区间排序且不重叠。任何输入结构不合法都应拒绝物化，而不是将其当成无媒体输入。
+4. 统一复用已有磁盘缓存 `disk_cache_match_prefix()` 的媒体身份语义；不改变 token 占位符、media ID 或底层多模态编码逻辑。
+5. 如当前真实 mtmd 处理路径仍不能保证媒体块之间的 target/draft 状态完全一致，应额外采用保守的“本请求有媒体则跳过主动捕获”保护。只在能证明物化完整状态可恢复之后，才允许真正写盘；不能因为媒体范围检查通过就宣称整个多模态路径被验证。
+
+## 6. 缺陷 D：checkpoint 边界的包含关系需要核查并修正
+
+### 6.1 位置与待证明前提
+
+文件：`tools/server/server-context.cpp::materialize_prefix()`：
+
+```cpp
+if (ckpt->pos_max <= (llama_pos) K) {
+    snapshot.checkpoints.push_back(ckpt);
+}
+```
+
+同一方法的 target KV 边界要求 `pos_max + 1 == K`。若状态位置从 0 开始且前缀总计 K 个 token，则实际最大合法 KV 位置为 `K-1`，而条件 `ckpt->pos_max <= K` 可能接纳一个额外位置的检查点。已有通用边界捕获路径也采用近似写法，因此**不能仅凭表面不等式断言当前测试模型已经损坏**；需要结合位置映射、`n_tokens`、`pos_min` 和混合记忆后端说明进行确定性证明。
+
+### 6.2 修改要求
+
+1. 阅读当前仓库的 `server_prompt`/checkpoint 位置元数据和 `llama_memory_seq_pos_max()` 的定义，明确 pos 与 token 数映射，覆盖非零起始位置与 SWA/混合记忆场景。
+2. 用实际已验证的 KV 末端 `pos_max`，而不是直接假设 `K` 即最大合法位置，筛选 checkpoint；核对 `ckpt->pos_min`、`ckpt->pos_max`、`ckpt->n_tokens` 均不越过捕获端点。
+3. 若确认代码存在 off-by-one，修复物化路径；同时审查常规 `capture_boundary()` 是否有同类问题。若后者确有通用缺陷，只做最小必要修复，不借机改变 checkpoint 策略或引入新存储格式。
+4. 在没有可用真实 checkpoint 模型时，构造纯元数据的边界测试，但明确记录“未执行真实模型检查点恢复”，不能将纯单测结论当成真实模型验证。
+
+## 7. 配置依赖与轻量诊断修正
+
+报告已明确指出：`--cache-prefix-materialize` 在未启用 `--cache-prefix-discovery` 或未配置磁盘层时会静默无效。更改为启动参数校验或一次性清晰诊断（任选其一，且遵循现有 CLI 风格）：
+
+- `--cache-prefix-materialize` 开启但前缀目录关闭：说明需要同时启用发现功能；
+- 开启但磁盘层不可用：说明需要启用磁盘缓存；
+- 开启且两个依赖齐全：正常启动、无需额外日志噪声；
+- 功能未开启：默认关闭态的日志与执行路径不应发生变化。
+
+本机单用户部署不需要新增 HTTP 鉴权、权限系统或多租户安全逻辑。本节只修复配置可理解性。
+
+## 8. 预期修改文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `tools/server/server-context.cpp` | 修复 target/draft 精确边界判断；支持合法 `DONE_PROMPT` 安全点捕获；按真实媒体块集合构造候选约束；收紧 checkpoint 过滤；加必要的依赖提示 |
+| `tools/server/server-prefix-materialize.h` | 将媒体范围从单个首尾区间改为多个实际区间；如添加端点状态纯函数，保持结构简单 |
+| `tools/server/server-prefix-materialize.cpp` | 修正多媒体块合法边界判断、输入验证和纯元数据拒绝原因；不新增 KV 序列化逻辑 |
+| `tools/server/tests/unit/test_prefix_materialize.cpp` | 增加多个媒体块、中间合法边界、target/draft 提前/超前、输入末端 K、上下文错位、checkpoint 边界等针对性测试 |
+| `tools/server/server-task.cpp/.h` | 原则上不改磁盘写盘、配额或 v8/v3；仅当单一状态判定函数需要共享时做最小改动 |
+| `common/arg.cpp` | 如选择启动时参数依赖诊断，则在此实现；不新增更多用户配置 |
+| `test-run/pmat.py` 及现有脚本 | 新增 `K == input_end`、`n_past == K`、多分支请求、重启恢复与取消/重试场景，覆盖异常状态回收 |
+| `change.md` | 实现人员只记录真实修改、实际执行的单测/集成检查及仍未覆盖项 |
+| `projectSummary.md` | 修复完成后更新整体项目的状态导出边界、输入末端捕获与多媒体块限制，保持现状一致 |
+
+不得为了本轮修复修改 `src/llama-context.cpp` 的 opaque state 格式、目标/草稿模型计算、DSpine speculative decoding、RAM/Disk 容量算法、768 KiB/token 成本守卫或 4096-token 写入抑制。
+
+## 9. 预期数据流变化
+
+### 9.1 捕获计划与 prefill
+
+```text
+tokenize → 精确 token/media 候选识别 → 计划 K
+     → n_past 与真实 KV 状态定位
+        ├─ K < n_past：跳过，绝不回退切片
+        ├─ K = n_past：验证 target/draft 恰好到 K → 直接捕获
+        └─ K > n_past：以 K 截断成功 prefill 批次
+               ├─ slot 仍 PROCESSING_PROMPT → 到 K 后捕获
+               └─ slot 已 DONE_PROMPT 且 K=input_end
+                    → 在生成前检查两处状态恰好 K → 捕获
+```
+
+### 9.2 实际状态检查与物理提交
+
+```text
+到达 K → 确认 target_end == K
+       → 若有草稿，则确认 draft_end == K
+       → 核对 prompt token/media 身份与 checkpoint 范围
+       → 由推理安全点调用完整序列 get_size_ext/get_data_ext
+       → 复用 disk->store()、配额准入、manifest 和提交通知
+       → 仅真实入库的有效条目变成 persisted
+```
+
+任何状态不同步只允许取消本次可选物化，不得中断正常已合法的 prefill，也不得写入不一致的 KV 快照；捕获报错若影响底层状态，应沿用原有状态清理/推理错误机制，不自行添加不安全恢复路径。
+
+## 10. 对推理/训练流水线及既有实现的影响
+
+- **训练流水线**：无训练；权重、数据、梯度、训练 checkpoint 完全不变。
+- **推理流水线**：只完善新增物化支路的正确边界、合法候选选择和诊断。未启用 `--cache-prefix-materialize` 时，不得新增 prefill 分批、序列状态导出或额外快照入队。
+- **DSpine draft**：不得把 draft 位置超过 K 的完整状态与 target 精确 K 状态组合成一个快照。保持原有 target/draft 参数及其状态恢复 API。
+- **文件协议**：v8 快照、v3 manifest、CRC64、LoRA/mmproj/config 签名、完整性先校验后恢复全部保留；不需要缓存文件迁移。
+- **缓存身份**：公共前缀 `observed/eligible/persisted` 与真实 `reused_slot/reused_ram/reused_disk` 不混算；本轮不通过降低门槛来增加表面命中。
+- **生命周期**：继续使用单一磁盘 worker、稳定路径所有权、隔离记账、配额准入和单调事件 epoch；不新增第二套前缀写入/通知系统。
+- **适用范围**：本机单用户 `-np 1`；多 slot、多租户、公网鉴权、Linux 不是本轮开发目标。正常关闭态仍为 baseline 行为。
+
+## 11. 验证检查清单
+
+### 11.1 版本、源码、关闭态
+
+- [ ] 复读最新 `change.md`，核实 commit、`git status`、二进制构建版本与当前 baseline；确认变更仅涉及本轮相关文件。
+- [ ] `--no-cache-prefix-materialize` 下完整请求 prefill token 分解和输出 sha 与同源码关闭态一致，无物化特征日志和磁盘额外条目。
+- [ ] 显式开启物化但关闭任一依赖，产生清晰配置说明，不发生静默假成功。
+
+### 11.2 target/draft 精确状态
+
+- [ ] 用纯函数单测分别构造 target=K、draft=K；target=K、draft<K；target=K、draft>K；target<K、draft=K；target>K、draft=K；仅 target 无 draft 等状态。除合法边界外不得调用完整状态导出。
+- [ ] 通过可控的 seq-position 夹具验证草稿“超前 K”确实被拒绝，而不是仅检验“小于 K”分支。
+- [ ] 对所有失败分支，确认不生成 `disk->store()`，`exported` 不增加，slot 后续正常请求处理不改变。
+
+### 11.3 输入末端与批次边界
+
+- [ ] `K < n_input` 的既有主路径仍能在 K 的中间批次精确捕获。
+- [ ] `K == n_input`、`n_past < K`、捕获发生在 `DONE_PROMPT` 到 `GENERATING` 之前时，可以导出准确的前缀状态，不被误标“越过边界”。
+- [ ] `K == n_input` 且 `n_past == K` 的组合不产生空批次、不双重捕获、不执行未必要的重复 decode。
+- [ ] `K < n_input` 但状态已经超过 K 时，跳过物化，不把长序列写成短前缀文件。
+- [ ] 校验实际新分支与 `capture_boundary(INPUT)`/`observe_prefix()` 的调用顺序、观察次数、已有写盘去重机制的兼容性。
+- [ ] context shift、取消和 decode 重试时不残留上一请求计划；不制造一批 0 token 的永续循环。
+
+### 11.4 媒体块与 checkpoint
+
+- [ ] 两个媒体块间存在合法 K 时不会仅因首尾合并区间被拒绝；落入任一真实块内部时必须拒绝。
+- [ ] K 恰好等于单块起点/终点、两块之间、多块末尾；媒体信息重叠/乱序/越界；均有确定性结果。
+- [ ] 多模态状态可否安全捕获，须通过真实输入/模型检查；未运行真实多模态测试时不能宣称全媒体支持。
+- [ ] checkpoint 在 K-1、K、K+1 附近的 pos_max 和 n_tokens 要验证合法性；超出实际 KV 端点的 checkpoint 不能进入快照。
+- [ ] 如果当前模型没有 checkpoint，需记录未验证的实际模型类别，不得把元数据单测冒充完整端到端恢复。
+
+### 11.5 磁盘复用和资源
+
+- [ ] 新导出的前缀仍走原 `disk->store()`、真实配额准入、完整性校验与原子写入；不绕过 RAM 时序规则或伪造物理引用。
+- [ ] 按相同模型/上下文配置重启，从纯磁盘读取恢复合法 K 前缀，使用 `source=disk` 与 `reused_disk` 核对真实复用；`restored`、`candidate_lcp` 不代替 `reused_disk`。
+- [ ] 比较同请求的开启态/关闭态输出、`prompt = reused_slot + reused_ram + reused_disk + prefill`；报告实际测试口径。
+- [ ] 对目标/草稿不同步、媒体元数据错误、checkpoint 超界、删除/配额失败，保持原有隔离和回退语义。
+
+## 12. 交付与文档约束
+
+- 开发人员交付实际源码提交、更新的 `change.md`、相关单元与单用户回归记录；只有已经实施的结构写入 `projectSummary.md`。
+- 本 `betterModification.md` **仅记录实验规划与算法修改日志**，不预填实验结果、性能预测、早停要求、计算报告或最终优劣判定规则。
+- 本次不启动分块 KV、增量写入、范围读取、热点淘汰等新的算法实现；先修复现有前缀物化路径的问题。

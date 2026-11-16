@@ -1802,3 +1802,187 @@ limit = 800 MiB
   - **context shift / 任务取消 / decode 重试下的重复捕获**：捕获点已限定在 `PROCESSING_PROMPT` 且校验 `pos_max + 1 == K`，但规划 §8.3 要求逐一验证的这些异常时序未单独构造
   - **checkpoint 超出 K 的端到端**：单测覆盖了截断逻辑，运行中未构造带 checkpoint 的模型（当前为纯文本 Qwen，`do_checkpoint` 路径未实测）
   - **配额淘汰与短快照替代对物化对象的交互**：本轮未构造。物化对象走的是同一个 `store()` 与配额事务，前几轮已验证的准入/替代/隔离语义对它同样适用，但未针对该对象单独回归
+
+# 2026-11-16 03-20 - Change Record（test1_3：物化路径边界收紧）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 01-12 - test1_3` 修复公共前缀物化路径的四处边界问题，并补齐配置依赖诊断。基线 HEAD `010c68a`，功能提交 `ab6bac2`。本轮只改物化支路的正确性边界、候选选择与诊断；未启用该开关时批次划分、状态导出与写盘路径完全不变。
+
+### 缺陷 A：draft 端点未作等值检查
+
+`materialize_prefix()` 原先只拒绝 `dft_pos_max + 1 < K`。draft 越过 K 时不会被拒绝，而导出会把 target 的 K 状态与 draft 的更长状态组合成一个快照。
+
+修复为成对检查，抽出可独立单测的 `disk_cache_check_capture_bounds(prefix_tokens, target_end, has_draft, draft_end)`，返回 `exact / target_short / target_past / draft_short / draft_past / draft_missing`。仅 `exact` 允许导出；`target_short` 保留计划等下一批；其余一律记 skipped。`has_draft == false` 时保持 target-only 路径，不把草稿检查变成强制前置。
+
+### 缺陷 B：K 等于输入终点时被当作"已越过"
+
+`post_decode()` 的物化循环只处理 `SLOT_STATE_PROCESSING_PROMPT`，把 `DONE_PROMPT` 且 `K <= slot.prompt.n_tokens()` 一律置 done 并记 skipped。当 K 恰为本次输入终点时，最后一个 prefill 批次同时使 slot 转入 `DONE_PROMPT`，合法捕获因此被跳过。
+
+修复为：`DONE_PROMPT` 也交给 `materialize_prefix()`，由真实的 target/draft 端点决定是 `exact`（捕获）还是 `target_past`（跳过）。slot 状态只说明提示词处理完，不说明停在哪里。
+
+### 缺陷 C：媒体块被聚合为单一区间
+
+`plan_prefix_materialize()` 原先把 `media_indices.front()` 到 `media_indices.back() + media_token_counts.back()` 当作一个区间，两个媒体块之间的合法 K 被误拒绝。
+
+修复为有序互不重叠的 `std::vector<disk_cache_media_chunk>`：
+- `disk_cache_media_chunks_valid()`：拒绝空块、重叠、乱序、越界。校验在候选筛选**之前**执行——结构不合法即拒绝物化，不降级为"无媒体输入"
+- `disk_cache_prefix_in_media()`：仅 `start < K < end` 判为块内
+
+### 缺陷 D：checkpoint 位置上界 off-by-one
+
+原判定 `ckpt->pos_max <= (llama_pos) K` 把 token 数当作位置上界。
+
+**确定性证据**：本机真实 checkpoint 日志为 `pos_max = 8238, n_tokens = 8239`（`pos_max = n_tokens - 1`）；代码侧 `server_tokens::pos_next(n) = n`（纯文本）与 `update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max)` 一致。即 K 个 token 占位置 `[0, K)`，最大合法位置是 `K-1`。故 `pos_max == K`（`n_tokens == K+1`）的 checkpoint 会被原条件接纳，而快照只声称 K 个 token。
+
+修复为双边界判定 `disk_cache_checkpoint_fits(ckpt, prefix_tokens, prefix_pos_max)`：`n_tokens` 对齐快照声称的 token 数，`pos_max` 对齐实际 KV 末端位置。文本下取 `prefix_pos_max = K-1`；媒体下两者本就不等，各查各的。
+
+**通用路径同类问题**：规划 §6.2 第 3 条要求审查 `capture_boundary()`。该处第 2064 行同样写 `ckpt->pos_max <= (llama_pos) n_covered`，存在同一 off-by-one（且 `n_covered` 是 token 数，媒体下与位置不等价）。已改为调用同一判定并传入真实 KV 末端 `pos_max`。这是最小必要修复，未改动 checkpoint 策略或存储格式。
+
+### 配置依赖诊断
+
+`--cache-prefix-materialize` 开启但缺依赖时原先静默无效。现于启动时输出明确说明（二选一触发，依赖齐全时无额外日志）：
+
+```
+W srv load_model: --cache-prefix-materialize needs --cache-prefix-discovery: there is no prefix directory to take candidates from, so no prefix will be captured
+W srv load_model: --cache-prefix-materialize needs a disk cache tier (--cache-disk): a captured prefix has nowhere to be stored, so no prefix will be captured
+```
+
+## 修改文件
+
+### tools/server/server-prefix-materialize.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-prefix-materialize.h
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：媒体块结构、请求结构、新增端点判定与 checkpoint 判定
+- 具体变更：
+  - 新增 `disk_cache_media_chunk { start, end }`（半开区间）
+  - `disk_cache_materialize_request` 的 `has_media` + 单一 `media_chunk_start/end` 替换为 `std::vector<disk_cache_media_chunk> media_chunks`
+  - 新增 `disk_cache_media_chunks_valid()`、`disk_cache_prefix_in_media()`
+  - 新增 `disk_cache_capture_bounds` 枚举与 `disk_cache_check_capture_bounds()`
+  - 新增 `disk_cache_checkpoint_view` 与 `disk_cache_checkpoint_fits(ckpt, prefix_tokens, prefix_pos_max)`
+- 修改原因：规划 §5.2、§3.2、§6.2
+
+### tools/server/server-prefix-materialize.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-prefix-materialize.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：新增四个判定函数；`disk_cache_plan_materialize()` 的媒体检查与前置校验
+- 具体变更：
+  - 媒体块列表校验置于候选筛选之前，不合法立即返回 `skipped (media)`
+  - 块内判定改为对每个真实块做 `start < K < end`，命中后因列表有序可提前结束
+  - 端点判定与 checkpoint 双边界判定的实现
+- 修改原因：规划 §5.2、§6.2
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-context.cpp
+- 修改后路径：同名文件
+- 修改位置：`materialize_prefix()`、`plan_prefix_materialize()`、`post_decode()` 物化循环、`capture_boundary()`、启动依赖诊断
+- 具体变更：
+  - `materialize_prefix()`：改用 `disk_cache_check_capture_bounds()` 成对判定；`target_short` 直接 return 等下一批（不记 skipped、不置 done），其余非 `exact` 记 skipped 并置 done；checkpoint 过滤改用 `disk_cache_checkpoint_fits()` 并传入 `K-1`
+  - `plan_prefix_materialize()`：由 `media_indices` / `media_token_counts` 构造真实块列表
+  - `post_decode()`：`DONE_PROMPT` 与 `PROCESSING_PROMPT` 都交给 `materialize_prefix()`
+  - `capture_boundary()`：checkpoint 过滤改为同一判定，位置上界用真实 `pos_max`
+  - 启动时按缺失依赖输出清晰说明
+- 修改原因：规划 §3.2、§4.2、§5.2、§6.2、§7
+
+### tools/server/tests/unit/test_prefix_materialize.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_prefix_materialize.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：媒体用例改写 + 三个新用例组
+- 具体变更：
+  - `test_media_boundary()` 改用块列表；新增块外两侧（K=1023 / K=4096）合法
+  - `test_media_gap_is_legal()`：两块之间、块终点、块起点、块内、全部块之后、以及"更有候选跨越块间隙时最长者胜出"（新增）
+  - `test_media_chunks_malformed()`：重叠、乱序、空块、越界四种非法结构 + 合法结构对照（新增）
+  - `test_media_chunk_predicate()`：`disk_cache_prefix_in_media()` 在 10 个边界点上的取值（新增）
+  - `test_capture_bounds()`：`target=K / draft=K`、`draft<K`、**`draft>K`**、`target<K`、`target>K`、`draft_missing`、负端点、仅 target 无 draft 共 12 项（新增）
+  - `test_checkpoint_fits()`：按实测关系 `n_tokens = pos_max + 1` 构造，含 `pos_max == K`（原缺陷）、`n_tokens > K`、位置超界、`pos_min > pos_max`、负值、K=1 边界、以及媒体下两边界分离的场景（新增）
+- 修改原因：规划 §11.2、§11.4、§8
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：行为边界；projectSummary §3.1 不变量表
+- 具体变更：新增"物化边界须成对""输入末端可捕获""媒体区间按块判定""checkpoint 双边界"四条不变量
+- 修改原因：规划 §8、§12
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real），本轮 3 次
+- 检查结果：通过，`0 FAILED`。期间一次失败是我把 `\n` 写进诊断字符串导致 `C2001`（常量中有换行符），改为转义后通过。`--version` 为 `0.9.0-dev (build 31, commit 010c68a)`
+
+- 已执行检查：**缺陷 A 单测**（`test_capture_bounds`，12 项）
+- 检查结果：通过。覆盖 `target=K/draft=K`、`draft<K`、**`draft>K`（原缺失分支）**、`target<K`、`target>K`、`draft_missing`、负端点、仅 target 无 draft、以及"target 短且 draft 超前时优先报 target"
+
+- 已执行检查：**缺陷 C 缺陷复现**（把判定临时改回单区间语义）
+- 检查结果：**确认缺陷存在**。同一组用例出现 6 项失败：
+
+  ```
+  FAIL test_prefix_materialize.cpp:199: plan.capture
+  FAIL test_prefix_materialize.cpp:200: plan.prefix_tokens == 800 (0 vs 800)
+  FAIL test_prefix_materialize.cpp:206: plan.capture
+  FAIL test_prefix_materialize.cpp:210: plan.capture
+  FAIL test_prefix_materialize.cpp:301: !disk_cache_prefix_in_media(20, chunks)
+  FAIL test_prefix_materialize.cpp:302: !disk_cache_prefix_in_media(30, chunks)
+  FAIL test_prefix_materialize.cpp:303: !disk_cache_prefix_in_media(40, chunks)
+  ```
+
+  即 `K=800` 落在 `[600,1000)` 聚合区间内部被误拒，且块终点 700 / 块起点 900 也被误判为块内。恢复修复版后全部通过
+
+- 已执行检查：**缺陷 D 缺陷复现**（把位置上界改回 `pos_max > K`）
+- 检查结果：**确认缺陷存在**。出现 2 项失败：`!disk_cache_checkpoint_fits({0,100,100},100)` 与 `!disk_cache_checkpoint_fits({0,1,1},1)`——即 `pos_max == K` 与 `pos_max == 1, K == 1` 两个越界 checkpoint 被原条件接纳
+
+- 已执行检查：**确定性证据核对**（checkpoint 位置映射）
+- 检查结果：通过。真实服务日志 `created context checkpoint 1 of 32 (pos_min = 8238, pos_max = 8238, n_tokens = 8239)`，多条记录一致满足 `pos_max = n_tokens - 1`；代码侧 `server_tokens::pos_next()` 在 `!has_mtmd` 时返回 `n_tokens`，`create_checkpoint()` 调 `update_pos(n_tokens, pos_min, pos_max)`。两者共同证明 K 个 token 占位置 `[0, K)`
+
+- 已执行检查：**缺陷 B 端到端**（`test-run/logs/fix8-n2.log`，`--cache-prefix-materialize`，`--cache-ram 512`，`--cache-disk-min-tokens 256`）
+- 检查结果：**通过，且定点命中该场景**。task 37：
+
+  ```
+  cache_stats: prompt = 2477, reused_slot = 2101, reused_disk = 0, prefill = 376
+  plan_prefix_: materialize = scheduled, prefix = 2477 tokens, n_past = 2101
+  materialize_: materialize = exported, prefix = 2477 tokens
+  ```
+
+  即 K（2477）恰等于本次输入总长，`n_past = 2101 < K`，最后一个 prefill 批次恰好结束在 K 并使 slot 转入 `DONE_PROMPT`——修复前这里会被一律当作"已越过 K"而跳过。修复后成功导出
+
+- 已执行检查：**核心链路回归**（`fix8-n1.log` / `fix8-f1.log`）
+- 检查结果：通过。`scheduled → exported → stored → persisted_refs 1` 全链路正常；`fix8-n1.log` 中两次调度两次导出（含一次 `scheduled at n_past`），输出 sha 与上一轮逐字节一致（`f283d36a836120c4`、`452bdcadc89d353f`、`ad661337d3aa8896`、`b9febb26949711a2`）
+
+- 已执行检查：**重启后磁盘真实恢复**（`fix8-n2r.log`，同配置重启）
+- 检查结果：通过。`cache_scan_end: 1 entries`、`1 snapshot(s) registered`；请求恢复 `source = disk, reused_disk = 2102, read_bytes = 391363294, restored = 2102`，`read_bytes` 与文件大小一致；恒等式 `0 + 0 + 2102 + 394 = 2496` 成立
+
+- 已执行检查：**关闭态一致性与无噪声**（`fix8-off.log`）
+- 检查结果：通过。`--cache-prefix-materialize` 未开启时三个 materialize 指标全 0、`cache_disk_entries 0`；输出 sha 与开启态对应请求一致；无任何依赖诊断日志（诊断只在显式开启且缺依赖时输出）
+
+- 已执行检查：**依赖诊断**（`diag1.log` / `diag2.log`，均 `-ngl 0` 快速启动后终止）
+- 检查结果：通过。两条各触发一次，措辞明确指向缺失项；依赖齐全的正常启动未出现该警告
+
+- 已执行检查：四套独立单测
+- 检查结果：通过。`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`
+
+- 已执行检查：恒等式抽查（`fix8-n1.log` / `fix8-n2.log`）
+- 检查结果：通过。`2504 = 0 + 0 + 0 + 2504`、`2468 = 1476 + 0 + 0 + 992`、`2506 = 1476 + 0 + 0 + 1030`、`2540 = 1478 + 0 + 0 + 1062`、`2512 = 2101 + 0 + 0 + 411`、`2477 = 2101 + 0 + 0 + 376`，全部成立
+
+- 已执行检查：清理
+- 检查结果：通过。测试缓存目录、临时编译脚本与可执行文件、`__pycache__`、根目录 `.obj` 均已删除；`test-run/` 为 1.2 MB
+
+- 未执行的检查及原因：
+  - **真实模型 checkpoint 恢复**：规划 §6.2 第 4 条允许在无可用 checkpoint 模型时改用元数据测试并如实记录。本机 `--checkpoint-min-step` 默认 8192，且 `create_checkpoint()` 还需 `is_user_start` 或 `near_prompt_end` 条件；我用 14990 token 的纯文本输入仍未触发任何 checkpoint（`grep "created context checkpoint"` 为 0，全部来自历史日志）。因此**位置映射的确定性证据来自历史真实 checkpoint 日志 + 代码语义核对**，而非本轮运行；checkpoint 过滤的**运行验证未执行**，本轮只做了单测与通用路径的静态修复
+  - **媒体输入的端到端**：测试机为纯文本，无多模态模型与图片输入。`media_chunks` 构造、块内判定、非法结构拒绝全部由单测覆盖（含 4 种非法结构与 10 个边界点），但**未在任何真实 mtmd 输入下运行过**。规划 §5.2 第 5 条还提示：若真实 mtmd 路径不能保证块间 target/draft 状态一致，应采用"本请求有媒体则跳过"的保守保护——我**没有**实现该保守保护，因为无法在无多模态环境下判断是否必要
+  - **draft 超前的端到端**：单测覆盖了 `draft_past` 分支，但运行中 `common_speculative_process()` 之后 draft 与 target 始终对齐，未能自然构造 draft 越过 K 的场景，也未能注入
+  - **context shift / 取消 / decode 重试**：捕获点已限定在 `PROCESSING_PROMPT`/`DONE_PROMPT` 且要求端点严格等于 K，但规划 §11.3 要求逐一构造的这些异常时序未执行
+  - **多个媒体块的真实输入**：本轮无法构造，仅单测覆盖

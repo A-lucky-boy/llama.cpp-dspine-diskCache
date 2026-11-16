@@ -1769,6 +1769,19 @@ private:
                 }
             }
 
+            if (params_base.cache_prefix_materialize) {
+                // an explicitly requested feature that silently does nothing is
+                // worse than one that is off: say which dependency is missing
+                if (!params_base.cache_prefix_discovery) {
+                    SRV_WRN("%s", "--cache-prefix-materialize needs --cache-prefix-discovery: "
+                            "there is no prefix directory to take candidates from, so no prefix will be captured\n");
+                }
+                if (!prompt_cache->disk) {
+                    SRV_WRN("%s", "--cache-prefix-materialize needs a disk cache tier "
+                            "(--cache-disk): a captured prefix has nowhere to be stored, so no prefix will be captured\n");
+                }
+            }
+
             if (params_base.cache_prefix_discovery) {
                 prefix_index_options idx_opt;
                 idx_opt.min_tokens       = (size_t) params_base.cache_prefix_min_tokens;
@@ -2046,9 +2059,16 @@ private:
         snapshot.tokens.keep_first(n_covered);
 
         // a checkpoint that reaches past the captured prefix describes a state
-        // this entry cannot reproduce
+        // this entry cannot reproduce.
+        //
+        // both bounds are passed: `n_covered` is how many tokens the entry claims,
+        // while `pos_max` is the position its KV really ends at. with media chunks
+        // the last token's position is larger than its index, so the two are not
+        // interchangeable - checking a position against a token count is what
+        // admitted one extra position before
         for (const auto & ckpt : slot.prompt.checkpoints) {
-            if (ckpt->pos_max <= (llama_pos) n_covered) {
+            if (disk_cache_checkpoint_fits({ ckpt->pos_min, ckpt->pos_max, ckpt->n_tokens },
+                        n_covered, (int64_t) pos_max)) {
                 snapshot.checkpoints.push_back(ckpt);
             }
         }
@@ -2142,10 +2162,12 @@ private:
         req.n_input_tokens = slot.task->tokens.size();
         req.n_past         = n_past;
 
-        if (!media_indices.empty()) {
-            req.has_media         = true;
-            req.media_chunk_start  = media_indices.front();
-            req.media_chunk_end    = media_indices.back() + media_token_counts.back();
+        // the real chunk ranges, not one span from the first to the last: a prefix
+        // ending between two chunks is a legal boundary
+        req.media_chunks.reserve(media_indices.size());
+        for (size_t i = 0; i < media_indices.size(); ++i) {
+            const size_t start = media_indices[i];
+            req.media_chunks.push_back({ start, start + media_token_counts[i] });
         }
 
         disk_cache_materialize_skip skipped = disk_cache_materialize_skip::none;
@@ -2218,54 +2240,56 @@ private:
 
         const size_t K = slot.materialize.prefix_tokens;
 
-        // wait for the batch that ends exactly at the boundary. the loop in the
-        // caller stops filling at K, so the KV reaches K and not beyond; any
-        // earlier batch simply has not arrived yet and must not be treated as a
-        // failure - the next one will come
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-        if (pos_max < 0 || (size_t) pos_max + 1 < K) {
+        // both contexts are asked for the number of positions they cover, which is
+        // what `pos_max + 1` is. target and draft are checked together, because a
+        // snapshot pairs them: a state copied from two contexts that disagree
+        // would describe a prompt that was never executed
+        const llama_pos tgt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        const llama_pos dft_pos_max = ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1;
+
+        const disk_cache_capture_bounds bounds = disk_cache_check_capture_bounds(
+                K, (int64_t) tgt_pos_max + 1, ctx_dft != nullptr, (int64_t) dft_pos_max + 1);
+
+        if (bounds == disk_cache_capture_bounds::target_short) {
+            // the batch that ends at K has not been decoded yet. this is not a
+            // failure: the next one will arrive, so the plan stays armed
             return;
         }
 
-        // the KV never moved past K: the batch was cut there. a position beyond it
-        // would mean the snapshot no longer describes the prefix
-        if ((size_t) pos_max + 1 > K) {
-            SLT_WRN(slot, "cache_stats: materialize = skipped (memory moved past %zu to %d)\n",
-                    K, (int) pos_max + 1);
+        if (bounds != disk_cache_capture_bounds::exact) {
+            // the state cannot be paired up. nothing is exported and no file is
+            // queued - the prefix simply stays without its own snapshot
+            SLT_WRN(slot, "cache_stats: materialize = skipped (%s), prefix = %zu, target_end = %d, draft_end = %d\n",
+                    disk_cache_capture_bounds_name(bounds), K, (int) tgt_pos_max + 1, (int) dft_pos_max + 1);
             slot.materialize.done = true;
             counters_materialize.skipped++;
             return;
         }
 
-        // the token view must have exactly the prefix, no more: a snapshot that
-        // claims tokens whose KV is not there cannot be restored
+        // the token view must hold the prefix: a snapshot claiming tokens whose KV
+        // is not there cannot be restored
         if (slot.prompt.tokens.size() < K) {
             SLT_WRN(slot, "cache_stats: materialize = skipped (prompt has %zu < %zu tokens)\n",
                     slot.prompt.tokens.size(), K);
             slot.materialize.done = true;
+            counters_materialize.skipped++;
             return;
-        }
-
-        if (ctx_dft) {
-            // the draft context must describe the same prefix. a mismatch means
-            // the two contexts are not in step, and a snapshot from them would be
-            // inconsistent
-            const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
-            if (dft_pos_max < 0 || (size_t) dft_pos_max + 1 < K) {
-                SLT_WRN(slot, "cache_stats: materialize = skipped (draft holds %d < %zu)\n", (int) dft_pos_max, K);
-                slot.materialize.done = true;
-                return;
-            }
         }
 
         server_prompt snapshot;
         snapshot.tokens = slot.prompt.tokens.clone();
         snapshot.tokens.keep_first(K);
 
-        // a checkpoint past the prefix describes state this entry cannot reproduce
+        // a checkpoint that reaches past the snapshot's positions describes KV the
+        // entry cannot account for. the check is done before any buffer is sized,
+        // so a refusal here costs nothing
         for (const auto & ckpt : slot.prompt.checkpoints) {
-            if (ckpt->pos_max <= (llama_pos) K) {
+            if (disk_cache_checkpoint_fits({ ckpt->pos_min, ckpt->pos_max, ckpt->n_tokens },
+                        K, (int64_t) K - 1)) {
                 snapshot.checkpoints.push_back(ckpt);
+            } else {
+                SLT_WRN(slot, "cache_stats: materialize: dropping checkpoint (pos_min = %d, pos_max = %d, n_tokens = %lld) past prefix %zu\n",
+                        (int) ckpt->pos_min, (int) ckpt->pos_max, (long long) ckpt->n_tokens, K);
             }
         }
 
@@ -5528,28 +5552,21 @@ private:
         // been brought up to the same positions. this is the point in the request
         // where both contexts are known to describe the same prefix
         //
-        // only ordinary mid-prompt batches reach this code: a batch that finished
-        // the prompt switches the slot to DONE_PROMPT, which runs its own
-        // input-boundary capture
+        // a mid-prompt batch and the batch that finished the prompt are both
+        // handled. the second case matters: when the planned prefix ends exactly at
+        // the end of the input, the batch that reaches it also switches the slot to
+        // DONE_PROMPT - and the state at that moment is exactly what should be
+        // captured. whether this is a capture or a miss is decided from the real
+        // sequence endpoints inside materialize_prefix(); the slot state only says
+        // the prompt is finished, not where it stopped
         for (auto & slot : slots) {
             if (!slot.materialize.armed || slot.materialize.done) {
                 continue;
             }
 
-            if (slot.state != SLOT_STATE_PROCESSING_PROMPT) {
-                // the prompt reached its end in this batch, so the state has moved
-                // past the planned boundary. exporting now would produce a snapshot
-                // of a longer prefix, so the plan is dropped instead
-                if (slot.state == SLOT_STATE_DONE_PROMPT &&
-                        slot.materialize.prefix_tokens <= slot.prompt.n_tokens()) {
-                    slot.materialize.done = true;
-                    counters_materialize.skipped++;
-
-                    if (params_base.cache_stats) {
-                        SLT_INF(slot, "cache_stats: materialize = skipped (prompt ended past %zu)\n",
-                                slot.materialize.prefix_tokens);
-                    }
-                }
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+                // the slot moved on for some other reason (released, shifted, taken
+                // by a different task): this plan cannot be honoured
                 continue;
             }
 
