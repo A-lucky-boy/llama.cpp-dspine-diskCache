@@ -2444,15 +2444,17 @@ server_disk_cache::server_disk_cache(const std::string & dir, const std::string 
         } else if (qs == disk_cache_quarantine_status::absent) {
             // nothing was ever quarantined: the ordinary case
         } else {
-            quarantine_untrusted = true;
-            active = false;
-
             SRV_ERR("disk cache: the quarantine record in '%s' cannot be trusted (%s); "
                     "the disk cache is disabled for this run and the directory is left as it is, "
                     "because entries whose quarantine state is unknown must not be served\n",
                     dir.c_str(),
                     qs == disk_cache_quarantine_status::invalid ? "its contents do not validate"
                                                                 : "it could not be read");
+
+            // The same entry the runtime failures use. Nothing else runs yet, so
+            // there is no concurrency here - but one place that defines what
+            // "disabled" means is what keeps the two cases from drifting apart.
+            disable_disk_tier_locked("the quarantine record could not be trusted at startup");
 
             return;
         }
@@ -2656,11 +2658,14 @@ disk_cache_remove_status server_disk_cache::remove_file(const std::string & path
 void server_disk_cache::disable_disk_tier_locked(const char * why) {
     // mtx must be held. Idempotent, because it is reached from several failure paths
     // and the first one is the only one that has anything new to say.
-    if (!active && quarantine_untrusted) {
+    if (!active.load(std::memory_order_acquire) && quarantine_untrusted) {
         return;
     }
 
-    active = false;
+    // the store is what other threads observe; release pairs with the acquire loads
+    // in the entry points, so a thread that sees `false` also sees whatever this
+    // function did before it
+    active.store(false, std::memory_order_release);
     quarantine_untrusted = true;
 
     SRV_ERR("disk cache: the disk tier is now disabled for the rest of this run: %s\n"
@@ -2671,7 +2676,7 @@ void server_disk_cache::disable_disk_tier_locked(const char * why) {
 }
 
 bool server_disk_cache::disk_tier_usable_locked() const {
-    return active && !quarantine_untrusted;
+    return active.load(std::memory_order_acquire) && !quarantine_untrusted;
 }
 
 disk_cache_commit_status server_disk_cache::quarantine_entry(server_disk_cache_entry & e, const char * why) {
@@ -2783,6 +2788,43 @@ void server_disk_cache::scan() {
     SRV_INF("disk cache: cache_scan_manifest: %s, %zu record(s)\n",
             manifest_ok ? "hit" : "miss (full header scan)", manifest.size());
 
+    // One place that decides what happens when a rejected file cannot actually be
+    // removed. Two call sites needed this - `drop()` below and the `file_size` failure
+    // path - and having written the check in only one of them is exactly how a file
+    // ends up on disk with nothing recording that it exists. So the rules live here:
+    //
+    //   confirmed absent        -> nothing to keep
+    //   still present, or its state cannot be confirmed -> quarantine it, keep its
+    //                              bytes accounted for, and let the durable record
+    //                              carry that across a restart
+    //   record cannot be written -> the tier can no longer reconstruct its own state,
+    //                              so it stops (handled inside quarantine_entry)
+    //
+    // `size_known` matters: a file whose size was never measured must be marked
+    // unknown rather than charged zero, because zero is read as free space by the
+    // quota pass.
+    const auto quarantine_unremovable = [&](const std::string & path, const char * reason,
+                                            uintmax_t size_file, bool size_known) {
+        server_disk_cache_entry e;
+        e.path         = path;
+        e.size_file    = size_known ? (size_t) size_file : 0;
+        e.size_unknown = !size_known;
+        e.last_used    = 0;
+        e.quarantined  = true;
+
+        if (!size_known) {
+            n_size_unknown_paths++;
+        }
+
+        const disk_cache_commit_status recorded = quarantine_entry(e, reason);
+
+        total_size += e.size_file;
+        entries.push_back(std::move(e));
+        n_quarantined_kept++;
+
+        return recorded;
+    };
+
     for (const auto & de : fs::directory_iterator(dir, ec)) {
         if (ec) {
             break;
@@ -2814,9 +2856,27 @@ void server_disk_cache::scan() {
         std::error_code ec_size;
         const uintmax_t fsize = fs::file_size(de.path(), ec_size);
         if (ec_size) {
-            // vanished or unreadable mid-scan - not worth keeping either way
-            std::error_code ec_rm;
-            fs::remove(de.path(), ec_rm);
+            // The size could not be read. The file may have vanished mid-scan, or it may
+            // be present and unreadable - and those are not the same thing.
+            //
+            // So the removal result is checked rather than assumed. A confirmed removal
+            // ends the matter. Anything else means a file whose bytes were never
+            // measured is still on disk: it must not be published as a snapshot, and it
+            // must not be charged zero either, because zero is read as free space by the
+            // quota pass and would admit writes that do not fit.
+            const disk_cache_path_state st = disk_cache_remove_and_confirm(de.path().string());
+
+            if (st == disk_cache_path_state::confirmed_absent) {
+                continue;
+            }
+
+            SRV_ERR("disk cache: '%s' has no readable size (%s) and could not be removed%s; "
+                    "keeping it quarantined with an unknown footprint\n",
+                    de.path().string().c_str(), ec_size.message().c_str(),
+                    st == disk_cache_path_state::unknown ? " (its state could not be confirmed)" : "");
+
+            quarantine_unremovable(de.path().string(), "unmeasurable during the startup scan",
+                                   0, /*size_known=*/false);
             continue;
         }
 
@@ -2918,38 +2978,23 @@ void server_disk_cache::scan() {
             SRV_WRN("disk cache: dropping '%s': %s\n", de.path().string().c_str(), reason);
             f.close();
 
-            std::error_code ec_rm;
-            fs::remove(de.path(), ec_rm);
+            const disk_cache_path_state st = disk_cache_remove_and_confirm(de.path().string());
 
-            std::error_code ec_still;
-            const bool still_there = fs::exists(de.path(), ec_still);
-
-            if (!ec_rm && !ec_still && !still_there) {
+            if (st == disk_cache_path_state::confirmed_absent) {
                 n_dropped++;
                 return;
             }
 
-            SRV_ERR("disk cache: '%s' was rejected (%s) but its file is still present%s; "
+            // A rejected file that is still there is not "dropped" - it is a path whose
+            // bytes still occupy the disk and which nothing else in the ledger mentions.
+            // Its size was read successfully above, so it is charged for real.
+            SRV_ERR("disk cache: '%s' was rejected (%s) but its file could not be removed%s; "
                     "keeping it quarantined\n",
                     de.path().string().c_str(), reason,
-                    ec_still ? " (its state could not be confirmed)" : "");
+                    st == disk_cache_path_state::unknown ? " (its state could not be confirmed)" : "");
 
-            server_disk_cache_entry e;
-            e.path        = de.path().string();
-            e.size_file   = (uintmax_t) fsize;
-            e.last_used   = 0;
-            e.quarantined = true;
-
-            // the same routine the eviction paths use, so the durable record is written
-            // and a failure to write it disables the tier rather than being swallowed
-            if (quarantine_entry(e, "rejected during the startup scan") != disk_cache_commit_status::committed) {
-                n_quarantined_kept++;
-                return;
-            }
-
-            total_size += e.size_file;
-            entries.push_back(std::move(e));
-            n_quarantined_kept++;
+            quarantine_unremovable(de.path().string(), "rejected during the startup scan",
+                                   (uintmax_t) fsize, /*size_known=*/true);
         };
 
         char magic[8];
@@ -4581,7 +4626,7 @@ void server_disk_cache::dedup_prefixes() {
 
 bool server_disk_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
         prompt_cache_restore_info & info) {
-    if (!active) {
+    if (!active.load(std::memory_order_acquire)) {
         return true;
     }
 
@@ -4929,6 +4974,14 @@ void server_disk_cache::inflight_erase_locked(uint64_t hash) {
     inflight.erase(hash);
 }
 
+void server_disk_cache::cancel_pending_locked(const server_disk_cache_pending & pending) {
+    // mtx must be held. Give back the two things store() reserved when it queued this
+    // write: the queue byte budget and the in-flight identity slot.
+    queue_bytes -= std::min(queue_bytes, pending.bytes);
+    inflight_erase_locked(pending.hash);
+    counters.n_queue_cancelled++;
+}
+
 // Whether a committed entry already answers for `hash`. Extracted from store() so
 // the preflight and the write path answer the question the same way; a second copy
 // of this rule is how the queued and committed halves drifted apart before.
@@ -4983,7 +5036,7 @@ server_disk_cache::preflight_result server_disk_cache::preflight_materialize(con
     // the counters for this live with the caller: it is the one that knows whether
     // the answer was "skip" or "allowed", and this method stays const so it cannot
     // be mistaken for something that changes the tier
-    if (!active) {
+    if (!active.load(std::memory_order_acquire)) {
         return preflight_result::cache_unavailable;
     }
 
@@ -5061,7 +5114,7 @@ server_disk_cache::preflight_result server_disk_cache::preflight_materialize(con
 }
 
 void server_disk_cache::store(server_prompt_cache_state && state) {
-    if (!active) {
+    if (!active.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -5216,7 +5269,7 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
 }
 
 bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t budget_left) {
-    if (!active) {
+    if (!active.load(std::memory_order_acquire)) {
         return false;
     }
 
@@ -5518,6 +5571,28 @@ void server_disk_cache::worker() {
 
             pending = std::move(queue.front());
             queue.pop_front();
+
+            // The tier may have stopped between the moment this task was queued and
+            // now - a failure in another write is enough. Draining the queue anyway
+            // would mean the disabled cache keeps creating files, and the whole point
+            // of stopping is that it stops.
+            //
+            // Nothing has been written yet at this stage, so the task is simply
+            // released: the final path is untouched, no file appears, and the byte
+            // budget and identity slot go back to the callers that are still waiting
+            // for them.
+            if (!active.load(std::memory_order_acquire)) {
+                cancel_pending_locked(pending);
+                continue;
+            }
+        }
+
+        // re-checked here as well as above: the block that builds the identity below
+        // drops the lock, so a write could have failed on another path in between
+        if (!active.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(mtx);
+            cancel_pending_locked(pending);
+            continue;
         }
 
         const size_t n_tokens = pending.ids.size();
@@ -5579,6 +5654,17 @@ void server_disk_cache::worker() {
             pending_identity.media_ids          = &pending.media_ids;
             pending_identity.file_bytes         = bytes;
 
+            // Checked here, under the lock, because an acquire read earlier only said
+            // what was true at that moment. Between then and now another write could
+            // have failed and disabled the tier, and a decision taken after that must
+            // not be taken on the old state - so the check is repeated at the point
+            // where the decision is actually made.
+            if (!active.load(std::memory_order_acquire)) {
+                cancel_pending_locked(pending);
+                SRV_TRC("disk cache: %016" PRIx64 " cancelled, the disk tier is disabled\n", hash);
+                continue;
+            }
+
             const std::string target = dir + "/" + string_format("pc-%016" PRIx64 ".bin", hash);
             path_owner_scratch = claim_path_locked(hash, target, pending_identity, "write");
 
@@ -5618,7 +5704,12 @@ void server_disk_cache::worker() {
                             target.c_str());
 
                     quarantine_paths_drop(target); // undo the in-memory part of the failed add
-                    quarantine_untrusted = true;
+
+                    // The mark could not be recorded, so this process can no longer
+                    // tell which paths a restart will consider usable. Setting only
+                    // `quarantine_untrusted` would record the doubt without acting on
+                    // it; the tier has to actually stop, which is what this does.
+                    disable_disk_tier_locked("a write-ahead quarantine mark could not be recorded");
 
                     path_ok = false;
                 }
@@ -5731,7 +5822,7 @@ void server_disk_cache::worker() {
                             "recording one now\n", orphan.path.c_str());
 
                     if (quarantine_paths_add({ orphan.path }) != disk_cache_commit_status::committed) {
-                        quarantine_untrusted = true;
+                        disable_disk_tier_locked("an orphan path could not be recorded as quarantined");
                     }
                 }
 
@@ -6026,7 +6117,7 @@ void server_prompt_cache::spill(server_prompt_cache_state & state) {
 }
 
 void server_prompt_cache::flush_to_disk() {
-    if (!disk || !disk->active || states.empty()) {
+    if (!disk || !disk->active.load(std::memory_order_acquire) || states.empty()) {
         return;
     }
 
@@ -6117,7 +6208,7 @@ bool server_prompt_cache::materialize(const server_prompt & prompt, llama_contex
 }
 
 void server_prompt_cache::mirror_latest(size_t budget) {
-    if (!disk || !disk->active || states.empty()) {
+    if (!disk || !disk->active.load(std::memory_order_acquire) || states.empty()) {
         return;
     }
 

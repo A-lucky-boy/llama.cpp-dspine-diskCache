@@ -3829,3 +3829,142 @@ candidate_lcp >= restored >= 真正进入推理状态的可复用 token 数
 ## 十二、交付约束
 
 本 `betterModification.md` 只记录**当前修复与功能测试规划**，不保存尚未运行的测试结果、性能预测、计算报告、早停要求或最终优劣裁决。修复后若仍发现明确的缓存功能错误，应先修复实际错误位置，而不是直接添加新的压缩/分块/热点淘汰算法。此轮不启动新的缓存性能优化方向。
+
+---
+
+# 2026-11-16 17-36 - test1_5
+
+## 一、实验目标与审查依据
+
+**性质：现有磁盘提示缓存的最后一轮定向正确性修复与回归。** 仅修复运行时 `fail-closed` 并发状态、队列中未完成写任务的处理，以及启动扫描时“大小读取失败且无法清理”的未记账文件路径。不得在本轮加入新的缓存算法、物理 KV 分块、压缩优化、投机解码改动、主动媒体 KV 写盘或多 slot 功能。
+
+规划前已先核对 GitHub `change.md` 最新的 `2026-11-16 17-40 - Change Record`、当前交付报告 `2026-11-16-handover-v15-quarantine-persistence.md` 和 `projectSummary.md`，逐函数审阅主仓库 `A-lucky-boy/llama.cpp-dspine-diskCache` 的 `tools/server/server-task.{h,cpp}`，并将最新功能提交 `af1c191a5c4b504aee990dc3cb8c60d51f8ace88`、最新文档提交 `689aaba146d2bf123f28c1ac51e88dc2cde4f661` 与原始 baseline `eb7681889f44304d2bd5b3e41572f5530af91a1d` 比较。
+
+当前版本已具备真正的隔离标记持久化、写前标记、失败时禁止恢复、小说文本的真实跨重启复用以及不同图片身份的隔离能力。正常文本和图像请求的主要缓存路径没有发现需要恢复 baseline 的直接错误。然而仍有下列源码可确认的边界错误：
+
+1. `server_disk_cache::active` 在头文件中仍是普通 `bool`，在后台 worker/持锁异常路径中被运行时写为 `false`，前台 `load/store/mirror/preflight_materialize` 及 `server_prompt_cache::flush_to_disk/mirror_latest` 则在不持同一锁的入口读取它，形成 C++ 数据竞争。原始 baseline 虽同样使用 `bool active`，但原有 disable 主要发生在单线程启动阶段；本次新增的**运行时 fail-closed 写操作**使这一同步问题成为实际并发正确性风险。
+2. worker 的“写前隔离标记添加失败”和“孤儿文件补充标记失败”分支仍存在直接写 `quarantine_untrusted = true` 而未调用 `disable_disk_tier_locked()` 的代码，违反该变量必须与 `active=false`、禁用后续磁盘读写同步联动的不变量。
+3. `server_disk_cache::worker()` 顶部的 `cv.wait()` / `queue.pop_front()` 循环未检查禁用状态。若某一写任务触发 fail-closed，队列已有任务仍可依次被 worker 取出并继续 `write_entry()`。仅禁止新任务入队不足以保证“磁盘层被禁用后无新增写入”。
+4. `server_disk_cache::scan()` 在 `fs::file_size(de.path(), ec_size)` 失败分支，执行 `fs::remove(de.path(), ec_rm)` 后无条件 `continue`，忽略删除是否成功及路径是否仍存在。若文件存在但无法测量且也无法删除，可能变成未登记、未隔离且未计入容量约束的路径。此前 `drop()` 的删除失败分支已经增加正确处理，本路径没有共享该处理。
+
+这些均是基于当前**源码控制流**的可确认问题或 C++ 同步不变量违反，不代表真实用户的正常推理已经发生错误；尚无定向故障注入或线程检查器证据，不得在后续日志中写成“线上故障已复现”。
+
+实验人员动手前应再次读取工作树最新 `change.md`，确认 HEAD、工作树与当前构建版本，复核上述函数和原始 baseline 的实际差异。如检查到更近提交已解决同一问题，先评估现有修复，不要重复改写。
+
+## 二、预期修改文件
+
+| 文件 | 修改范围 |
+|---|---|
+| `tools/server/server-task.h` | 将对外跨线程读取的 `active` 改为受一致内存同步协议约束的状态（推荐 `std::atomic<bool>`）；继续明确 `quarantine_untrusted` 与 `entries/queue` 只能在 `mtx` 下访问。按需要声明小型的队列封锁/占位清理辅助函数。 |
+| `tools/server/server-task.cpp` | `disable_disk_tier_locked()`、`load()`、`store()`、`mirror()`、`preflight_materialize()` 与 `worker()` 的状态读取/转换，两个直接赋值遗漏分支，`scan()` 的 `file_size` 错误和删除失败分支。 |
+| `tools/server/server-task.cpp` 的 `server_prompt_cache` 调用点 | `flush_to_disk()`、`mirror_latest()` 对 `disk->active` 的访问改为相同原子/锁规则，不触及模型缓存主数据。 |
+| `tools/server/tests/unit/test_disk_cache_lifecycle.cpp` | 增加状态同步、触发 fail-closed 后队列不再产生文件写入、异常路径占位/账本/侧车一致性单测。 |
+| `test-run/cache_fault_inject.py` 与测试目录下的 C++ 辅助夹具 | 用仅限测试构建的确定性障碍/文件操作失败注入，在 Windows 上运行真实 worker 和真实文件流；不把破坏性故障开关带入 Release。 |
+| `change.md` | 由实施人员填写实际修改和确实执行的验证事实。 |
+| `projectSummary.md` | 仅当修复真实落地后更新磁盘层 fail-closed 与扫描文件占用的一致性描述，以及剩余未覆盖的验收范围。 |
+
+不更改 v8/v9 KV 文件、manifest v3、`pc-quarantine.dat` 的 CRC 格式、原始 `llama_state_seq_get/set_data_ext`、完整 token/media 身份、`--cache-disk-codec` 默认值、`768 KiB/token` 成本闸门或 RAM/Slot 优先级。
+
+## 三、算法变更
+
+### 3.1 将运行时禁用变成线程安全、单向的状态切换
+
+- 仅在对象启动/配置初始化阶段初始化 `active`；运行期间触发的禁用必须是单向操作，采用 `active.store(false, std::memory_order_release)`；所有无锁入口以 `active.load(std::memory_order_acquire)` 判断。
+- `quarantine_untrusted` 保持在磁盘 `mtx` 下访问，不应在普通读路径无锁读取它。`disable_disk_tier_locked()` 是唯一负责组合更新 `quarantine_untrusted`、`active` 和诊断输出的入口。对已有 `disk_tier_usable_locked()` 做真正的代码复用，避免新增未被生产路径使用的辅助接口。
+- 两处仍直接执行 `quarantine_untrusted = true` 的分支必须改为调用 `disable_disk_tier_locked()`，并避免在其持锁执行时重新锁定 `mtx`。写前标记失败时不得修改最终 `pc-*.bin`；孤儿标记失败时不能把任何不可信文件作为正常恢复候选。
+- 一次入口的 acquire 读取只能证明**读取时**还未禁用，不能保证长操作期间状态不改变。因此在磁盘锁内进行候选选取、正式写入前准入、提交通知等决定时，应再次检查仍可用；不能用旧的缓存候选绕过后续 fail-closed。
+- 不能单纯把 `active` 改为 `atomic` 就认为恢复过程完全受保护：若禁用恰发生在 `load()` 的多百 MiB 无锁文件读取期间，需要在读取后、调用 KV `set_data_ext` 前或恢复许可的合适边界复核状态，并按既有安全回退语义处理。
+
+### 3.2 禁用后撤销队列中未提交的写入
+
+当前 writer 可能在“任务 A 触发禁用”后继续从队列取出任务 B。新增一致的队列关闭规则：
+
+```text
+任务 A 发现侧车/隔离状态无法可靠记录
+  → 持 mtx 调用 disable_disk_tier_locked()
+  → active 原子置 false，禁止新 store/mirror/preflight
+  → worker 后续检查队列：
+       已排队、未开始写盘 → 取消，不调用 write_entry()
+       已开始、尚未完成事务 → 按已存在的失败/隔离流程收口，不发布可恢复引用
+  → 对每个已取消 pending 扣减 queue_bytes、清除完整身份 inflight 占位
+  → 普通文本推理继续，磁盘层在此进程不再读写
+```
+
+- 清理队列不应假装文件写成功，不能发 `notify_committed()` 或增加真实 `reused_disk`。
+- worker 必须能继续响应 `stop_flag`，避免在磁盘禁用后析构等待死锁；建议把“跳过并释放本项占位”设计成单一、可测试的私有清理函数。
+- 必须保持磁盘队列与主请求线程使用同一互斥锁来管理 `entries`、`queue_bytes`、`inflight`，防止重复清除与错误计数。
+- 发生故障时不需要禁用模型推理、Slot 或 RAM 缓存，只停止不可信的**磁盘层**。
+
+### 3.3 统一启动扫描的“文件存在但大小未知”路径
+
+针对 `scan()` 内 `fs::file_size` 失败后直接 `remove` 并 `continue` 的分支：
+
+1. 先将文件路径状态分类为 `confirmed_absent`、`confirmed_present`、`unknown`；任何删除请求是否完成均须经可观测结果确认。
+2. 删除后能**确认文件不存在**：无需继续保存该文件索引，按既有扫描删除口径结束。
+3. 删除失败或存在性无法确认：必须保守持久化该条目的隔离身份；不能将其发布为可恢复项或将该路径当作可用空间。
+4. 若 `file_size()` 仍无法提供真实字节数，使用项目既有的 `size_unknown`、`n_size_unknown_paths` 与 `disk_cache_plan_quota().blocked_by_unknown` 语义。不要将未测得的字节当成 0，更不能拿临时文件的长度作为未知已有文件的占用。
+5. 侧车持久化失败时，进入磁盘层 fail-closed；启动扫描不得在此后继续发布可用条目。保持现有 manifest、header 读取和完整身份校验方式，不重设计存储格式。
+6. 建议将已修复的扫描 `drop()` 分支与此次 `file_size` 分支统一调用一个小型“清理失败→隔离/未知占用”辅助函数，减少再次出现“一个分支检查了删除结果，另一个分支忘记”的风险。
+
+## 四、预期数据流变化
+
+### 正常缓存路径
+
+```text
+请求文本/图片 → Slot/RAM → Disk 候选选择与验证 → 正常 prefill/恢复 → 模型生成
+                                      ↑
+                           atomic active 检查
+```
+
+不新增正常请求所需的 KV 拷贝或额外磁盘 IO，不改变已验证的小说、图片缓存身份和前缀 LCP 匹配。
+
+### 故障路径
+
+```text
+侧车不能可靠更新 / 隔离状态丢失风险
+   → disable_disk_tier_locked()（锁内）
+   → active 原子关闭，取消未开始写盘任务
+   → 释放队列/inflight 记账，保持未知文件不可信
+   → 后续请求正常执行，但磁盘命中和写盘均停止
+```
+
+```text
+startup scan → file_size() 失败 → 尝试清理并复查路径
+   ├─ 确认已消失 → 正常忽略
+   └─ 存在/状态未知 → 持久隔离 + size_unknown + 阻止无依据的容量准入
+                             └─ 隔离无法持久化 → fail-closed
+```
+
+## 五、对训练和推理流水线的影响
+
+- **训练**：本项目没有训练任务，模型参数不变。
+- **推理**：正常 Slot/RAM/Disk 路径、图片/文本 tokenize、模型输出与 target/draft 计算均不变；只在确定无法信任磁盘缓存元数据时关闭 Disk 层，继续正常 prefill。
+- **持久化**：不改 v8/v9 文件协议、manifest 或媒体身份，只修复文件删除与记账之间的状态一致性。
+- **线程**：保留一个 writer 和现有单用户 `-np 1` 环境；但前台服务器主线程与后台 writer 本来就并发，故仍必须使用正确的原子/锁规则。
+
+## 六、与既有变更的兼容性
+
+1. 保留已完成的写前隔离标记、持久化侧车、CRC64、`failed_orphaned` 与真实删除才解除隔离的规则。
+2. 默认 `--cache-disk-codec none`，不优化当前 LZ77、不修改压缩格式。
+3. 对磁盘缓存已关闭的请求不得改动 RAM/Slot 复用及模型输出；所有计数都要区分“候选/恢复/真实复用”。
+4. `E:\小说`、`C:\Users\Administrator\Desktop\1.png`、`C:\Users\Administrator\Desktop\2.png` 与正式缓存 `E:\llama.cpp.cache` 均不允许被本轮脚本修改；故障测试只使用临时缓存目录和测试副本。
+5. 继续使用本轮已验证的 Windows 目标/草稿模型和 `mmproj` 配置，不添加新的多用户、网络权限或生产 API 功能。
+
+## 七、验证检查清单
+
+- [ ] 修复前重新阅读最新 `change.md`、`projectSummary.md`、HEAD 与 baseline，对照 `active` 和全部封锁/写入分支；确认实际工作树匹配本计划。
+- [ ] 运行时因侧车写入失败执行 `disable_disk_tier_locked()`，同时前台执行 `load()/store()/mirror()/preflight_materialize()`；测试构建下用有界、可重复的同步障碍注入，不依赖随机时间窗。确保不存在未同步读写 `active`，如有可用线程检查器则补充 TSAN 或等效并发检查。
+- [ ] 针对写前 `quarantine_paths_add()` 失败、孤儿后补标记失败、撤销标记失败，分别触发并检查 active 变为关闭状态、磁盘层的读写门禁和持久化引用失效。
+- [ ] 先在队列中准备两条独立的缓存写任务，再让第一条触发禁用；第二条应取消且不创建最终 `pc-*.bin`，`queue_bytes` 和 in-flight 占位均正常释放。
+- [ ] 模拟 worker 已经取出而正在写文件时触发关闭，检查在完成/清理流程中不发布任何不可信快照；服务析构时不因队列/stop_flag 死锁。
+- [ ] 在 `scan()` 的 `file_size` 失败条件下分别注入：文件实际已消失、删除成功、删除失败但文件仍存在、`exists` 也失败。后三种中的不确定状态不得被当作可用快照，必须记录隔离/未知容量或进入 fail-closed。
+- [ ] 删除失败残留文件在正常重启、无 manifest 和 manifest 损坏三种情况下，均不能重新作为有效缓存恢复；只有真实删除后才解除隔离。
+- [ ] 运行既有九套磁盘测试，不修改验证过的格式、hash 身份与投机解码功能；复用现有文本/图片测试脚本做轻量回归即可，不重新遍历全部长篇文本。
+- [ ] 至少重复一次三篇小说的交替跨重启磁盘恢复，以及 1.png/2.png 不同媒体身份隔离；确认 `source=disk`、`reused_disk`、SHA 和 prompt token 分解语义未变。
+- [ ] `media_state_unverified` 对未验证的图像主动中间前缀物化继续保持关闭；普通完整图片快照恢复另行观察，不混为一项结论。
+- [ ] 测试使用 `output\llama-server.exe` 的最新功能构建，不用旧的根目录 build 2；server 启动参数保持模型、draft、KV 类型与上下文配置不变。
+- [ ] 只在 `change.md` 记录实际跑过的故障注入、Windows 构建和真实请求；未执行的检查明确标为未覆盖；`projectSummary.md` 只记录最终已落地且可核查的结构。
+
+## 八、交付范围
+
+只处理当前确定的同步/封锁/文件生命周期问题；不进入新一轮缓存性能算法研究。若这三类状态不变量得到实现和验证，代码进入稳定维护阶段，不再因为微小压缩率和边缘性能收益添加新的算法实验。

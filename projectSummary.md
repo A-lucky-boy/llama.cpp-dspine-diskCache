@@ -71,6 +71,10 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| 启用标志是原子的、单向的 | `active` 为 `std::atomic<bool>`：后台 worker 持锁禁用，前台 `load`/`store`/`mirror`/`preflight_materialize` 及 `flush_to_disk`/`mirror_latest` 无锁读取，普通 `bool` 在此构成数据竞争。禁用侧 release、读取侧 acquire，转移单向（判定元数据不可信后同一轮内不再可信），因此不需 compare-exchange。acquire 只证明读取那一刻的状态，故在磁盘锁内做实际决定处**再次复检** |
+| 封锁只有一个入口 | `disable_disk_tier_locked()` 是唯一组合更新 `quarantine_untrusted`、`active` 与诊断的地方。此前有两处只写 `quarantine_untrusted = true` 而不置 `active = false`——记录了疑虑却没据此行动 |
+| 禁用后队列不再产生文件 | worker 取出任务后即判断禁用并取消，归还字节预算与 in-flight 身份槽（`cancel_pending_locked()`）。仅禁止新任务入队不足以保证"禁用后无新增写入" |
+| 扫描的清理失败统一口径 | `drop()` 与 `file_size` 失败分支共用 `quarantine_unremovable()`：确认文件消失才忽略，删除失败或状态未知一律持久隔离并计入占用；测不到大小用 `size_unknown` 而**不当作 0**。抽出共享辅助是必要的——此前正是"一个分支检查了删除结果、另一个忘了"的形态 |
 | 所有隔离入口都必须落到持久侧车 | `quarantine_entry()` 返回是否**记录成功**，而不只是内存标记。顺序为"先写侧车、后标记"：失败时条目在本进程仍受排除且调用方被告知，避免"排除了但重启后失效"。TTL 清理、超配额淘汰、回滚失败、扫描拒绝共 5 处调用点共用它 |
 | 撤销失败时内存条目同步不可用 | 提交后 `quarantine_paths_drop()` 失败时立即把该条目置 `quarantined`，撤回已发布的物理引用并进入封锁。运行期可复用资格与重启扫描必须一致——`load()` 读条目、重启读记录，两者不能各说各话 |
 | 封锁链是策略而非标志 | `quarantine_untrusted` 单独存在时无人读取，等同诊断变量。`disable_disk_tier_locked()` 把它变为策略：置 `active=false` 并输出诊断，使既有的 `load`/`store`/`mirror`/`preflight_materialize` 四处门禁立即生效 |

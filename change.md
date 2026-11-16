@@ -3818,3 +3818,204 @@ n_dropped++;
 - 未把小说原文或图片二进制写入仓库或报告；`.jsonl` 已加入忽略规则
 - 未在 Release 构建中加入可被外部请求触发的破坏性测试功能
 - 配额算法未改；未知占用仍不可视为零字节
+
+# 2026-11-16 18-20 - Change Record（test1_5 修复轮：active 原子化、封锁入口统一、队列取消、扫描清理口径统一）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 17-36 - test1_5` 修复四项状态一致性问题。规划 §一 列出的 4 条全部由源码确认并修复；规划**未列出**的第 5 项（一处 `remove` 的类型/命名空间问题）在实现中暴露并修正。
+
+**另外在回归中发现一个既有的严重崩溃**（文本磁盘快照恢复后发图片 → `GGML_ASSERT(has_mtmd)`），经**在改动前二进制上复现确认与本轮改动无关**，来自提交 `60f38918`（11-14）。详见 §五。
+
+## 一、已确认缺陷与修复
+
+### 1.1 缺陷 A：`active` 是普通 `bool`，跨线程读写构成数据竞争
+
+**缺陷**：`tools/server/server-task.h:1065` 为 `bool active = true;`。后台 worker 持 `mtx` 写 `active = false`（fail-closed），而前台 `load()` / `store()` / `mirror()` / `preflight_materialize()` 以及 `server_prompt_cache::flush_to_disk()` / `mirror_latest()` **在不持同一把锁的入口读取它**。这是一个 C++ 数据竞争。规划指出：baseline 中 disable 主要发生在单线程启动阶段，而本轮新增的**运行时** fail-closed 写操作使它成为实际的并发正确性风险——判断成立。
+
+**修复**：改为 `std::atomic<bool> active{true}`，禁用侧 `store(false, std::memory_order_release)`，所有读侧 `load(std::memory_order_acquire)`。转移是**单向**的（已判定元数据不可信的缓存不会在同一轮内重新可信），所以 release/acquire 就是完整协议，不需要 compare-exchange。
+
+覆盖 4 处入口门禁 + 2 处 `server_prompt_cache` 无锁读取 + `disable_disk_tier_locked()` / `disk_tier_usable_locked()`。
+
+**规划 §3.1 的补充要求**："一次 acquire 读取只能证明读取时还未禁用"。已在 worker 内**两处**复检：一次在取出队列项后、一次在**磁盘锁内**（真正做候选/写入决定的点），后者的检查才是权威的。
+
+### 1.2 缺陷 B：两处直接写 `quarantine_untrusted = true`，未联动 `active`
+
+**缺陷**：`server_disk_cache::worker()` 中"写前隔离标记添加失败"（原 5621 行）与"孤儿文件补充标记失败"（原 5734 行）直接执行 `quarantine_untrusted = true`，**不置 `active = false`**。这违反了该变量必须与磁盘层禁用同步联动的不变量——记录了疑虑却没有据此行动。
+
+**修复**：两处改为调用 `disable_disk_tier_locked()`。该函数是唯一负责组合更新 `quarantine_untrusted`、`active` 与诊断输出的入口。持锁调用时不重新加锁（`disable_disk_tier_locked()` 不加锁，操作 `std::atomic` 与普通成员，前提是调用方持锁）。
+
+同类问题也存在于构造函数中"侧车不可信"分支（原 `quarantine_untrusted = true; active = false;` 两句），一并统一为同一入口——虽然那里单线程无竞争，但**一处定义"禁用"含义**才能避免两处漂移。
+
+修复后全文件只有 **1 处** 写 `quarantine_untrusted = true`，即 `disable_disk_tier_locked()` 内部。
+
+### 1.3 缺陷 C：禁用后队列中未开始的任务仍会执行
+
+**缺陷**：`worker()` 顶部的 `cv.wait(lock, [this]{ return stop_flag || !queue.empty(); })` **不检查禁用状态**。若任务 A 触发 fail-closed，队列中已排队的任务 B 仍会被取出并继续 `write_entry()`——磁盘层"禁用"后仍在创建新文件。
+
+**修复**：新增 `cancel_pending_locked()`（单一可测函数），归还 `queue_bytes` 与 `inflight` 占位并计入 `n_queue_cancelled`。worker 在**取出后**判断禁用即取消（此时尚未写任何东西，最终路径未被触碰）；已开始写盘的任务按既有失败/隔离流程收口。仍正常响应 `stop_flag`，析构不因队列变化而死锁。
+
+`cancel_pending_locked()` 只做两件必须成对的事（字节预算 + 身份槽），因为漏掉任何一个都会静默阻塞后续同 hash 的写入。
+
+### 1.4 缺陷 D：`scan()` 的 `file_size` 失败分支忽略删除结果
+
+**缺陷**（源码确认）：
+
+```cpp
+std::error_code ec_size;
+const uintmax_t fsize = fs::file_size(de.path(), ec_size);
+if (ec_size) {
+    std::error_code ec_rm;
+    fs::remove(de.path(), ec_rm);   // ← 结果被丢弃
+    continue;                        // ← 路径可能仍存在
+}
+```
+
+若文件存在但测不到大小又删不掉，它会成为**未登记、未隔离、未计入容量**的路径。上一轮已修好 `drop()` 的同类问题，但本分支没有共享该处理——规划指出这正是"一个分支检查了、另一个忘了"的形态。
+
+**修复**：抽出共享的 `quarantine_unremovable()` 辅助（只此一处定义规则），`drop()` 与本分支都调用它：
+
+| 删除后状态 | 处理 |
+|---|---|
+| `confirmed_absent` | 忽略，按既有删除口径结束 |
+| `confirmed_present` / `unknown` | 持久隔离 + 计入占用（`drop()` 用已测得的 `fsize`；`file_size` 分支用 `size_unknown`，**不计为 0**） |
+| 侧车写入失败 | 由 `quarantine_entry()` 内部进入 fail-closed |
+
+`size_unknown` 走既有的 `n_size_unknown_paths` 与 `disk_cache_plan_quota().blocked_by_unknown` 语义，未视为零。
+
+**规划 §3.3.6 明确建议**"统一调用一个小型清理失败辅助函数，减少再次出现一个分支检查、另一个忘记的风险"——已照此实现。
+
+### 1.5 规划未列出：新增辅助的类型与命名空间问题
+
+`disk_cache_remove_and_confirm()` 首次实现时，(a) 定义落在匿名命名空间内、而声明在头文件全局作用域，形成两个不同实体（`C2665`/`C2668`）；(b) 调用点传入 `de.path()`（`fs::path`）而形参是 `std::string`。
+
+修正：函数连同 `disk_cache_path_state` 枚举一并迁入 `server-disk-cache-quarantine.{h,cpp}`——它与"路径当前处于什么状态"是同一个问题，且放这里才能被**独立单测**直接覆盖（`server-task.h` 需要整包服务端头文件，无法独立编译）。调用点统一 `.string()`。
+
+## 二、修改文件
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：`active` 改为 `std::atomic<bool>`；新增 `<atomic>`；移除已迁出的 `disk_cache_path_state` 与 `disk_cache_remove_and_confirm()` 声明；新增 `cancel_pending_locked()` 声明；`n_queue_cancelled` 计数
+- 具体变更：见 §一
+- 修改原因：规划 §二、§三.1、§三.2
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`disable_disk_tier_locked()` / `disk_tier_usable_locked()` 原子语义；4 处入口门禁与 2 处 `server_prompt_cache` 读取；两处遗漏分支改调封锁入口；构造函数统一入口；`worker()` 取出后与锁内复检 + 取消；新增 `cancel_pending_locked()`；`scan()` 的 `drop()` 与 `file_size` 分支统一到 `quarantine_unremovable()`；移除已迁出的函数实现与 `de.path()` 类型修正
+- 具体变更：见 §一
+- 修改原因：规划 §三.1、§三.2、§三.3
+
+### tools/server/server-disk-cache-quarantine.h / .cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-disk-cache-quarantine.h、.cpp
+- 修改后路径：同名文件
+- 修改位置：迁入 `disk_cache_path_state` 与 `disk_cache_remove_and_confirm()`；模块注释说明为何两者同属一处
+- 具体变更：见 §1.5
+- 修改原因：可独立测试性（规划 §二要求为本文件增加单测）
+
+### tools/server/tests/unit/test_disk_cache_lifecycle.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_lifecycle.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 7 组用例（删除结果确认 4 组、原子标志 3 组）
+- 具体变更：见 §三
+- 修改原因：规划 §二
+
+### test-run/run_unit_tests.bat（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：九套独立单测的正式运行脚本（上一轮为临时脚本、已随 scratch 清理丢失，本次作为受版本管理的产物固化）
+- 修改原因：规划 §七（"运行既有九套磁盘测试"）需要可复现入口
+
+### test-run/start_fsize.bat、test-run/start_nodisk.bat（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：分别用于"配置不符触发扫描拒绝"与"完全关闭磁盘层"两种对照启动
+- 修改原因：规划 §七（故障注入与对照）
+
+## 三、验证执行记录
+
+- 已执行检查：CUDA release 构建，本轮 6 次（其中 4 次为我的编译错误修正：两回 `\n` 被二次转义成字面换行、匿名命名空间重定义、`fs::path` 未转 `std::string`）
+- 检查结果：通过。最终 `output\llama-server.exe` build 54（工作树含本轮全部修改）
+
+- 已执行检查：九套独立单测（`test-run\run_unit_tests.bat`）
+- 检查结果：全部通过（codec / layout / lifecycle / match / quota / prefix-index / materialize / ASan codec / fs replace）
+
+- 已执行检查：新增 7 组用例
+- 检查结果：通过。**反向验证**：把 `disk_cache_remove_and_confirm()` 退回"只看 `remove()` 返回码、忽略路径是否仍存在"后 **2 项失败**——恢复"删除失败即报 present"的规则是当前实现的关键
+- 其中一例我最初写错：用**空**目录测试"目录不可删除"，但 `fs::remove` 对空目录会成功。已改为非空目录（代码正确、测试假设错误）
+
+- 已执行检查：**F04 型故障注入**（持有条目文件 → 扫描拒绝 → 删除失败）
+- 检查结果：通过。
+  ```
+  dropping '...pc-54a7c596c3613435.bin': different model or context configuration
+  '...' was rejected (...) but its file could not be removed; keeping it quarantined
+  rejected during the startup scan, keeping 559.26 MiB accounted for and excluding it from lookups
+  cache_scan_end: 1 entries ..., 1 kept quarantined, 559.26 MiB
+  ```
+  侧车（magic `LLDSCQ01`）记入该名，占用计入。手动删除文件后重启：`1 quarantine cleared`，侧车被移除，路径释放
+
+- 已执行检查：**文本跨重启磁盘恢复**（三篇真实小说，按生产参数 `-c 262144`）
+- 检查结果：通过。乱序请求，三条全部 `source=disk`：核心规则 2457、正文 2476、语录 2251，`restored` 与 sha 与预热一致（`6b84e67f1928d399` / `ae40d196680b87a3` / `0d9780ae1c8c4710`）
+
+- 已执行检查：**`active` 原子化的并发用例**
+- 检查结果：通过。跨线程 release/acquire 可见性、单向性、幂等性各一例。**未使用线程检查器**：本机未配置 TSAN，规划 §七"如有可用线程检查器则补充"未满足
+
+- 已执行检查：图片请求（磁盘层关闭 vs 开启）
+- 检查结果：见 §五
+
+- **未执行的检查及原因**：
+  - **规划 §七"两条队列任务、第一条触发禁用后第二条取消"的端到端注入**：**未执行**。需要在**生产 Release 构建**中可控地让侧车写入失败，而这正是规划 §八明确禁止的（"不把破坏性故障开关带入 Release"）。`cancel_pending_locked()` 与两处复检**只有代码实现与静态推理，没有运行证据**。这是本轮最大缺口
+  - **规划 §七"worker 已取出并正在写文件时触发关闭"**：**未执行**，原因同上
+  - **规划 §七"`file_size` 失败条件下四种注入（已消失 / 删除成功 / 删除失败但存在 / `exists` 也失败）"**：**仅部分执行**。删除失败但文件仍存在的情形已通过 F04 型注入真实验证；**`file_size` 本身失败未能在本机产生**——实测发现 Windows 上（a）持句柄占用会让 `remove` 失败但 `file_size` **仍能读到大小**，（b）拒绝读取的 ACL 也不影响 `file_size`（`GetFileAttributesEx` 不打开文件）。两种手段都构造不出"存在但测不到大小"，因此该分支的**触发本身**没有动态证据（`test-run/probe_size_denial.py` 记录了这一实测结论，脚本已随 scratch 清理）
+  - **`exists` 自身失败**：未构造
+  - **规划 §七"删除失败残留文件在无 manifest / manifest 损坏下也不被恢复"**：**仅验证了 manifest 0（header 路径）一种**
+  - **`touch_entry()` 端到端**：**仍未验证**（析构路径，本环境送不达 `CTRL_C_EVENT`），连续四轮相同
+
+## 四、结论与范围确认
+
+- 未改 v8/v9 KV 文件、manifest v3、`pc-quarantine.dat` 的 CRC 格式、`llama_state_seq_get/set_data_ext`、完整 token/media 身份、`--cache-disk-codec` 默认值、`768 KiB/token` 成本闸门、RAM/Slot 优先级（规划 §二）
+- 未新增缓存算法、物理 KV 分块、压缩优化、投机解码改动、主动媒体 KV 写盘或多 slot 功能（规划 §一）
+- 图片请求不产生磁盘条目，`media_state_unverified` 对主动中间前缀物化的门禁**保持不变**（与规划 §七预期一致）
+- 所有测试使用独立 scratch 目录；`E:\llama.cpp.cache`、`E:\小说` 与桌面两张图片**未被修改**
+
+## 五、回归中发现的既有崩溃（与本轮改动无关）
+
+**现象**：**先恢复一个纯文本磁盘快照，紧接着发送图片请求** → 服务器崩溃：
+
+```
+disk cache: ... source=disk, reused_disk=2476
+... encoding mtmd batch ...
+C:\...\tools\server\server-common.cpp:732: GGML_ASSERT(has_mtmd) failed
+```
+
+**归因过程**（不停留在推断）：
+
+1. 崩溃点 `server-common.cpp:732` 位于 `server_tokens::push_back_placeholder()`，由 `server-context.cpp:5573` 调用
+2. `git blame` 显示相关行出自 **`60f38918`（11-14）**，早于本轮全部工作
+3. 崩溃那次运行中，本轮新增的禁用路径**一次都没有触发**（日志无 `disk tier is now disabled` / `cancelled`），也无镜像恢复错误
+4. **对照实验**：`--cache-disk-max 0` 完全关闭磁盘层后，同样的"文本→图片"与"文本→图片→文本→图片"序列**全部正常**
+5. **决定性对照**：`git stash` 暂存本轮全部改动并重新构建（验证二进制中 `has my fix: False`），在**改动前二进制**上重放同一序列——**同样崩溃，同一个 `GGML_ASSERT`**
+
+**结论**：既有缺陷，非本轮引入。可疑机制是：
+
+```cpp
+prompt.tokens = server_tokens(restored_tokens, tokens_new.has_mtmd);
+prompt.tokens.append_media_placeholders_from(tokens_new);
+```
+
+`has_mtmd` 取自**本次请求**（图片请求为 true），而磁盘条目来自**纯文本**请求、不含任何媒体块——于是无媒体的 prompt 被标记为 `has_mtmd=true`，后续媒体占位插入走到 `GGML_ASSERT(has_mtmd)` 的失败路径。
+
+**影响与本轮边界**：规划 §七要求"至少重复一次三篇小说的交替跨重启磁盘恢复，以及 1.png/2.png 不同媒体身份隔离"。**文本部分已完成并通过**；**媒体身份隔离部分被这个既有崩溃阻断，未能执行**。这属于"明确的缓存功能错误"，但按规划 §十二"应先修复实际错误位置"——它不在本轮四项范围（§二"预期修改文件"）内，且修复需要改动 `server-context.cpp` / `server-common.cpp` 的 `has_mtmd` 传播语义。**本轮未修改这两处**，如实记录为待办。

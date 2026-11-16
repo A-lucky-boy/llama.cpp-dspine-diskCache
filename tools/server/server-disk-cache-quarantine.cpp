@@ -1,6 +1,7 @@
 #include "server-disk-cache-quarantine.h"
 
 #include <cstring>
+#include <filesystem>
 
 // CRC64-ECMA (reflected polynomial 0xC96C5795D7870F42), the same function the entry
 // payloads use. Kept local rather than shared because the record must stay readable
@@ -193,4 +194,40 @@ quarantine_migrate disk_cache_quarantine_parse_legacy(const std::string & bytes,
     }
 
     return quarantine_migrate::ok;
+}
+
+// Remove `path` and report what the path holds afterwards.
+//
+// The point is the difference between "the delete call succeeded" and "the path is
+// free". On Windows a delete can fail and leave the file in place - a handle held
+// elsewhere is enough (measured in test-run/hold_delete_probe.cpp) - and both an
+// error return and a successful one still have to be checked against `exists`,
+// because a path that reappeared is not a path that was removed.
+//
+// Returning a state instead of a bool is deliberate: a caller that only asks "did it
+// work" tends to write `if (!ok) continue;`, and that is exactly how a file that could
+// not be removed ends up recorded nowhere.
+disk_cache_path_state disk_cache_remove_and_confirm(const std::string & path) {
+    namespace fs = std::filesystem;
+
+    std::error_code ec_rm;
+    fs::remove(path, ec_rm);
+
+    // the existence query is what decides, not the delete's return value
+    std::error_code ec_exists;
+    const bool present = fs::exists(path, ec_exists);
+
+    if (ec_exists) {
+        // the query itself failed: neither "gone" nor "there" can be claimed
+        return disk_cache_path_state::unknown;
+    }
+
+    if (!present) {
+        return disk_cache_path_state::confirmed_absent;
+    }
+
+    // still there. `ec_rm` being set is the usual reason, but a successful remove
+    // followed by a present path is also not an absence, so the state is reported the
+    // same way and the caller quarantines rather than assuming
+    return disk_cache_path_state::confirmed_present;
 }

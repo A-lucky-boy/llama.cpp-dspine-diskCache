@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include "common.h"
 #include "llama.h"
 #include "server-disk-cache-codec.h"
@@ -711,6 +712,7 @@ struct disk_cache_counters {
     uint64_t n_enqueue_queued       = 0;
     uint64_t n_enqueue_dedup        = 0; // already stored, already queued or covered by a longer entry
     uint64_t n_enqueue_rejected     = 0; // over the size limit or the queue budget
+    uint64_t n_queue_cancelled      = 0; // queued writes dropped because the disk tier stopped
     uint64_t n_remove_failed        = 0; // files that could not be deleted, cumulative
     uint64_t n_hash_collisions      = 0; // stored path with a different identity, cumulative
     uint64_t n_path_conflicts       = 0; // writes refused because the path stayed occupied, cumulative
@@ -940,17 +942,6 @@ enum class disk_cache_write_outcome {
     failed_orphaned,    // the final path exists, or its state could not be confirmed
 };
 
-// Whether the final path holds data, and how sure that answer is.
-//
-// "The query said no" and "the query failed" are different facts, and collapsing
-// them is how a file that no ledger knows about becomes invisible. `unknown` covers
-// both a query that returned an error and one whose answer cannot be trusted; it is
-// never a synonym for absent.
-enum class disk_cache_path_state {
-    confirmed_absent,
-    confirmed_present,
-    unknown,
-};
 
 // Where the data sitting at the final path came from.
 //
@@ -1062,7 +1053,20 @@ struct server_disk_cache {
     std::string dir;
     std::string sig;
 
-    bool active = true;
+    // Whether the disk tier may still be used.
+    //
+    // Atomic rather than a plain bool, and this is not a formality. The tier is
+    // disabled from the background writer, under the cache mutex, while the request
+    // thread reads the flag on entry to load(), store(), mirror(),
+    // preflight_materialize() and the flush/mirror helpers - none of which hold that
+    // mutex. A plain bool read by one thread while another writes it is a data race,
+    // whatever the intention behind it.
+    //
+    // The transitions are one-way: a cache that has concluded it cannot trust its own
+    // metadata does not become trustworthy again in the same run. Release on the store
+    // and acquire on the load is therefore the whole protocol - it is a shutdown
+    // flag, not a shared counter, and it never needs a compare-exchange.
+    std::atomic<bool> active{true};
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -1186,6 +1190,15 @@ private:
 
     // must be called with mtx held
     void inflight_erase_locked(uint64_t hash);
+
+    // Release the bookkeeping for a queued write that will not happen: the byte budget
+    // it held and its in-flight identity slot. mtx must be held.
+    //
+    // One function for this, because it is called from more than one place and each of
+    // them has to give back exactly the same two things - a missed release leaks the
+    // queue budget and leaves an identity claimed, which silently blocks a later write
+    // of the same prompt.
+    void cancel_pending_locked(const server_disk_cache_pending & pending);
 
     // what the committed entries already say about a write for `hash`.
     //

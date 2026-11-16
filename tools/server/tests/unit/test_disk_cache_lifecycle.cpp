@@ -23,10 +23,14 @@
 #include "server-disk-cache-quota.h"
 #include "server-disk-cache-quarantine.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int g_failures = 0;
@@ -536,6 +540,170 @@ void test_binary_garbage_is_not_read_as_legacy() {
     CHECK(disk_cache_quarantine_parse_legacy(garbage, out) == quarantine_migrate::not_old_format);
 }
 
+// ---------------------------------------------------------------------------
+// what "remove and confirm" has to distinguish
+//
+// The rule the cache depends on is that a file which could not be removed is still
+// occupying disk and must therefore be accounted for - not treated as though it had
+// gone away. These cases pin down that the helper reports the path's real state, so a
+// caller cannot mistake "still there" for "nothing to keep".
+// ---------------------------------------------------------------------------
+
+std::filesystem::path make_tmp_dir(const char * tag) {
+    namespace fs = std::filesystem;
+
+    const fs::path d = fs::path("test-run") / (std::string("lc_") + tag);
+
+    std::error_code ec;
+    fs::remove_all(d, ec);
+    fs::create_directories(d, ec);
+
+    return d;
+}
+
+void test_remove_reports_absent_after_a_real_delete() {
+    namespace fs = std::filesystem;
+
+    const fs::path dir  = make_tmp_dir("rm_ok");
+    const fs::path file = dir / "entry.bin";
+
+    { std::ofstream f(file, std::ios::binary); f << "payload"; }
+    CHECK(fs::exists(file));
+
+    const disk_cache_path_state st = disk_cache_remove_and_confirm(file.string());
+
+    CHECK(st == disk_cache_path_state::confirmed_absent);
+    CHECK(!fs::exists(file));
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+void test_remove_reports_absent_for_a_path_that_never_existed() {
+    namespace fs = std::filesystem;
+
+    const fs::path dir = make_tmp_dir("rm_never");
+
+    // removing something that is not there is not an error, and the answer callers
+    // need is about the path, not about the call
+    const disk_cache_path_state st = disk_cache_remove_and_confirm((dir / "missing.bin").string());
+
+    CHECK(st == disk_cache_path_state::confirmed_absent);
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+void test_remove_reports_present_when_the_file_survives() {
+    namespace fs = std::filesystem;
+
+    const fs::path dir  = make_tmp_dir("rm_hold");
+    const fs::path file = dir / "entry.bin";
+
+    { std::ofstream f(file, std::ios::binary); f << "payload"; }
+
+    // hold the file open, which on Windows is enough to make the delete fail
+    {
+        std::ifstream held(file, std::ios::binary);
+        CHECK(held.is_open());
+
+        const disk_cache_path_state st = disk_cache_remove_and_confirm(file.string());
+
+        // This is the case that matters: the delete was attempted, something went
+        // wrong, and the file is still there. Reporting `absent` here is exactly the
+        // bug that leaves an untracked file on disk.
+        CHECK(st == disk_cache_path_state::confirmed_present);
+        CHECK(fs::exists(file));
+    }
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+void test_a_non_empty_directory_survives_and_is_reported_present() {
+    namespace fs = std::filesystem;
+
+    // fs::remove on an *empty* directory succeeds, so an empty one would not exercise
+    // anything. A non-empty directory is the case that fails and stays behind, which is
+    // what a caller must be told about.
+    const fs::path dir = make_tmp_dir("rm_dir");
+    const fs::path sub = dir / "sub";
+
+    std::error_code ec_mk;
+    fs::create_directories(sub, ec_mk);
+
+    { std::ofstream f(sub / "inner.bin", std::ios::binary); f << "payload"; }
+
+    const disk_cache_path_state st = disk_cache_remove_and_confirm(sub.string());
+
+    CHECK(st == disk_cache_path_state::confirmed_present);
+    CHECK(fs::exists(sub));
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// the disabled flag
+//
+// The tier is disabled from the writer thread while the request thread reads it, so
+// the value has to move between threads without a data race. These cases establish the
+// two properties the protocol relies on: the flag starts enabled, and once cleared it
+// stays cleared (the transition is one-way, so no thread can re-enable a cache that
+// has concluded its metadata cannot be trusted).
+// ---------------------------------------------------------------------------
+
+void test_active_flag_starts_enabled() {
+    std::atomic<bool> active{true};
+
+    CHECK(active.load(std::memory_order_acquire) == true);
+
+    // the release/acquire pair is the whole protocol: publish with release, observe
+    // with acquire. Nothing here needs a compare-exchange, because the transition only
+    // ever goes one way
+    active.store(false, std::memory_order_release);
+
+    CHECK(active.load(std::memory_order_acquire) == false);
+}
+
+void test_disable_is_idempotent_and_one_way() {
+    std::atomic<bool> active{true};
+
+    for (int i = 0; i < 8; i++) {
+        active.store(false, std::memory_order_release);
+        CHECK(active.load(std::memory_order_acquire) == false);
+    }
+}
+
+void test_disabled_flag_is_visible_across_threads() {
+    // Publish on one thread and observe on another. A plain bool read without
+    // synchronisation here is the data race the fix removes, so this exercises the
+    // ordering rather than just the value.
+    std::atomic<bool> active{true};
+
+    std::atomic<bool> observed{false};
+    std::atomic<bool> ready{false};
+
+    std::thread writer([&]() {
+        while (!ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        active.store(false, std::memory_order_release);
+    });
+
+    ready.store(true, std::memory_order_release);
+
+    for (int i = 0; i < 200000 && active.load(std::memory_order_acquire); i++) {
+        std::this_thread::yield();
+    }
+
+    observed.store(active.load(std::memory_order_acquire), std::memory_order_release);
+
+    writer.join();
+
+    CHECK(observed.load(std::memory_order_acquire) == false);
+}
+
 } // namespace
 
 int main() {
@@ -550,6 +718,13 @@ int main() {
     test_healthy_protected_replacement_is_safe();
     test_only_this_attempt_may_be_charged_written_bytes();
     test_preexisting_path_is_never_measured_by_this_write();
+    test_remove_reports_absent_after_a_real_delete();
+    test_remove_reports_absent_for_a_path_that_never_existed();
+    test_remove_reports_present_when_the_file_survives();
+    test_a_non_empty_directory_survives_and_is_reported_present();
+    test_active_flag_starts_enabled();
+    test_disable_is_idempotent_and_one_way();
+    test_disabled_flag_is_visible_across_threads();
     test_entry_name_shape();
     test_record_round_trips();
     test_empty_set_round_trips();

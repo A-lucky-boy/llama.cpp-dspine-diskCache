@@ -6,6 +6,11 @@
 // to be testable directly rather than only through a running server. The reader's
 // behaviour on a damaged record is the whole point of the format, so it has to be
 // exercisable on bytes.
+//
+// The module also owns the other half of the same question: what state a cache path is
+// in after a removal was attempted. The two belong together because the quarantine
+// record exists precisely to describe paths whose removal did not work out, and because
+// both have to be testable without standing up a server.
 
 #pragma once
 
@@ -65,3 +70,25 @@ enum class quarantine_migrate {
 // file ends on a line boundary, so a visibly truncated file is refused rather than
 // read as "a list that simply has fewer names".
 quarantine_migrate disk_cache_quarantine_parse_legacy(const std::string & bytes, std::set<std::string> & out);
+
+// Whether a path holds data, and how sure that answer is.
+//
+// "The query said no" and "the query failed" are different facts, and collapsing them
+// is how a file that no ledger knows about becomes invisible. `unknown` covers both a
+// query that returned an error and one whose answer cannot be trusted; it is never a
+// synonym for absent.
+enum class disk_cache_path_state {
+    confirmed_absent,
+    confirmed_present,
+    unknown,
+};
+
+// Remove a file and report what the path holds afterwards.
+//
+// The answer callers need is not "did remove() return 0" but "is the path free". On
+// Windows a delete can fail while the file remains - a handle held elsewhere is
+// enough - and a delete can also report success while the path survives, so the
+// existence query is what decides. Returning a state rather than a bool is deliberate:
+// a caller that only asks "did it work" tends to write `if (!ok) continue;`, and that
+// is exactly how a file that could not be removed ends up recorded nowhere.
+disk_cache_path_state disk_cache_remove_and_confirm(const std::string & path);
