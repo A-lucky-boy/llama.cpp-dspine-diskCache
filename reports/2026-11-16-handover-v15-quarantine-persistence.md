@@ -4,7 +4,9 @@
 |---|---|
 | 仓库 | `A-lucky-boy/llama.cpp-dspine-diskCache` |
 | 本次交付起点 | `2c8cbef`（会话前 HEAD，第十六轮交付说明） |
-| 本次交付终点 | 分支 `main` 顶端 |
+| 本次交付终点 | 分支 `main` 顶端（功能提交 `af1c191`） |
+| 功能提交 | `af1c191`（三项修复、附加 drop 修复、功能矩阵与注入脚本） |
+| 构建产物 | `output\llama-server.exe` **build 53**（工作树 `af1c191`），MSVC 19.44.35226 |
 | 规划依据 | `betterModification.md` → `2026-11-16 16-35 - test1_5` |
 | 交付性质 | 两项状态一致性修复 + `quarantine_untrusted` 封锁链 + 综合功能回归（规划 §一） |
 
@@ -59,7 +61,7 @@ n_dropped++;
 
 ## 2. 综合功能回归（真实模型 + 真实数据）
 
-**关键前提**：`D:\AiHelper\llama.cpp\llama-server.exe` 是 **build 2 / commit 60f3891（11-15）**，早于本轮全部隔离修复且不识别 `--cache-stats`。测试统一使用 `output\llama-server.exe`（build 52）。
+**关键前提**：`D:\AiHelper\llama.cpp\llama-server.exe` 是 **build 2 / commit 60f3891（11-15）**，早于本轮全部隔离修复且不识别 `--cache-stats`。测试统一使用 `output\llama-server.exe`（当次为 build 52，与功能提交同源；补文档后重建为 build 53）。
 
 **另一关键前提**：`--cache-disk-idle-flush 60` 是磁盘层真正落盘的条件。先前用 `0` 配 `--cache-ram 25600` 时 RAM 永不驱逐，只写出索引、无 `.bin`。
 
