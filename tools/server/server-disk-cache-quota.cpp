@@ -30,10 +30,27 @@ disk_cache_quota_plan disk_cache_plan_quota(const std::vector<disk_cache_quota_i
         }
     }
 
+    // A live path whose size was never measured holds bytes nobody can count. The
+    // arithmetic below is only as good as its input, so while such a path exists the
+    // plan cannot certify that free space is available - reclaiming the countable
+    // items would appear to free the difference between the limit and the counted
+    // total, but the uncounted bytes are still there.
+    //
+    // The plan is still produced (the caller needs the eviction order), but it never
+    // reports `fits`, so admission cannot rely on space this ledger cannot see.
+    for (const auto & it : items) {
+        if (it.size_unknown) {
+            plan.blocked_by_unknown = true;
+            break;
+        }
+    }
+
     // limit 0 means "unlimited": the server maps --cache-disk-max -1 to 0, so
-    // nothing is ever reclaimed and everything fits
+    // nothing is ever reclaimed and everything fits - unless a path holds bytes
+    // nobody measured. Unlimited capacity is still a statement about capacity, and
+    // it cannot be made while part of the directory is uncounted.
     if (limit == 0) {
-        plan.fits = true;
+        plan.fits = !plan.blocked_by_unknown;
         return plan;
     }
 
@@ -65,7 +82,17 @@ disk_cache_quota_plan disk_cache_plan_quota(const std::vector<disk_cache_quota_i
     plan.overshoot = running > limit ? running - limit : 0;
     plan.fits      = running <= limit;
 
+    // an unmeasured path keeps the plan from certifying free space, however the
+    // countable arithmetic came out
+    if (plan.blocked_by_unknown) {
+        plan.fits = false;
+    }
+
     return plan;
+}
+
+bool disk_cache_orphan_chargeable(bool placed_by_this_attempt, bool size_measured) {
+    return placed_by_this_attempt && size_measured;
 }
 
 bool disk_cache_commit_eligible(const std::vector<disk_cache_commit_candidate> & entries,

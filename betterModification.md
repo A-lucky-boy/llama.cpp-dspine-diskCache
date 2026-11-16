@@ -3263,3 +3263,157 @@ v9 段读取 → encoded CRC 检查 → LZ77 真实解码
 本次只修复上述解码收尾、失败后的文件生命周期以及文件末端范围校验，不延伸新的物理缓存算法。保留原有快照捕获、前置准入、队列身份匹配、v8/v9 读取与现有配额事务。
 
 `betterModification.md` 只保存实验规划和算法修改日志；不填写实验收益预测、早停要求、计算报告或最终判定规则。本节不引用其他实验结果作为本实验的设计前提。
+
+---
+
+# 2026-11-16 15-25 - test1_5
+
+## 一、实验目标与核查依据
+
+本节是当前磁盘快照 v8/v9 **写入失败状态与隔离生命周期的补充修复规划**，不是新的压缩算法实验。保留此前已有的 KV 主动物化、导出前准入、分段编码、完整身份去重、配额准入、CRC 校验、位置/媒体边界和关闭态代码；不重新恢复整个 baseline。
+
+本次规划前已按要求首先查看仓库 `change.md` 最新 `2026-11-16 15-10 - Change Record`，并核对《2026-11-16-handover-v12-decode-eof-orphan.md》、`projectSummary.md` 及 GitHub 当前源码。检查时最新文档 HEAD 为 `980ab84fd8ec1c944d3c81ea34f2e445e43296fb`，对应代码提交 `2b8d7af9775f3a2574acda435635ae53fe4f8de1`，原始改造前 baseline 为 `eb7681889f44304d2bd5b3e41572f5530af91a1d`。与 baseline 的差异集中在新增写入结果结构体、隔离记账、分段编码以及启动清单/缓存索引；baseline 中没有本轮 `failed_orphaned` 生命周期。
+
+最新报告和源码表明：纯字面量/匹配两条解码退出路径已经统一检查完整消费，v8/v9 在分配前进行 payload 真实 EOF 范围核对，真实截断文件会在 state 恢复前拒绝，默认 `none` 新写 v8 及 `lz` 新写 v9 的跨进程恢复都有记录。这些不需要重新设计。但 `failed_orphaned` 在 **最终路径存在状态不确定** 与 **重启生命周期** 两处仍有明显不变量漏洞，必须先修复，不能再开始另一项存储算法实验。
+
+实施人员开始改动时需再次核对实际工作树 `git rev-parse HEAD`、`git status --short`、最新 `change.md`、`projectSummary.md` 与 baseline 差异。若已出现更新提交，先审查相关分支是否已修好；不得重复覆盖已有正确性修复。
+
+## 二、已确认缺陷 A：最终路径 `exists()` 报错被误判为 `failed_clean`
+
+**位置：**`tools/server/server-task.cpp` → `server_disk_cache::write_entry()`，第二次 `fs::rename(tmp, path, ec)` 失败之后。
+
+当前代码：
+
+```cpp
+std::error_code ec_final;
+if (fs::exists(path, ec_final) && !ec_final) {
+    result.outcome = disk_cache_write_outcome::failed_orphaned;
+}
+return result;
+```
+
+`result` 默认 `failed_clean`。如果 `fs::exists(path, ec_final)` 返回 false **并设置错误码**，分支未执行，函数仍返回 `failed_clean`。但此时**不能确认最终路径已不存在**，与返回结果语义相矛盾。该错误可以仅凭当前源码的布尔表达式直接确认；真实 Windows 权限/共享状态下能否自然触发，尚无测试证据。
+
+**修复要求：**
+
+1. 把路径状态分为 `confirmed_absent`、`confirmed_present`、`unknown`；未知不能和确认不存在合并。
+2. 只有 `!exists && !ec_final` 才能返回 `failed_clean`；`exists || ec_final` 都应保守返回 `failed_orphaned`，或者采用等价的显式状态枚举。不要把“查询失败”当作“文件不存在”。
+3. 同时检查 `!path_owned` 时 `fs::exists(path, ec_exists)` 报错的分支：虽然当前 worker 传 `path_owned=true`，共享写入 API 也不得在路径所有权无法验证的情况下继续 `rename()`；应返回明确失败结果，不得绕过路径证明。
+4. 若 `fs::remove(tmp)` 失败，至少记录临时路径未清理的事实，确保启动时清扫与占用统计不会把 `.tmp` 残留当成可复用正式快照；不借此新增第二套异步清理系统。
+5. 成功提交仍须满足已测量 `size_file`、身份与配额检查；本轮不改变正常的 v8/v9 提交资格。
+
+## 三、已确认缺陷 B：隔离状态在重启后可能丢失
+
+**位置：**
+
+- `tools/server/server-task.cpp` → `server_disk_cache::worker()` 的 `failed_orphaned` 分支；
+- `server_disk_cache::save_manifest()` 的 `staged_record` 构造；
+- `server_disk_cache::scan()` 的 manifest 命中与 header 扫描两个分支。
+
+worker 目前把残留文件作为 `quarantined=true` 的 `server_disk_cache_entry` 插入 `entries`，并增加 `total_size`。这防止了**当前进程内**它被 `load()`、去重与 `persisted` 使用。但该失败分支本身没有持久化隔离状态；即使析构时保存清单，当前 manifest v3 也没有 `quarantined` 字段，`save_manifest()` 会把它当成普通记录，而 `scan()` 重建条目时默认 `quarantined=false`。若清单中没有该记录，header 扫描同样可能在只核对前置元数据后登记可用条目。因此 `failed_orphaned` 的“不可信、不许恢复”资格可能跨重启丢失。
+
+此处的确定性事实是**隔离标志未编码于重启恢复路径**；是否发生具体错误恢复，需要针对性故障注入验证。不能仅凭已有成功的 v8/v9 正常重启测试声称该分支安全。
+
+**修复要求：**
+
+1. 为 `failed_orphaned` 增加可跨重启识别的**持久化隔离依据**，或在启动阶段对该类路径进行完整物理校验且只有确认状态有效后才允许建立可恢复引用。不得只验证 header/packed CRC 就将上轮不可信文件直接视为可用。
+2. 优先采用兼容既有 v8/v9 和 manifest v3 的保守设计：可考虑原子落盘的“待清理路径标记”侧车记录，并在启动 scan 之前读取；文件被真实移除/核实后再撤销标记。若采用变更清单协议方案，则必须说明旧 manifest/旧缓存扫描的兼容方式、异常掉电行为以及配置关闭态。两者只选其一，不叠加新格式优化。
+3. 标记/文件/账本的更新顺序须保证：**记录失败不得把不可信文件变为可恢复对象**。对于文件状态不可确认的路径，保留路径占用标识且拒绝同 hash 覆写，直至删除成功或完成等价的有效性确认。
+4. `scan()` 两个分支（manifest 命中、无清单完整扫描）都必须遵守上述隔离依据。被隔离文件不能参加 `load()`、`covered_cheaply()`、in-flight/committed 精确去重、前缀目录 `persisted` 登记与物理替代。
+5. 既有 `notify_committed()` 和 `notify_invalidated()` 仍仅在磁盘层锁内按真实生命周期交付；隔离失败分支不得发布成功提交事件。磁盘状态与前缀目录重启重建必须一致。
+6. 对于确认被删除的文件才撤销路径占用并扣减真实占用；如果不能删除则继续处于隔离，且下一次 startup/清理不能把它隐式复活。
+
+## 四、已确认缺陷 C：重命名失败时 `written_bytes` 未必是目标路径大小的下限
+
+**位置：**`write_entry()` rename 最终失败结果，以及 `worker()` 的 `failed_orphaned` 记账。
+
+`write.written_bytes` 来源于**新写临时文件**的 `tellp()`；如果 rename 失败后，最终 `path` 上残存的是较早的另一个文件，这个计数并不对应最终路径的数据。当前代码却为该路径登记：
+
+```cpp
+orphan.size_file = write.written_bytes;
+total_size += orphan.size_file;
+```
+
+于是它甚至未必是目标文件大小的可靠下限。对本次新文件已经 rename 成功、仅 `file_size()` 查询失败的场景，`written_bytes` 可作为写入字节的近似线索；对**从未成功 rename 的既有路径**不能用该值表述“目标文件已知写入长度”。
+
+**修复要求：**
+
+1. 在 `disk_cache_write_result` 内明确区分 `final_path_written_by_this_attempt` 和 `existing_path_unverified`，或使用等价的结果枚举；失败位置和实际文件身份必须可追踪。
+2. `existing_path_unverified` 不能按当前临时文件 `written_bytes` 作为物理大小记账。优先再次尝试安全测量；仍无法确认时记录“占用字节未知”，并通过保守准入门禁**禁止基于伪精确 `total_size` 认定还有可用配额**，直到路径被真实测量或清除。
+3. 对已成功 rename、文件可能由本次写入生成的场景，`written_bytes` 只能作为诊断/保守估值，不能把估值当作可释放字节或有效 `size_file` 参与读盘成本与 `persisted` 资格。
+4. 若使用单独的未知占用路径集合，请将其纳入容量规划和下一次清理/重启核查；不得另开一个与 `claim_path_locked()` 冲突的路径所有权体系。
+5. 所有 `failed_orphaned` 路径都必须是不可恢复条目，直到经过明确验证；`save_manifest` 与 `scan` 不得在进程重启时丢失这一结论。
+
+## 五、预期修改文件
+
+| 文件 | 修改位置与职责 |
+|---|---|
+| `tools/server/server-task.h` | `disk_cache_write_outcome` / `disk_cache_write_result` 增加路径状态、产生来源及未知占用语义；必要时声明最小隔离标记读写接口 |
+| `tools/server/server-task.cpp` | `write_entry()` 的 rename/exists 失败分支；显式区分 absent/present/unknown；`worker()` 的孤儿登记与配额门禁；`claim_path_locked()` 统一的回收核实 |
+| `tools/server/server-task.cpp` | `save_manifest()`、`scan()`：保证隔离状态在重启前后保持保守，阻止未经验证的路径重新登记为可恢复快照 |
+| `tools/server/server-disk-cache-quota.h/.cpp` | 仅当引入“占用未知”状态并需要配额保守判定时做最小扩充；不可把未知占用当成 `0 B` |
+| `tools/server/tests/unit/test_disk_cache_layout.cpp` 或新增生命周期单测文件 | 覆盖 `exists()` 失败、孤儿写入状态与路径所有权条件分支；避免仅复刻代码的布尔表达式作为测试 |
+| `test-run/` | 增加带真实临时目录的文件系统故障注入夹具，覆盖两种失败来源和重启后的隔离恢复；不使用真实模型缓存目录做破坏性注入 |
+| `change.md` | 记录实际代码修改、触发的故障注入与未覆盖验证，区分静态确认/实际复现 |
+| `projectSummary.md` | 仅在修复真实落地后更新孤儿文件生命周期和容量状态定义，不提前声称已完成 |
+
+禁止修改 `src/llama-context.cpp` 的 `state_seq_get/set_data_ext` 协议、模型参数、DSpine 解码流程、v8/v9 已持久化 payload、CRC、媒体主动捕获门禁或现有 token 复用统计。此次仅处理磁盘文件生命周期，不引入另一个压缩器或 checkpoint 存储算法。
+
+## 六、预期数据流变化
+
+### 6.1 写入失败时的精确状态
+
+```text
+write_entry(tmp → final)
+  ├─ committed：最终路径归本次写入，且实测大小有效
+  │       → 原有准入 / 配额 / manifest / notify_committed
+  ├─ failed_clean：可以确认最终路径已不存在
+  │       → 不建立可恢复条目，不虚报成功
+  └─ failed_orphaned：最终路径存在或状态无法确认
+          → 区分“本次写入已 rename”与“较早路径未核实”
+          → 生成持久化隔离依据；登记路径占用
+          → 已知真实大小则准确计账，未知大小则标记未知并保守限制配额
+          → 不调用 notify_committed，不生成 persisted，不参与去重/复用
+          → 后续真实清理或经有效性核验后解除隔离
+```
+
+### 6.2 重启扫描
+
+```text
+启动：读取已有清单 + 持久化隔离依据
+   → 物理路径查验
+      ├─ 有效且已明确认证的普通条目 → 按原 v8/v9 流程恢复索引
+      ├─ 待清理/状态未知路径 → 只登记占用与隔离；不提供 load()
+      └─ 文件不存在或已确认被清理 → 移除路径占用与持久化隔离标记
+   → 容量与路径所有权稳定后，才向公共前缀索引发布有效引用
+```
+
+保持原有 `n_past`、target/draft KV 状态恢复和 prompt token 计数不变。修改不会给正常请求增加新的模型计算分支。
+
+## 七、训练与推理流水线影响、兼容性
+
+- **训练流水线**：本项目没有训练，完全不变。
+- **推理流水线**：正常提交、正常命中、CRC 先校验后恢复、v8/v9 双向读取、prefill/采样/输出保持原样；仅调整异常磁盘写入、重启扫描及保守准入路径。
+- **存储兼容性**：不改变现有 `pc-<hash>.bin` 的 v8/v9 payload，不修改已生成文件的内容寻址，也不使 `--cache-disk-codec none` 改变默认写入格式。
+- **单用户范围**：本机、单实例、`-np 1`，不加入网络鉴权、多租户隔离或公网访问控制。
+- **路径所有权**：仍由当前 `claim_path_locked()` 协调，任何保守隔离状态只能收紧错误路径的写入权限，不得覆盖同 hash 的未知文件。
+- **监控口径**：`cache_disk_write_failed_total`、`cache_disk_write_orphaned_total` 仅报告实际事件；`cache_disk_bytes` 需要区分“可确认为真实占用的字节”与“未知字节占用”而不能悄悄将后者记作零。
+
+## 八、验证检查清单
+
+- [ ] 在实际工作树再次读最新 `change.md` 并对照 baseline 与本次审查提交；确认上述源码风险仍存在。
+- [ ] 通过可控的文件系统包装/测试故障注入，让 rename 失败后 `exists(path)` 返回 false 且带错误码；断言**不得**返回 `failed_clean`。
+- [ ] 分别注入 `file_size` 失败 + remove 成功、file_size 失败 + remove 失败、rename 失败 + 原路径存在、rename 失败 + 路径状态未知，覆盖全部 write outcome。
+- [ ] 验证来自临时文件的 `written_bytes` 不会错误记到一个不同的旧最终文件上；未知大小不能使容量试算错误放行写入。
+- [ ] 失败孤儿路径在当前进程内必须 `quarantined`、不能 `load`、不能被 `covered_cheaply` 抑制新写入、不能发出 `notify_committed`。
+- [ ] 将带隔离标记的真实文件留在独立测试目录，模拟进程正常退出及强杀重启；两种路径的扫描都不能把它重建成可复用条目。
+- [ ] 在 manifest 存在且包含隔离文件、manifest 缺失、manifest 损坏三个状态中重复重启检查；禁止失去隔离状态。
+- [ ] 对文件真正删除成功的路径，确认清除标记、释放占用及清单同步；删除仍失败则继续隔离，不得反复错误地登记多个同路径条目。
+- [ ] 继续执行原有七套独立单元测试、ASan codec 测试及正常 v8/v9 新写后跨重启恢复；确保默认关闭态、纯文本真实 `reused_disk` 与输出一致性不受影响。
+- [ ] 对临时文件清理失败进行隔离测试；不要把 `.tmp` 文件当成最终可恢复快照。
+- [ ] 仅把实际执行过的文件系统失败注入/强杀重启记录为已验证；没有运行的路径继续明确标为未覆盖。
+- [ ] 完成后更新 `change.md` 的实际修改记录，按已经落地的结构维护 `projectSummary.md`。
+
+## 九、实验记录范围
+
+本节继续已有缓存文件生命周期修复工作，不启动新的 checkpoint 去重、KV 物理分块、增量编码或新压缩器实验。`betterModification.md` 只记录本节实验规划与算法修改日志，不写性能收益预估、早停、计算报告及最终判定规则。每次后续规划前仍须先审阅最新 `change.md` 并与 baseline 对比。

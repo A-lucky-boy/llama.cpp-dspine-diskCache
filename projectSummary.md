@@ -71,6 +71,10 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| 路径状态分三态 | `confirmed_absent` / `confirmed_present` / `unknown`。`fs::exists` 返回 false **并带错误码**表示查询未得到答案，不等于"文件不存在"；只有确认不存在才允许 `failed_clean`。`!path_owned` 下查询报错时不得继续 rename——所有权证明是覆写安全的前提 |
+| 隔离状态跨重启持久化 | 隔离信息在独立侧车 `pc-quarantine.dat`（每行一个条目名），不放进 manifest v3——那是描述可用快照的格式。侧车在 `scan()` **之前**读取；隔离检查置于 manifest 与 header 两个分支之前，两者都无法重新判其为可用。**不对称规则**：存在从不解除隔离，只有确认文件消失才解除 |
+| 孤儿记账按来源区分 | `written_bytes` 来自新写临时文件，若 rename 失败则最终路径上可能是更早的文件，该计数不对应它。`disk_cache_write_origin` 区分 `this_attempt` 与 `preexisting_unverified`；只有"本次放置且拿到实测大小"才可记账（`disk_cache_orphan_chargeable()`） |
+| 未知占用阻塞准入 | 未测得大小的路径不计为 0——那会被配额读成"不占空间"。`disk_cache_plan_quota()` 在任何情况下都不因未知路径报告 `fits`，**含 `limit == 0` 的无限配额提前返回**；未知路径永不成为淘汰候选 |
 | 解码流须被精确消费（两个收尾点同一规则） | `is_complete_stream(out, want, pos, src_len)` 是唯一判定，纯字面量收尾与匹配收尾**都调用它**。缺陷期纯字面量分支只查 `out == want`，使「重复串+一个不可匹配字节」这类以字面量收尾的有效流可被追加任意字节而仍被接受 |
 | 文件末端须与段表累计一致 | `read_entry()` 取真实 `file_end`，用受检加法累加各段 `stored_len`，要求 `payload_bytes == file_end - payload_start`，并与索引 `size_file` 交叉核对。`seekg().good()` 不能证明区间存在——流可定位到 EOF 之后仍报 good，而未选中的 checkpoint 从不读取。v8/v9 同规则，用 **stored** 而非 raw 长度 |
 | 写入结果的三种去向 | `committed` / `failed_clean` / `failed_orphaned`。最终路径在测大小之前就已 rename 到位，所以"失败"不等于"没有文件"。孤儿文件由 worker 在锁内登记为 `quarantined` 条目：不可查找、不可去重、不可发布，但计入 `total_size`，待确认真实删除后释放 |

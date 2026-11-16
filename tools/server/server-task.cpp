@@ -1767,6 +1767,10 @@ std::string server_task_result_metrics::to_metrics() {
             "Disk cache writes that did not commit",
             (double) cache_disk.n_write_failed
         }, {
+            "cache_disk_unknown_size_paths",
+            "Live paths whose byte count could not be measured; their space is not counted and admission is denied while any exists",
+            (double) cache_disk.n_size_unknown_paths_snapshot
+        }, {
             "cache_disk_write_orphaned_total",
             "Failed writes that left a file at the final path; quarantined until the file is confirmed removed",
             (double) cache_disk.n_write_orphaned
@@ -2118,6 +2122,11 @@ constexpr char     DISK_CACHE_INDEX_MAGIC[8] = { 'L', 'L', 'D', 'S', 'C', 'I', '
 constexpr uint32_t DISK_CACHE_INDEX_VERSION  = 3; // v2 added size_main/size_drft, v3 added packed_crc + body checksum
 constexpr const char * DISK_CACHE_INDEX_NAME = "pc-index.dat";
 
+// sidecar listing entry files that failed a write and must not be treated as usable.
+// One name per line, so a truncated file simply yields fewer names - and fewer names
+// means "treat as ordinary", which the startup path already re-validates anyway
+constexpr const char * DISK_CACHE_QUARANTINE_NAME = "pc-quarantine.dat";
+
 // how many entries a single lookup may try before giving up and prefilling.
 // a rejected entry (corrupt file, unreadable, missing draft state) must not
 // force a full prefill while a shorter entry can still cover part of the prompt
@@ -2407,6 +2416,19 @@ server_disk_cache::server_disk_cache(const std::string & dir, const std::string 
         return;
     }
 
+    // The quarantine record is read before the scan, because it is what tells the
+    // scan which files must not come back as usable. Loading it afterwards would
+    // mean the entries were already registered.
+    //
+    // It is read without the lock: nothing else is running yet, and the set is
+    // filled before the worker thread exists
+    load_quarantine(quarantined_names);
+
+    if (!quarantined_names.empty()) {
+        SRV_WRN("disk cache: %zu path(s) were left quarantined by a previous run; "
+                "they stay unusable until their files are confirmed gone\n", quarantined_names.size());
+    }
+
     scan();
 
     {
@@ -2527,6 +2549,16 @@ disk_cache_path_owner server_disk_cache::claim_path_locked(uint64_t hash, const 
                     path.c_str(), it->size_file/(1024.0*1024.0));
 
             total_size -= std::min(total_size, it->size_file);
+
+            if (it->size_unknown) {
+                n_size_unknown_paths = n_size_unknown_paths > 0 ? n_size_unknown_paths - 1 : 0;
+            }
+
+            // the file is gone, so the path no longer needs to be excluded across
+            // restarts either - this is the one place a quarantine is lifted on a
+            // confirmed removal during a run
+            quarantine_paths_drop(path);
+
             notify_invalidated(path);
             it = entries.erase(it);
             save_manifest();
@@ -2623,6 +2655,7 @@ disk_cache_counters server_disk_cache::stats() const {
     out.n_entries       = entries.size();
     out.n_bytes         = total_size;
     out.n_queue_entries = queue.size();
+    out.n_size_unknown_paths_snapshot = n_size_unknown_paths;
 
     for (const auto & e : entries) {
         out.n_quarantined += e.quarantined ? 1 : 0;
@@ -2645,6 +2678,8 @@ void server_disk_cache::scan() {
     size_t n_manifest_stale = 0; // record present but the header had to be parsed anyway
     size_t n_dropped       = 0;
     size_t n_removed_tmp   = 0;
+    size_t n_quarantined_kept = 0;
+    size_t n_quarantine_cleared = 0;
 
     const int64_t t_scan_start = ggml_time_us();
 
@@ -2698,6 +2733,55 @@ void server_disk_cache::scan() {
             // vanished or unreadable mid-scan - not worth keeping either way
             std::error_code ec_rm;
             fs::remove(de.path(), ec_rm);
+            continue;
+        }
+
+        // A path listed by the quarantine record is not usable, no matter what else
+        // the directory holds for it. This check comes before both the manifest and
+        // the header branch, because the whole point is that neither of them can
+        // reclassify such a file as good: the manifest would need a field it does not
+        // have, and the header only proves the bytes are *a* snapshot, not that this
+        // path was ever successfully committed.
+        //
+        // The bytes are still real, so they are counted - charged at the recorded
+        // size when the index has one, and otherwise left unmeasured.
+        if (quarantined_names.count(name) > 0) {
+            const auto mi = manifest.find(name);
+
+            if (mi != manifest.end()) {
+                server_disk_cache_entry e;
+                e.path       = de.path().string();
+                e.hash       = mi->second.hash;
+                e.size_file  = (size_t) fsize;
+                e.size_main  = (size_t) mi->second.size_main;
+                e.size_drft  = (size_t) mi->second.size_drft;
+                e.last_used  = mi->second.last_used;
+                e.packed_crc = mi->second.packed_crc;
+
+                e.quarantined = true;
+                total_size += e.size_file;
+                entries.push_back(std::move(e));
+            } else {
+                // no index record for it: the size on disk is still known here, so it
+                // can be charged honestly
+                server_disk_cache_entry e;
+                e.path        = de.path().string();
+                e.size_file   = (size_t) fsize;
+                e.quarantined = true;
+                total_size += e.size_file;
+
+                if (e.hash == 0) {
+                    e.hash = disk_cache_hash(e.tokens, e.media_indices, e.media_token_counts, e.media_ids);
+                }
+
+                entries.push_back(std::move(e));
+            }
+
+            SRV_WRN("disk cache: keeping '%s' quarantined (%.2f MiB); it was left unusable by a previous write\n",
+                    de.path().string().c_str(), fsize/(1024.0*1024.0));
+
+            manifest.erase(name);
+            n_quarantined_kept++;
             continue;
         }
 
@@ -2841,9 +2925,160 @@ void server_disk_cache::scan() {
         n_from_header++;
     }
 
-    SRV_INF("disk cache: cache_scan_end: %zu entries (manifest %zu, header %zu, stale index records %zu), %zu dropped, %zu temp removed, %.2f MiB, %.2f ms\n",
+    // A quarantined name whose file is no longer present has served its purpose: the
+    // bytes are gone, so nothing needs to be excluded any more. This is the only
+    // place a quarantine is lifted without an explicit removal during this run - a
+    // file deleted while the process was down is exactly that case.
+    //
+    // Note the asymmetry: absence lifts the quarantine, presence never does. A name
+    // is only ever removed because the file is confirmed gone, never because it looks
+    // valid.
+    {
+        std::set<std::string> surviving;
+
+        for (const auto & name : quarantined_names) {
+            std::error_code ec_exists;
+            const bool present = fs::exists(dir + "/" + name, ec_exists);
+
+            if (present || ec_exists) {
+                surviving.insert(name);
+            } else {
+                n_quarantine_cleared++;
+            }
+        }
+
+        if (surviving.size() != quarantined_names.size()) {
+            quarantined_names = std::move(surviving);
+            save_quarantine(quarantined_names);
+        }
+    }
+
+    SRV_INF("disk cache: cache_scan_end: %zu entries (manifest %zu, header %zu, stale index records %zu), "
+            "%zu dropped, %zu temp removed, %zu kept quarantined, %zu quarantine cleared, %.2f MiB, %.2f ms\n",
             entries.size(), n_from_manifest, n_from_header, n_manifest_stale, n_dropped, n_removed_tmp,
+            n_quarantined_kept, n_quarantine_cleared,
             total_size/(1024.0*1024.0), (ggml_time_us() - t_scan_start)/1000.0);
+}
+
+// The quarantine sidecar: entry file names that must not be treated as usable until
+// the file is confirmed removed or measured.
+//
+// Why a sidecar rather than a manifest field: manifest v3 is a format whose
+// compatibility is required, and its records describe usable snapshots. A path that
+// exists only because a write failed is a different kind of fact, and one that must
+// outlive the process that learned it - an in-memory flag cannot do that, and adding
+// a field to the existing index would mean every older reader sees a record it does
+// not understand.
+//
+// The format is one name per line. That has a useful failure mode: a torn write
+// yields fewer names, and a missing name means "ordinary entry", which the normal
+// startup validation then re-checks from the file itself. It never means "treat a
+// broken file as good".
+void server_disk_cache::save_quarantine(const std::set<std::string> & names) const {
+    namespace fs = std::filesystem;
+
+    const std::string path = dir + "/" + DISK_CACHE_QUARANTINE_NAME;
+    const std::string tmp  = path + ".tmp";
+
+    if (names.empty()) {
+        // nothing is quarantined: remove the record rather than leave an empty file.
+        // An absent sidecar and an empty one mean the same thing, and absence avoids
+        // a stray file in the cache directory
+        std::error_code ec;
+        fs::remove(path, ec);
+        return;
+    }
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            SRV_WRN("disk cache: cannot write the quarantine record '%s'; "
+                    "quarantined paths will be re-validated from their files at startup\n", tmp.c_str());
+            return;
+        }
+
+        for (const auto & n : names) {
+            // a name that cannot be round-tripped would corrupt the record, so it is
+            // left out and the file is validated normally instead
+            if (n.empty() || n.size() > 256 || n.find('\n') != std::string::npos) {
+                continue;
+            }
+
+            f << n << '\n';
+        }
+
+        f.flush();
+        if (!f) {
+            f.close();
+            std::error_code ec;
+            fs::remove(tmp, ec);
+            SRV_WRN("disk cache: failed to write the quarantine record '%s'\n", tmp.c_str());
+            return;
+        }
+    }
+
+    // atomic swap: a reader either sees the previous record or this one, never a
+    // half-written list
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+
+    if (ec) {
+        std::error_code ec_rm;
+        fs::remove(tmp, ec_rm);
+        SRV_WRN("disk cache: failed to commit the quarantine record '%s'\n", path.c_str());
+    }
+}
+
+bool server_disk_cache::load_quarantine(std::set<std::string> & out) const {
+    std::ifstream f(dir + "/" + DISK_CACHE_QUARANTINE_NAME, std::ios::binary);
+    if (!f) {
+        return false; // no record from a previous run
+    }
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        if (!line.empty() && line.size() <= 256) {
+            out.insert(line);
+        }
+    }
+
+    return true;
+}
+
+void server_disk_cache::quarantine_paths_add(const std::vector<std::string> & paths) {
+    namespace fs = std::filesystem;
+
+    // mtx must be held
+    bool changed = false;
+
+    for (const auto & p : paths) {
+        const std::string name = fs::path(p).filename().string();
+        if (!name.empty()) {
+            changed |= quarantined_names.insert(name).second;
+        }
+    }
+
+    if (changed) {
+        save_quarantine(quarantined_names);
+    }
+}
+
+void server_disk_cache::quarantine_paths_drop(const std::string & path) {
+    namespace fs = std::filesystem;
+
+    // mtx must be held
+    const std::string name = fs::path(path).filename().string();
+    if (name.empty()) {
+        return;
+    }
+
+    if (quarantined_names.erase(name) > 0) {
+        save_quarantine(quarantined_names);
+    }
 }
 
 bool server_disk_cache::load_manifest(std::map<std::string, disk_cache_manifest_meta> & out) {
@@ -2957,6 +3192,17 @@ void server_disk_cache::save_manifest() {
 
     std::vector<staged_record> records;
     for (const auto & e : entries) {
+        // A quarantined entry is not indexed. The manifest is a list of *usable*
+        // snapshots - every field in a record describes one - and a quarantined path
+        // has none of that to say. Writing it here would put a name into the index
+        // that the startup scan would then read back as an ordinary entry, which is
+        // exactly how the unusable state was lost across restarts.
+        //
+        // Its path is carried by the quarantine sidecar instead.
+        if (e.quarantined) {
+            continue;
+        }
+
         staged_record rec;
         if (!disk_cache_pack_ids(e.tokens, e.media_indices, e.media_token_counts, e.media_ids, rec.packed)) {
             continue;
@@ -3061,6 +3307,20 @@ disk_cache_write_result server_disk_cache::write_entry(const server_disk_cache_p
     // path to quarantine, whether or not the rename happened
     disk_cache_write_result result;
     result.path = path;
+
+    // A leftover `.tmp` is never a usable snapshot and the startup sweep removes it,
+    // so a failed cleanup is not itself a correctness problem. It is still recorded:
+    // silently discarding the error would hide that the directory is accumulating
+    // files this run believes it deleted.
+    auto drop_tmp = [&]() {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            SRV_WRN("disk cache: could not remove the temporary '%s' (%s); "
+                    "the startup sweep will pick it up\n", tmp.c_str(), ec.message().c_str());
+        }
+    };
 
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -3218,8 +3478,7 @@ disk_cache_write_result server_disk_cache::write_entry(const server_disk_cache_p
         f.flush();
         if (!f) {
             f.close();
-            std::error_code ec;
-            fs::remove(tmp, ec);
+            drop_tmp();
             SRV_ERR("disk cache: failed to write '%s'\n", tmp.c_str());
             return result; // the tmp file was removed; the final path was never touched
         }
@@ -3241,11 +3500,27 @@ disk_cache_write_result server_disk_cache::write_entry(const server_disk_cache_p
     // not classified yet
     if (!path_owned) {
         std::error_code ec_exists;
-        if (fs::exists(path, ec_exists)) {
+        const bool path_present = fs::exists(path, ec_exists);
+
+        if (path_present && !ec_exists) {
             SRV_ERR("disk cache: refusing to write '%s': the path is not claimed\n", path.c_str());
-            std::error_code ec_drop;
-            fs::remove(tmp, ec_drop);
+            drop_tmp();
             return result; // only the tmp file existed, and it was removed
+        }
+
+        // The ownership proof is what makes overwriting safe, so a query that cannot
+        // answer leaves it unproven. Renaming anyway could clobber a file this process
+        // is not entitled to replace, so the write stops here - the tmp file is
+        // dropped and no assumption is made about the final path.
+        if (ec_exists) {
+            SRV_ERR("disk cache: refusing to write '%s': cannot verify that the path is free (%s)\n",
+                    path.c_str(), ec_exists.message().c_str());
+
+            drop_tmp();
+
+            result.path_state = disk_cache_path_state::unknown;
+            result.size_unknown = true;
+            return result;
         }
     }
 
@@ -3262,17 +3537,45 @@ disk_cache_write_result server_disk_cache::write_entry(const server_disk_cache_p
     if (ec) {
         SRV_ERR("disk cache: failed to rename '%s': %s\n", tmp.c_str(), ec.message().c_str());
 
-        std::error_code ec_rm;
-        fs::remove(tmp, ec_rm);
+        drop_tmp();
 
-        // The rename did not take, so the final path should not exist. It is checked
-        // rather than assumed: a prior crashed write could have left something there,
-        // and a path this process cannot account for is not the same as an absent one
+        // The rename did not take, so the final path *should* not exist. Whether it
+        // does is a separate question, and answering it has three outcomes, not two:
+        // the query can confirm absence, confirm presence, or fail to answer at all.
+        //
+        // `exists(path, ec)` returning false while setting `ec` means the question was
+        // not answered - and the earlier code treated that as "absent", returning
+        // `failed_clean` for a path whose state was in fact unknown. Unknown is not
+        // absent, so it is reported conservatively as an orphan.
         std::error_code ec_final;
-        if (fs::exists(path, ec_final) && !ec_final) {
+        const bool final_present = fs::exists(path, ec_final);
+
+        if (final_present && !ec_final) {
+            result.path_state = disk_cache_path_state::confirmed_present;
+            result.origin     = disk_cache_write_origin::preexisting_unverified;
+
             SRV_ERR("disk cache: '%s' exists after a failed rename; leaving it for the caller to quarantine\n",
                     path.c_str());
+        } else if (ec_final) {
+            result.path_state = disk_cache_path_state::unknown;
+            result.origin     = disk_cache_write_origin::preexisting_unverified;
+
+            SRV_ERR("disk cache: cannot tell whether '%s' exists after a failed rename (%s); "
+                    "treating it as present\n", path.c_str(), ec_final.message().c_str());
+        } else {
+            // confirmed absent: the rename left nothing behind
+            result.path_state = disk_cache_path_state::confirmed_absent;
+        }
+
+        // Presence and unknown both mean the caller has a path it cannot account for
+        if (result.path_state != disk_cache_path_state::confirmed_absent) {
             result.outcome = disk_cache_write_outcome::failed_orphaned;
+
+            // The bytes at this path are not this attempt's: the rename never landed,
+            // so whatever is there predates this write. Charging `written_bytes` to it
+            // would report a size for a file the writer never produced
+            result.written_bytes = 0;
+            result.size_unknown  = true;
         }
 
         return result;
@@ -3292,30 +3595,44 @@ disk_cache_write_result server_disk_cache::write_entry(const server_disk_cache_p
     if (ec_size) {
         SRV_ERR("disk cache: cannot determine the size of '%s': %s\n", path.c_str(), ec_size.message().c_str());
 
+        // The rename landed, so whatever is at this path *is* this write's bytes -
+        // unlike the failed-rename case, where the path may hold an older file.
+        // `written_bytes` therefore describes something real here, and is the best
+        // available floor if the removal cannot be completed
+        result.origin = disk_cache_write_origin::this_attempt;
+
         std::error_code ec_rm;
         fs::remove(path, ec_rm);
 
         // Removal is only believed when the path is observably gone. `fs::remove`
         // reports success or failure, but the question that matters is whether
-        // anything is still there, so it is asked directly
+        // anything is still there, so it is asked directly - and a query that fails
+        // answers nothing, which is not the same as "gone"
         std::error_code ec_still;
-        const bool still_there = fs::exists(path, ec_still) && !ec_still;
+        const bool still_there = fs::exists(path, ec_still);
 
         if (still_there || ec_still) {
             SRV_ERR("disk cache: '%s' could not be removed after a failed size query%s; "
                     "leaving it for the caller to quarantine\n",
                     path.c_str(), ec_still ? " (its state could not be confirmed)" : "");
 
-            result.outcome = disk_cache_write_outcome::failed_orphaned;
+            result.outcome      = disk_cache_write_outcome::failed_orphaned;
+            result.path_state   = ec_still ? disk_cache_path_state::unknown
+                                           : disk_cache_path_state::confirmed_present;
+            result.size_unknown = true;
             return result;
         }
 
-        result.outcome = disk_cache_write_outcome::failed_clean;
+        result.path_state = disk_cache_path_state::confirmed_absent;
+        result.outcome    = disk_cache_write_outcome::failed_clean;
         return result;
     }
 
-    result.outcome = disk_cache_write_outcome::committed;
-    result.size_file = (size_t) fsize;
+    result.outcome    = disk_cache_write_outcome::committed;
+    result.path_state = disk_cache_path_state::confirmed_present;
+    result.origin     = disk_cache_write_origin::this_attempt;
+    result.size_file  = (size_t) fsize;
+    result.size_unknown = false;
 
     // Cross-check the measured size against what the writer produced. They need not be
     // equal - block padding and directory metadata are not part of the stream - but a
@@ -4836,8 +5153,9 @@ std::vector<disk_cache_quota_item> server_disk_cache::quota_items_locked(const s
         disk_cache_quota_item item;
         item.path        = &path_storage.back();
         item.size_file   = e.size_file;
-        item.last_used   = e.last_used;
-        item.quarantined = e.quarantined;
+        item.last_used    = e.last_used;
+        item.quarantined  = e.quarantined;
+        item.size_unknown = e.size_unknown;
         // the provisional entry is protected by construction: it is the one whose
         // admission the whole transaction is about
         item.protected_  = is_new;
@@ -5055,22 +5373,62 @@ void server_disk_cache::worker() {
                 orphan.size_main = pending.main->size();
                 orphan.size_drft = pending.drft->size();
 
-                // The real size was never obtained. The writer's own byte count is the
-                // only figure available and it is a floor, not the footprint: the
-                // ledger owes an honest number, so the bytes actually written are
-                // charged and the uncertainty is recorded rather than papered over.
+                // What the bytes at this path are depends on where they came from, and
+                // only one of the two origins lets the writer say anything about them:
                 //
-                // This entry is quarantined, which is what keeps an estimate from
-                // being used as if it were measured - a quarantined record can never
-                // be looked up, matched, or published to the prefix directory.
-                orphan.size_file = write.written_bytes;
+                //   this_attempt          - the rename landed, so the path holds the
+                //                           bytes this writer produced. `written_bytes`
+                //                           is a genuine floor on them.
+                //   preexisting_unverified - the rename never landed. Whatever sits
+                //                           there was written by some earlier attempt,
+                //                           and this writer's byte count says nothing
+                //                           about its size.
+                //
+                // Charging `written_bytes` in the second case would report a size for
+                // a file that was never produced here. The ledger would then be
+                // carrying a number that is not even a lower bound.
+                const bool measured = disk_cache_orphan_chargeable(
+                        write.origin == disk_cache_write_origin::this_attempt, !write.size_unknown);
 
-                SRV_WRN("disk cache: quarantining unaccounted '%s' (~%.2f MiB by the writer's count, real size unknown)\n",
-                        orphan.path.c_str(), write.written_bytes/(1024.0*1024.0));
+                if (measured) {
+                    orphan.size_file = write.written_bytes;
+
+                    SRV_WRN("disk cache: quarantining '%s' (~%.2f MiB by the writer's count; the real size "
+                            "could not be measured)\n",
+                            orphan.path.c_str(), write.written_bytes/(1024.0*1024.0));
+                } else {
+                    // Nothing here can be charged honestly. The bytes are unknown, and
+                    // an unknown that gets recorded as zero is worse than no number at
+                    // all: the quota pass would read it as free space and admit writes
+                    // that do not fit.
+                    orphan.size_file = 0;
+
+                    SRV_WRN("disk cache: quarantining '%s' with an unknown footprint (%s); "
+                            "its bytes are not counted and the cache is treated as full for admission\n",
+                            orphan.path.c_str(),
+                            write.origin == disk_cache_write_origin::preexisting_unverified
+                                ? "the path held a file this write never replaced"
+                                : "its size could not be determined");
+                }
 
                 orphan.quarantined = true;
+                orphan.size_unknown = !measured;
 
                 total_size += orphan.size_file;
+
+                if (orphan.size_unknown) {
+                    // Admission cannot pretend this costs nothing. Until the path is
+                    // measured or removed, the ledger holds bytes it cannot size, so
+                    // the conservative reading is that the budget is unavailable
+                    ++n_size_unknown_paths;
+                }
+
+                // Recorded before the entry is published to `entries`, so the
+                // exclusion outlives this process: the in-memory flag is enough while
+                // this run lasts, but a restart would read the file back as ordinary
+                // unless the record says otherwise
+                quarantine_paths_add({ orphan.path });
+
                 entries.push_back(orphan);
 
                 counters.n_write_orphaned++;

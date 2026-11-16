@@ -28,6 +28,10 @@ struct disk_cache_quota_item {
     size_t              size_file   = 0;    // bytes actually occupied on disk
     int64_t             last_used   = 0;    // LRU ordering key
     bool                quarantined = false; // the file could not be deleted: bytes stay, entry is unusable
+    // the path occupies space whose size was never measured, so `size_file` is not a
+    // real figure. Such an item can never be counted as reclaimable: dropping it from
+    // the plan's arithmetic would free capacity on paper while the bytes remain
+    bool                size_unknown = false;
     // must survive this transaction. `true` for the provisional new entry, and
     // for every snapshot whose disappearance the transaction would justify - a
     // short prefix may only be marked free-to-delete after its replacement is
@@ -42,6 +46,11 @@ struct disk_cache_quota_plan {
     size_t                protected_bytes = 0;
     size_t                overshoot  = 0;     // bytes still over the limit when nothing else can go
     std::vector<size_t>   evict_order;        // indices into the input, LRU first
+
+    // set when an item's footprint is unknown. The plan cannot certify that any
+    // amount of free space remains while such a path is live, because the bytes it
+    // holds are real but unmeasured
+    bool                  blocked_by_unknown = false;
 };
 
 // plan the eviction of unprotected items until the accounted total fits the
@@ -74,6 +83,23 @@ std::vector<bool> disk_cache_replacements_safe(const std::vector<disk_cache_repl
 // entries that are really usable, otherwise it would record a `persisted`
 // reference to a file the disk tier itself refuses to load - a state that also
 // disappears on restart, because startup registration skips quarantined entries.
+// whether a path may be charged a byte count by the ledger.
+//
+// A failed write can leave bytes at the final path, and the ledger has to decide what
+// to record for them. Two facts are needed, and neither alone is enough:
+//
+//   placed_by_this_attempt - did this write's own rename put the bytes there? If not,
+//                            whatever sits at the path belongs to an earlier attempt,
+//                            and this writer's byte count describes a different file.
+//   size_measured          - was a real size obtained? If not there is no figure to
+//                            charge; the writer's count describes the temporary file,
+//                            not the object left at the final path.
+//
+// Only when both hold can the count be used. Otherwise the footprint is unknown, which
+// is recorded as such and blocks capacity admission rather than being silently taken
+// as zero.
+bool disk_cache_orphan_chargeable(bool placed_by_this_attempt, bool size_measured);
+
 struct disk_cache_commit_candidate {
     std::string path;
     bool        quarantined = false;

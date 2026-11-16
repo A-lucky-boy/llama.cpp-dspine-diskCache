@@ -5,6 +5,7 @@
 #include "server-disk-cache-codec.h"
 
 #include <string>
+#include <set>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -713,6 +714,7 @@ struct disk_cache_counters {
     uint64_t n_hash_collisions      = 0; // stored path with a different identity, cumulative
     uint64_t n_path_conflicts       = 0; // writes refused because the path stayed occupied, cumulative
     uint64_t n_quarantined          = 0; // entries currently excluded from lookups
+    uint64_t n_size_unknown_paths_snapshot = 0; // live paths occupying space that could not be measured
     uint64_t n_entries              = 0;
     uint64_t n_bytes                = 0; // accounted disk usage (total_size)
     uint64_t n_queue_entries        = 0;
@@ -884,6 +886,12 @@ struct server_disk_cache_entry {
     // disk and keeps occupying its bytes, so its quota is not reclaimed; it is
     // excluded from lookups instead of being reported as freed
     bool         quarantined = false;
+
+    // the path is known to occupy space but its size could not be measured, so
+    // `size_file` is not a real figure. Kept separate from a measured zero: a zero
+    // reads as "costs nothing", which would let the quota check admit writes into
+    // space that is actually taken
+    bool         size_unknown = false;
 };
 
 // result of reading one entry file. the caller must not write any KV state into
@@ -927,12 +935,39 @@ struct server_disk_cache_payload {
 // of unknown state; only the first is an ordinary failure.
 enum class disk_cache_write_outcome {
     committed,          // the file is on disk, measured, and may be indexed
-    failed_clean,       // nothing was written, or the partial file was confirmed removed
-    failed_orphaned,    // the final path exists, or its removal could not be confirmed
+    failed_clean,       // nothing was written, or the partial file was *confirmed* removed
+    failed_orphaned,    // the final path exists, or its state could not be confirmed
+};
+
+// Whether the final path holds data, and how sure that answer is.
+//
+// "The query said no" and "the query failed" are different facts, and collapsing
+// them is how a file that no ledger knows about becomes invisible. `unknown` covers
+// both a query that returned an error and one whose answer cannot be trusted; it is
+// never a synonym for absent.
+enum class disk_cache_path_state {
+    confirmed_absent,
+    confirmed_present,
+    unknown,
+};
+
+// Where the data sitting at the final path came from.
+//
+// A failed rename leaves whatever was already there. The writer's byte count
+// describes the *temporary* file it wrote, so charging that number to the final path
+// would be sizing a file the writer never produced. Only when this attempt's own
+// rename landed does that count say anything about what is on disk, and even then
+// only as a floor.
+enum class disk_cache_write_origin {
+    none,                       // nothing of this attempt reached the final path
+    this_attempt,               // this attempt's rename landed; written_bytes describes it
+    preexisting_unverified,     // the final path held something older, not this write
 };
 
 struct disk_cache_write_result {
     disk_cache_write_outcome outcome = disk_cache_write_outcome::failed_clean;
+    disk_cache_path_state    path_state = disk_cache_path_state::confirmed_absent;
+    disk_cache_write_origin  origin = disk_cache_write_origin::none;
 
     // the final path, always set: the worker must be able to quarantine exactly this
     // path without recomputing it
@@ -944,9 +979,14 @@ struct disk_cache_write_result {
     size_t size_file = 0;
 
     // the length the writer knows it wrote, from the stream position after flush.
-    // Only a lower bound on what exists on disk, so it is kept for accounting a
-    // quarantined file and for cross-checking, never for quota release
+    // It describes this attempt's own bytes only; `origin` says whether those bytes
+    // are what sits at the final path
     size_t written_bytes = 0;
+
+    // True when the path is charged to the ledger without a measured size. The
+    // byte count for such a path is unknown, and treating unknown as zero would let
+    // the quota check admit writes that do not fit.
+    bool size_unknown = false;
 };
 
 // an entry queued for the background writer
@@ -1037,6 +1077,12 @@ struct server_disk_cache {
 
     std::vector<server_disk_cache_entry> entries;
     size_t total_size = 0;
+
+    // how many live paths occupy space the ledger cannot size. Not part of
+    // `total_size`, which only ever holds real figures: these bytes are real but
+    // unmeasured, so admission is denied while any of them is present rather than
+    // treating them as zero and over-filling the directory
+    size_t n_size_unknown_paths = 0;
 
     mutable std::mutex      mtx;
     std::condition_variable cv;
@@ -1256,6 +1302,25 @@ private:
     // cache holds many entries; trusted only when the file size matches
     bool load_manifest(std::map<std::string, disk_cache_manifest_meta> & out);
     void save_manifest(); // mtx must be held
+
+    // The quarantine record is a small sidecar, separate from the manifest, listing
+    // the entry file names that must not be treated as usable until they are
+    // confirmed removed or measured.
+    //
+    // It is separate because manifest v3 has no field for this, and adding one would
+    // change a format whose compatibility the plan requires keeping. A file that
+    // exists only because a write failed is exactly the state that must outlive the
+    // process that discovered it, so it cannot live only in memory either.
+    //
+    // The read must happen before the scan decides what is usable; the write only
+    // ever adds or removes names, never reclassifies a file as good.
+    bool load_quarantine(std::set<std::string> & out) const;
+    void save_quarantine(const std::set<std::string> & names) const; // atomic; mtx must be held
+    void quarantine_paths_add(const std::vector<std::string> & paths); // mtx must be held
+    void quarantine_paths_drop(const std::string & path);             // mtx must be held
+
+    // entry names (file name only, not the full path) currently marked unusable
+    std::set<std::string> quarantined_names;
     void worker();
 };
 

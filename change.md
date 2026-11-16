@@ -3238,3 +3238,199 @@ cache_stats: reused_disk = 0, restored = 0, prefill = 2496, reject = checksum_er
 - `seekg` 跳过仍保留按需读取，未把全部 checkpoint 读入内存（规划 §2.3.3）
 - 文件系统异常未被当作缓存命中，未修改 model state，未重算 prompt，未削弱磁盘配额（规划 §2.2 末段）
 - 未调用 `notify_committed()` 于回滚失败路径（隔离条目不经该路径）
+
+# 2026-11-16 16-20 - Change Record（test1_5 修复轮：路径状态三态、隔离跨重启、孤儿来源区分）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 15-25 - test1_5` 修复 `failed_orphaned` 在两处的不变量漏洞，并补上孤儿记账的一组缺陷。三处逻辑错误均已由源码确认存在，其中 B（隔离跨重启丢失）另有真实端到端证据。基线 HEAD `980ab84`。
+
+## 一、缺陷 A：`exists()` 报错被当作"路径不存在"
+
+### 缺陷
+
+rename 失败后的分支是：
+
+```cpp
+std::error_code ec_final;
+if (fs::exists(path, ec_final) && !ec_final) {
+    result.outcome = disk_cache_write_outcome::failed_orphaned;
+}
+return result;   // 默认 failed_clean
+```
+
+若 `fs::exists` 返回 **false 并设置错误码**，条件为假、分支跳过，函数返回 `failed_clean`——**把"查询失败"当成了"文件不存在"**，与结果语义矛盾。
+
+`!path_owned` 分支有同类问题：`fs::exists(path, ec_exists)` 报错时 `if` 为假，代码继续走到 `rename()`，**在路径所有权未被证明的情况下覆写**。
+
+### 修复
+
+引入三态，未知不与不存在合并：
+
+```cpp
+enum class disk_cache_path_state {
+    confirmed_absent,
+    confirmed_present,
+    unknown,
+};
+```
+
+- rename 失败后：`present && !ec` → `confirmed_present`；`ec` → `unknown`；否则 `confirmed_absent`。只有 `confirmed_absent` 返回 `failed_clean`，另两者一律 `failed_orphaned`
+- `!path_owned`：`ec_exists` 时**拒绝继续**，丢弃 tmp 并以 `unknown` 返回——所有权证明是覆写安全的前提，查询答不出来就不能认为已证明
+- 新增 `drop_tmp()` 统一四处临时文件清理，删除失败时记录（`.tmp` 由启动清扫处理，但不再静默丢弃错误）
+
+## 二、缺陷 B：隔离状态跨重启丢失
+
+### 缺陷
+
+worker 把残留文件作为 `quarantined=true` 的条目插入 `entries`，这防住了**当前进程内**的使用。但：
+
+- `disk_cache_manifest_meta` **没有 `quarantined` 字段**
+- `save_manifest()` 把所有条目当普通记录写出
+- `scan()` 重建条目时**从不设置** `quarantined`（全文件只有一处 `e.quarantined` 读取，无写入）
+
+因此隔离资格在重启后消失：文件被重建为可用条目，`load()` 会去读它。
+
+### 修复：独立侧车记录
+
+新增 `pc-quarantine.dat`，每行一个条目文件名：
+
+- **不放进 manifest**：manifest v3 是要求保持兼容的格式，其记录描述的是*可用*快照；"写入失败留下的路径"是另一类事实。加字段会让旧读者看到不认识的记录
+- 原子落盘（`tmp` + `rename`），与 manifest 同一套做法
+- **在 `scan()` 之前读取**，否则条目已被登记完毕
+- **不对称规则**：存在**从不**解除隔离，只有确认文件消失才解除。`scan()` 目录循环中隔离检查置于 manifest 与 header 两个分支**之前**，所以两者都无法把一个隔离文件重新判为可用——manifest 缺字段，header 只能证明"这是一份快照"，不能证明"这个路径曾被成功提交"
+- `quarantine_paths_drop()` 只在 `claim_path_locked()` 确认删除成功后调用
+- 隔离名对应的文件已不存在时，`scan()` 末尾清除该名（这可能发生在进程停机期间被外部删除）
+
+被隔离的字节**仍然计数**：有索引记录时用记录的长度，否则用磁盘上实测的 `fsize`。
+
+## 三、缺陷 C：孤儿来源区分与未知占用
+
+### 缺陷
+
+`written_bytes` 来自**新写临时文件**的 `tellp()`。rename 失败后最终路径上残存的可能是**较早的另一个文件**，该计数描述的却是本次临时文件。原代码却：
+
+```cpp
+orphan.size_file = write.written_bytes;
+total_size += orphan.size_file;
+```
+
+对"从未成功 rename 的既有路径"，这不是目标文件大小的可靠下限。
+
+### 修复
+
+结果结构新增来源与未知标记：
+
+```cpp
+enum class disk_cache_write_origin {
+    none,                       // 本次写入没有任何东西到达最终路径
+    this_attempt,               // 本次 rename 成功，written_bytes 描述它
+    preexisting_unverified,     // 最终路径上是更早的东西，不是本次写入
+};
+
+bool size_unknown = false;      // 路径占用空间但大小未能测得
+```
+
+新增纯函数 `disk_cache_orphan_chargeable(placed_by_this_attempt, size_measured)`，**worker 直接调用它**（不是复制一份规则）：
+
+- rename 失败 → `preexisting_unverified` + `size_unknown`，`written_bytes` 清零
+- `file_size` 失败 → `this_attempt` + `size_unknown`（rename 已成功，但没拿到数字）
+- 只有"本次写入放置的字节 **且** 拿到了实际大小"才可记账
+
+### 未知占用必须阻塞准入
+
+`size_file = 0` 会被配额读成"不占空间"。新增：
+
+- 条目字段 `size_unknown`，`server_disk_cache` 成员 `n_size_unknown_paths`
+- `disk_cache_quota_item.size_unknown` → `disk_cache_quota_plan.blocked_by_unknown`
+- `disk_cache_plan_quota()` 在**任何**情况下都不因未知路径报告 `fits`，**包括 `limit == 0`（无限配额）的提前返回**——无限容量仍是对容量的声明，不能在一部分目录未被计数时作出
+- 未知路径**永不**成为淘汰候选（"淘汰"它会释放一个无人测量过的数字）
+- 新增指标 `cache_disk_unknown_size_paths`
+
+`claim_path_locked()` 确认删除后递减该计数并解除隔离。
+
+## 四、修改文件
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_path_state`、`disk_cache_write_origin`、`disk_cache_write_result` 扩展；条目 `size_unknown` 字段；侧车接口声明；`n_size_unknown_paths` 成员与快照字段；`<set>` 包含
+- 具体变更：见 §一、§二、§三
+- 修改原因：规划 §二、§三、§四
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`write_entry()` 的 rename/`!path_owned`/`file_size` 分支与 `drop_tmp()`；`save_manifest()` 跳过隔离条目；`scan()` 隔离检查与清除；`save_quarantine()`/`load_quarantine()`/`quarantine_paths_add()`/`quarantine_paths_drop()`；worker 孤儿记账；`claim_path_locked()` 解除隔离；指标
+- 具体变更：见 §一、§二、§三
+- 修改原因：规划 §二、§三、§四
+
+### tools/server/server-disk-cache-quota.h / .cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-disk-cache-quota.h、tools/server/server-disk-cache-quota.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_quota_item.size_unknown`；`disk_cache_quota_plan.blocked_by_unknown`；`disk_cache_plan_quota()` 的两处 `fits` 判定；新增 `disk_cache_orphan_chargeable()`
+- 具体变更：见 §三
+- 修改原因：规划 §四、§五
+
+### tools/server/tests/unit/test_disk_cache_lifecycle.cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 修改位置：全文件，11 组用例
+- 具体变更：未知占用阻塞准入（有限/无限/不计为零/解除后可准入/永不为淘汰候选）、隔离不可用于提交、隔离持有者不能作为替代依据、孤儿可记账规则
+- 修改原因：规划 §五、§八
+
+## 五、验证执行记录
+
+- 已执行检查：CUDA release 构建，本轮 4 次（其中 3 次为我的编译错误修正）
+- 检查结果：通过，`0 FAILED`。三次失败均为我自己的问题：Python 脚本里 `\r` 被二次转义成字面换行（`C2001`）、新函数缺 `namespace fs` 别名（`C2653`）
+
+- 已执行检查：新单测 `test_disk_cache_lifecycle`
+- 检查结果：通过，11 组。**反向验证**：退回配额 gate 后 5 项失败，覆盖有限与无限两条路径
+
+- 已执行检查：八套独立单测（含 ASan 版 codec）
+- 检查结果：通过。codec / layout / lifecycle / match / quota / prefix-index / materialize 七套 + ASan codec 静默
+
+- 已执行检查：**隔离跨重启（规划 §八第 6 项）真实端到端**
+- 检查结果：**通过**。构造带隔离标记的真实目录（538.51 MiB 文件 + 索引 + 侧车）后启动：
+  ```
+  1 path(s) were left quarantined by a previous run
+  keeping '...pc-bf495e2785d51ca5.bin' quarantined (538.51 MiB)
+  cache_scan_end: 1 entries (manifest 0, header 0), 1 kept quarantined
+  cache_stats: reused_disk = 0, restored = 0, prefill = 2496, reject = no_prefix
+  ```
+  文件存在、索引列出它、**仍被拒绝恢复**。修复前它会被重建为可用条目
+
+- 已执行检查：**隔离在文件确认消失后解除**
+- 检查结果：**通过**。删除文件后启动：`cache_scan_end: 0 entries, 0 kept quarantined, 1 quarantine cleared`，**侧车文件本身被移除**，条目不再出现
+
+- 已执行检查：正常 v8 新写 + 跨进程重启回归
+- 检查结果：通过。564668394 字节、无侧车产生（无隔离时才不生成）；`scan 1 entries, 0 dropped, 0 kept quarantined`；`reused_disk=2102`、sha 一致
+
+- 已执行检查：清理
+- 检查结果：通过
+
+- **未执行的检查及原因**：
+  - **文件系统故障注入（规划 §八第 2、3、4 项）**：**未执行**。需要可控地让 `rename` 失败同时 `exists` 返回 false 带错误码、或让 `file_size`/`remove` 失败。本机无 fault-injection 框架，Windows 上难以对该路径制造稳定的权限/共享冲突而不影响其它 I/O。因此 `failed_clean` 与 `failed_orphaned` 的**生成**只有代码实现与单元级算术验证，**没有从真实失败中产生过**
+  - **侧车自身的部分写入与并发**：未测试。格式选择的失败模式（截断 → 名字更少 → 当作普通条目由既有校验重新把关）已在注释中说明，但**未实际构造截断侧车**
+  - **`touch_entry()` 端到端**：**仍未验证**（同上轮，析构路径 + 本环境送不达 `CTRL_C_EVENT`）
+  - **写入失败后同 hash 重写走 `claim_path_locked()` 回收**：逻辑未改且路径已被既有回收分支覆盖，但**未在真实故障后构造**
+  - **媒体输入端到端**：测试机无多模态模型；`media_state_unverified` 门禁未变
+
+## 六、range 确认
+
+- 未改 `src/llama-context.cpp` 的 `state_seq_get/set_data_ext` 协议、模型参数、DSpine 解码流程（规划 §五）
+- 未改 v8/v9 已持久化 payload、CRC、媒体主动捕获门禁、token 复用统计
+- manifest v3 格式**未变更**；隔离信息走独立侧车，旧清单/旧缓存扫描方式不受影响
+- `claim_path_locked()` 仍协调路径所有权；隔离只收紧错误路径的写入权限
+- 未调用 `notify_committed()` 于任何隔离路径；`notify_invalidated()` 仍只在锁内按真实生命周期交付
+- `--cache-disk-codec` 默认 `none`、`768 KiB/token` 守卫、4096-token 写入抑制、preflight、完整身份匹配、in-flight 保护**均未改动**
