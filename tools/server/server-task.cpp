@@ -1809,6 +1809,14 @@ std::string server_task_result_metrics::to_metrics() {
             "cache_prefix_materialize_skipped_total",
             "Prefix captures that produced no state (refused, past the boundary, export failed)",
             (double) n_materialize_skipped
+        }, {
+            "cache_prefix_materialize_preflight_skip_total",
+            "Prefix captures spared by the pre-export admission check; not a cache hit",
+            (double) n_preflight_skipped
+        }, {
+            "cache_prefix_materialize_preflight_export_allowed_total",
+            "Pre-export admission checks that let the state export proceed",
+            (double) n_preflight_allowed
         },
     };
 
@@ -3891,6 +3899,137 @@ void server_disk_cache::inflight_erase_locked(uint64_t hash) {
     inflight.erase(hash);
 }
 
+// Whether a committed entry already answers for `hash`. Extracted from store() so
+// the preflight and the write path answer the question the same way; a second copy
+// of this rule is how the queued and committed halves drifted apart before.
+//
+// Every entry that maps to a hash shares the same path, so more than one of them
+// can be present - a quarantined one alongside a usable one, for instance. A
+// quarantined holder therefore cannot end the scan: it says nothing about the
+// prompt, and a usable entry behind it might be the actual answer. Only a
+// *reusable* entry decides the outcome.
+//
+// `holder` receives the path of the entry that produced `conflict`, for the
+// caller's diagnostic.
+//
+// must be called with mtx held: it walks `entries`.
+server_disk_cache::committed_verdict server_disk_cache::committed_check_locked(
+        uint64_t hash, const disk_cache_prompt_identity & wanted, std::string * holder) const {
+    bool saw_holder = false;
+
+    for (const auto & e : entries) {
+        if (e.hash != hash) {
+            continue;
+        }
+
+        if (!is_reusable_entry(e)) {
+            // a quarantined holder is not "already stored": the entry cannot serve
+            // a lookup, so treating it as a duplicate would keep the prompt
+            // permanently uncacheable. the worker resolves the path before writing.
+            // keep looking in case a usable entry shares this hash
+            saw_holder = true;
+            continue;
+        }
+
+        // the path is derived from the hash, so a hash hit is a path hit: the
+        // identity decides between "already stored" and "conflict"
+        if (disk_cache_classify_duplicate(identity_of(e), wanted, true) == disk_cache_duplicate::identical) {
+            return committed_verdict::identical;
+        }
+
+        if (holder) {
+            *holder = e.path;
+        }
+        return committed_verdict::conflict;
+    }
+
+    return saw_holder ? committed_verdict::held : committed_verdict::none;
+}
+
+// Metadata-only admission. Everything below is token/media arithmetic over
+// structures the disk tier already holds; no context, no file, no allocation worth
+// mentioning.
+server_disk_cache::preflight_result server_disk_cache::preflight_materialize(const server_tokens & prefix) const {
+    // the counters for this live with the caller: it is the one that knows whether
+    // the answer was "skip" or "allowed", and this method stays const so it cannot
+    // be mistaken for something that changes the tier
+    if (!active) {
+        return preflight_result::cache_unavailable;
+    }
+
+    // the same packing the write path uses, so the identity compared here is the
+    // identity that would be written
+    server_disk_cache_pending probe;
+
+    if (!disk_cache_pack(prefix, probe.packed, probe.ids,
+                probe.media_indices, probe.media_token_counts, probe.media_ids)) {
+        // no usable identity: the caller must not act on a guess about it
+        return preflight_result::invalid_identity;
+    }
+
+    if (probe.ids.size() < min_tokens) {
+        // below the tier's own minimum: nothing could be stored at all, so nothing
+        // is worth exporting
+        return preflight_result::invalid_identity;
+    }
+
+    const uint64_t hash = disk_cache_hash(probe.ids, probe.media_indices, probe.media_token_counts, probe.media_ids);
+
+    disk_cache_prompt_identity identity;
+    identity.tokens             = &probe.ids;
+    identity.media_indices      = &probe.media_indices;
+    identity.media_token_counts = &probe.media_token_counts;
+    identity.media_ids          = &probe.media_ids;
+    // no file exists yet, so there is no byte count for the cost guard to use. That
+    // is precisely why it is not consulted here: covered_cheaply() sizes each
+    // committed entry by its own size_file, and anything needing *this* write's
+    // size is left to store(), which has it
+    identity.file_bytes = 0;
+
+    std::lock_guard<std::mutex> lock(mtx);
+
+    // 1. a committed entry with the same identity, or a different one on the path
+    switch (committed_check_locked(hash, identity, nullptr)) {
+        case committed_verdict::identical:
+            return preflight_result::identical_committed;
+
+        case committed_verdict::conflict:
+            // n_hash_collisions/n_path_conflicts stay with store(): this call only
+            // decides whether to export, and those counters describe writes
+            return preflight_result::hash_path_conflict;
+
+        case committed_verdict::held:
+            // a quarantined holder says nothing either way; the worker decides the
+            // path. fall through to the remaining checks
+            break;
+
+        case committed_verdict::none:
+            break;
+    }
+
+    // 2. the same identity already queued or being written
+    switch (inflight_check_locked(hash, identity)) {
+        case inflight_verdict::duplicate:
+            return preflight_result::identical_inflight;
+
+        case inflight_verdict::conflict:
+            return preflight_result::hash_path_conflict;
+
+        case inflight_verdict::free:
+            break;
+    }
+
+    // 3. a committed entry that covers this prefix cheaply. this is the predicate
+    // the write path uses, so the media boundaries, the minimum length, the tail
+    // tolerance and the read-cost guard are the same rules - evaluated against each
+    // entry's real size_file
+    if (covered_cheaply(identity)) {
+        return preflight_result::covered_by_committed;
+    }
+
+    return preflight_result::export_needed;
+}
+
 void server_disk_cache::store(server_prompt_cache_state && state) {
     if (!active) {
         return;
@@ -3940,33 +4079,32 @@ void server_disk_cache::store(server_prompt_cache_state && state) {
         // the path is derived from the hash, so a hash hit is a path hit: resolve
         // the owner first and only then decide between "already stored" and
         // "conflict". a hash hit with a different identity - including a different
-        // token length - is a conflict, not something to skip
-        for (const auto & e : entries) {
-            if (e.hash != hash) {
-                continue;
-            }
+        // token length - is a conflict, not something to skip.
+        //
+        // the preflight asks the same question, so both go through this one helper
+        // and cannot disagree
+        std::string holder;
 
-            if (is_reusable_entry(e) &&
-                    disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
+        switch (committed_check_locked(hash, pending_identity, &holder)) {
+            case committed_verdict::identical:
                 SRV_TRC("disk cache: %016" PRIx64 " is already stored, skipping\n", hash);
                 counters.n_enqueue_dedup++;
                 return;
-            }
 
-            if (!is_reusable_entry(e)) {
-                // a quarantined holder is not "already stored": the entry cannot
-                // serve a lookup, so counting this as a duplicate would keep the
-                // prompt permanently uncacheable. the worker resolves the path
-                // before writing (reclaim or refuse)
+            case committed_verdict::held:
+                // the worker resolves the path before writing (reclaim or refuse)
                 SRV_TRC("disk cache: %016" PRIx64 " is held by a quarantined entry, resolving the path at write time\n", hash);
-                continue;
-            }
+                break;
 
-            counters.n_hash_collisions++;
-            counters.n_path_conflicts++;
-            SRV_ERR("disk cache: %016" PRIx64 " is held by '%s' with a different token/media identity, refusing the write\n",
-                    hash, e.path.c_str());
-            return;
+            case committed_verdict::conflict:
+                counters.n_hash_collisions++;
+                counters.n_path_conflicts++;
+                SRV_ERR("disk cache: %016" PRIx64 " is held by '%s' with a different token/media identity, refusing the write\n",
+                        hash, holder.c_str());
+                return;
+
+            case committed_verdict::none:
+                break;
         }
 
         // queued or being written. a hash hit is not yet an answer: the identity
@@ -4096,28 +4234,28 @@ bool server_disk_cache::mirror(const server_prompt_cache_state & state, size_t b
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        // already written, or already waiting in the queue
-        for (const auto & e : entries) {
-            if (e.hash != hash) {
-                continue;
-            }
+        // already written, or already waiting in the queue. same helper store()
+        // uses, so the two paths cannot drift
+        std::string holder;
 
-            if (is_reusable_entry(e) &&
-                    disk_cache_classify_duplicate(identity_of(e), pending_identity, true) == disk_cache_duplicate::identical) {
+        switch (committed_check_locked(hash, pending_identity, &holder)) {
+            case committed_verdict::identical:
                 counters.n_enqueue_dedup++;
                 return false;
-            }
 
-            if (!is_reusable_entry(e)) {
+            case committed_verdict::held:
                 // see store(): a quarantined holder is not a stored duplicate
-                continue;
-            }
+                break;
 
-            counters.n_hash_collisions++;
-            counters.n_path_conflicts++;
-            SRV_ERR("disk cache: %016" PRIx64 " is held by '%s' with a different token/media identity, refusing the mirror\n",
-                    hash, e.path.c_str());
-            return false;
+            case committed_verdict::conflict:
+                counters.n_hash_collisions++;
+                counters.n_path_conflicts++;
+                SRV_ERR("disk cache: %016" PRIx64 " is held by '%s' with a different token/media identity, refusing the mirror\n",
+                        hash, holder.c_str());
+                return false;
+
+            case committed_verdict::none:
+                break;
         }
         switch (inflight_check_locked(hash, pending_identity)) {
             case inflight_verdict::duplicate:

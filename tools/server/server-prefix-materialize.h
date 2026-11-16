@@ -160,6 +160,66 @@ struct disk_cache_checkpoint_view {
 bool disk_cache_checkpoint_fits(const disk_cache_checkpoint_view & ckpt,
         size_t prefix_tokens, int64_t prefix_pos_max);
 
+//
+// what the plan should do on this call
+//
+// This is the decision materialize_prefix() acts on, extracted so a unit test
+// exercises the real control flow rather than a look-alike. It exists because that
+// flow has already been broken once in a way no pure predicate could catch: the
+// token-view length check was changed into an immediate failure, which silently
+// turned every mid-prompt batch into a permanent skip.
+//
+enum class disk_cache_materialize_action : uint8_t {
+    // the batch that reaches the prefix has not been decoded yet. the plan stays
+    // armed and nothing is exported, checked or counted as a failure
+    wait_next_batch,
+
+    // the token view holds the prefix, both contexts end exactly on it, and the
+    // admission check found no reason to hold back: export the state
+    export_state,
+
+    // there is nothing worth exporting: a usable committed entry already answers
+    // for this prefix, the same identity is already queued, the path is held by a
+    // different identity, or the state cannot be paired up. the optional capture
+    // ends here without touching the request
+    skip_export,
+
+    // the plan no longer describes this request: the slot belongs to another task,
+    // or a context has moved past the prefix so the captured boundary is gone.
+    // nothing may be exported from the current state
+    cancel_plan,
+};
+
+const char * disk_cache_materialize_action_name(disk_cache_materialize_action action);
+
+// the admission outcome, mirrored from server_disk_cache::preflight_result so this
+// decision does not depend on the disk tier's header
+enum class disk_cache_preflight_verdict : uint8_t {
+    export_needed,
+    skip,           // the disk tier can already answer for this prefix
+    conflict,       // the path is spoken for by another identity
+    invalid,        // no usable identity, or the tier is unavailable
+};
+
+struct disk_cache_materialize_decision_input {
+    bool     armed        = false;
+    bool     done         = false;
+    bool     task_matches = true;  // the plan's task id still equals the slot's
+    size_t   prefix_tokens = 0;
+    size_t   tokens_filled = 0;    // how many of the prefix's tokens the view holds
+    int64_t  expected_position_end = -1;
+    int64_t  target_position_end   = -1;
+    bool     has_draft             = false;
+    int64_t  draft_position_end    = -1;
+    disk_cache_preflight_verdict preflight = disk_cache_preflight_verdict::export_needed;
+};
+
+// the order of the checks is the point: an unfilled token view and a target that has
+// not arrived both mean "the next batch will bring it", which must never be recorded
+// as a refusal
+disk_cache_materialize_action disk_cache_decide_materialize_action(
+        const disk_cache_materialize_decision_input & in);
+
 // The position a text-only prefix of `prefix_tokens` tokens ends at, i.e.
 // `prefix_tokens - 1` (and -1 for an empty prefix).
 //

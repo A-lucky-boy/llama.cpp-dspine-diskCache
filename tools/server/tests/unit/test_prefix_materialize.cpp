@@ -614,6 +614,86 @@ void test_prefix_pos_max_text() {
     CHECK( disk_cache_checkpoint_fits({ 0, 100, 100 }, 100, 100)); // bound taken as K: wrongly admitted
 }
 
+// ---------------------------------------------------------------------------
+// the materialize decision, which is what materialize_prefix() itself acts on
+// ---------------------------------------------------------------------------
+void test_materialize_action() {
+    using a = disk_cache_materialize_action;
+    using pv = disk_cache_preflight_verdict;
+
+    // a helper with sensible defaults: capturable, no draft, preflight allows
+    auto mk = [](bool armed, bool done, bool task_matches, size_t K, size_t filled,
+                 int64_t expected, int64_t tgt, bool has_draft, int64_t dft, pv pf) {
+        disk_cache_materialize_decision_input in;
+        in.armed = armed;
+        in.done = done;
+        in.task_matches = task_matches;
+        in.prefix_tokens = K;
+        in.tokens_filled = filled;
+        in.expected_position_end = expected;
+        in.target_position_end = tgt;
+        in.has_draft = has_draft;
+        in.draft_position_end = dft;
+        in.preflight = pf;
+        return in;
+    };
+
+    // not armed, or already done: nothing to do, and not a refusal
+    CHECK(disk_cache_decide_materialize_action(mk(false, false, true, 100, 100, 100, 100, false, -1, pv::export_needed)) == a::cancel_plan);
+    CHECK(disk_cache_decide_materialize_action(mk(true, true, true, 100, 100, 100, 100, false, -1, pv::export_needed)) == a::cancel_plan);
+
+    // the slot was handed to another request: the plan is stale
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, false, 100, 100, 100, 100, false, -1, pv::export_needed)) == a::cancel_plan);
+
+    // the token view has not filled up to K. this is the case that must never be
+    // recorded as a refusal - the next batch brings it
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 99, -1, 99, false, -1, pv::export_needed)) == a::wait_next_batch);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 0, -1, 0, false, -1, pv::export_needed)) == a::wait_next_batch);
+
+    // view is full but the target has not reached the prefix yet
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 99, false, -1, pv::export_needed)) == a::wait_next_batch);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 0, false, -1, pv::export_needed)) == a::wait_next_batch);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, -1, false, -1, pv::export_needed)) == a::wait_next_batch);
+
+    // a draft that lags while the target is already on the prefix: this batch is the
+    // one that reached it, so the draft will not catch up within this capture - the
+    // next batch moves past the prefix. that is an unpaired state, not a wait
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, true, 99, pv::export_needed)) == a::skip_export);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, true, -1, pv::export_needed)) == a::skip_export);
+
+    // everything lines up and the disk tier has nothing to gain against it
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, false, -1, pv::export_needed)) == a::export_state);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, true, 100, pv::export_needed)) == a::export_state);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 150, 100, 100, false, -1, pv::export_needed)) == a::export_state);
+
+    // a prefix whose positions differ from its token count: judged on positions
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 2102, 2102, 2104, 2104, false, -1, pv::export_needed)) == a::export_state);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 2102, 2102, 2104, 2102, false, -1, pv::export_needed)) == a::wait_next_batch);
+
+    // the states cannot be paired up: not a wait, and not a crash
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 101, false, -1, pv::export_needed)) == a::skip_export);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 101, true, 101, pv::export_needed)) == a::skip_export);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, true, 101, pv::export_needed)) == a::skip_export);
+
+    // the state is capturable but the disk tier already has an answer
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, false, -1, pv::skip)) == a::skip_export);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, false, -1, pv::conflict)) == a::skip_export);
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 100, 100, 100, false, -1, pv::invalid)) == a::skip_export);
+
+    // an unfilled view is a wait even when the preflight already said skip: the
+    // state was never capturable, so this is not the preflight's call
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, true, 100, 99, -1, 99, false, -1, pv::skip)) == a::wait_next_batch);
+
+    // a stale plan is cancelled regardless of what the preflight would have said
+    CHECK(disk_cache_decide_materialize_action(mk(true, false, false, 100, 100, 100, 100, false, -1, pv::skip)) == a::cancel_plan);
+
+    // each action has its own printable name
+    const a all[] = { a::wait_next_batch, a::export_state, a::skip_export, a::cancel_plan };
+    for (const auto v : all) {
+        CHECK(std::string(disk_cache_materialize_action_name(v)) != "unknown");
+    }
+}
+
 // every refusal reason has a printable name, distinct from "none"
 void test_skip_names() {
     const skip_t all[] = {
@@ -646,6 +726,7 @@ int main() {
     test_media_gap_is_legal();
     test_media_chunks_malformed();
     test_media_chunk_predicate();
+    test_materialize_action();
     test_capture_position_bounds();
     test_position_vs_token_units();
     test_media_state_unverified_gate();

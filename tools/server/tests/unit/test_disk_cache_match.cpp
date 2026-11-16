@@ -725,6 +725,98 @@ void test_inflight_lifecycle() {
     CHECK_EQ(t.size(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// the questions preflight_materialize() asks, in the order it asks them
+//
+// preflight calls committed_check_locked() (built on classify_duplicate), then
+// inflight_check_locked() (the same call), then covered_cheaply() (built on
+// suppresses_write). Each of those is exercised above; this pins the *combination*
+// down so the preflight's conclusions follow from the predicates it reuses rather
+// than from a second rule.
+//
+// The distinction that matters: "already have this exact prompt" is a different
+// answer from "have something longer that covers it", and neither is "a different
+// prompt wants this path".
+// ---------------------------------------------------------------------------
+void test_preflight_conclusions() {
+    const size_t MIN_TOKENS = 256;
+    const size_t LAG        = 16;   // DISK_CACHE_MAX_PREFIX_LAG_TOKENS in the tests' terms
+
+    // the committed entry: 512 tokens, small enough to be cheap to restore
+    ident committed = make_ident(512, 1000);
+    committed.bytes = 512 * 4096;
+
+    // 1. identical_committed: the same prompt is already there
+    {
+        ident wanted = make_ident(512, 1000);
+        CHECK(disk_cache_classify_duplicate(view_of(committed), view_of(wanted), true) == disk_cache_duplicate::identical);
+    }
+
+    // 2. covered_by_committed: a longer committed entry covers this prefix, and its
+    // real size_file passes the read-cost guard
+    {
+        ident wanted = make_ident(500, 1000); // a prefix of the committed one
+        CHECK(disk_cache_classify_duplicate(view_of(committed), view_of(wanted), true) == disk_cache_duplicate::none);
+        CHECK(disk_cache_suppresses_write(view_of(committed), view_of(wanted), MIN_TOKENS, LAG));
+    }
+
+    // 3. neither: the committed entry is too expensive to restore for this prefix,
+    // so it must NOT be reported as coverage. the state has to be exported
+    {
+        ident wanted  = make_ident(500, 1000);
+        ident costly  = make_ident(512, 1000);
+        costly.bytes  = 512 * (1024 * 1024); // way over the per-token guard
+
+        CHECK(disk_cache_classify_duplicate(view_of(costly), view_of(wanted), true) == disk_cache_duplicate::none);
+        CHECK(!disk_cache_suppresses_write(view_of(costly), view_of(wanted), MIN_TOKENS, LAG));
+    }
+
+    // 4. neither: an unrelated prompt, so no coverage either
+    {
+        ident wanted = make_ident(500, 2000);
+        CHECK(!disk_cache_suppresses_write(view_of(committed), view_of(wanted), MIN_TOKENS, LAG));
+    }
+
+    // 5. hash_path_conflict: a committed entry with the same hash (same_hash = true)
+    // but a different identity. it is a refusal, and it must not be read as dedup.
+    //
+    // note the two questions are independent by construction: `suppresses_write`
+    // only asks whether a longer entry could serve this prefix, and it has no hash
+    // to compare. Here the entry genuinely is a longer prefix of `wanted`, so
+    // coverage holds - and the identity check still says "not the same prompt".
+    // preflight asks the identity question first, which is why the conflict is
+    // reported instead of the coverage.
+    {
+        ident wanted = make_ident(400, 1000); // differs in length, shares the prefix
+        CHECK(disk_cache_classify_duplicate(view_of(committed), view_of(wanted), true) == disk_cache_duplicate::none);
+        CHECK(disk_cache_suppresses_write(view_of(committed), view_of(wanted), MIN_TOKENS, LAG));
+
+        // an entry that is NOT a longer prefix of `wanted` is neither a duplicate
+        // nor coverage: both questions answer no, and the export proceeds
+        ident unrelated = make_ident(400, 3000);
+        CHECK(disk_cache_classify_duplicate(view_of(committed), view_of(unrelated), true) == disk_cache_duplicate::none);
+        CHECK(!disk_cache_suppresses_write(view_of(committed), view_of(unrelated), MIN_TOKENS, LAG));
+    }
+
+    // 6. a prefix below the tier's minimum is nothing to store, so preflight reports
+    // it as invalid rather than as coverage
+    {
+        ident tiny = make_ident(64, 1000);
+        // suppresses_write itself refuses below the minimum match length
+        CHECK(!disk_cache_suppresses_write(view_of(committed), view_of(tiny), MIN_TOKENS, LAG));
+    }
+
+    // 7. media must match for any of this to hold: same tokens, different media id
+    {
+        ident a = make_ident(512, 1000);
+        ident b = make_ident(512, 1000);
+        a.idx = { 100 }; a.cnt = { 8 }; a.ids = { "img-a" };
+        b.idx = { 100 }; b.cnt = { 8 }; b.ids = { "img-b" };
+        CHECK(disk_cache_classify_duplicate(view_of(a), view_of(b), true) == disk_cache_duplicate::none);
+        CHECK(!disk_cache_suppresses_write(view_of(a), view_of(b), MIN_TOKENS, LAG));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -741,6 +833,7 @@ int main() {
     test_classify_duplicate();
     test_inflight_identity_verdict();
     test_inflight_lifecycle();
+    test_preflight_conclusions();
     test_suppresses_write();
 
     if (g_failures == 0) {

@@ -700,6 +700,7 @@ struct disk_cache_counters {
     uint64_t n_materialize_scheduled = 0;
     uint64_t n_materialize_exported  = 0;
     uint64_t n_materialize_skipped   = 0;
+
     uint64_t n_manifest_fallback    = 0;
     uint64_t n_reject[(size_t) cache_reject_reason::count] = {};
     uint64_t n_enqueue_queued       = 0;
@@ -734,6 +735,12 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_materialize_scheduled = 0;
     uint64_t n_materialize_exported  = 0;
     uint64_t n_materialize_skipped   = 0;
+
+    // pre-export admission: the metadata check settled it before the state was
+    // exported, and the check let the export proceed. a saved export is not a cache
+    // hit - it is never counted as a reused token
+    uint64_t n_preflight_skipped     = 0;
+    uint64_t n_preflight_allowed     = 0;
 
     virtual json to_json() override;
 
@@ -1028,6 +1035,38 @@ struct server_disk_cache {
         }
     };
 
+public:
+    // Metadata-only admission check for a prefix that is about to have its full
+    // target/draft sequence state exported.
+    //
+    // The export is the expensive part: sizing the state, allocating buffers in
+    // the hundreds of MiB, copying both contexts out. Everything the disk layer
+    // already knows - a committed entry with the same identity, a committed entry
+    // that covers this prefix cheaply, the same identity already queued, a hash
+    // held by a different identity - can be answered from token/media metadata
+    // alone, before any of that.
+    //
+    // Read-only and synchronous. It never touches `entries`, `inflight`, the byte
+    // ledger, the manifest or the prefix directory, and it takes no KV state. A
+    // result of `export_needed` is not permission to skip the real checks later:
+    // store() and the worker still decide, and this call says nothing about the
+    // quota, the final buffer size or whether a file will still be there in a
+    // moment.
+    enum class preflight_result {
+        export_needed,          // nothing here says the export is pointless
+        identical_committed,    // a reusable entry with this very identity exists
+        covered_by_committed,   // a reusable entry covers this prefix cheaply
+        identical_inflight,     // this very identity is queued or being written
+        hash_path_conflict,     // the path is spoken for by a different identity
+        invalid_identity,       // no usable metadata identity could be built
+        cache_unavailable,      // the disk tier is not active
+    };
+
+    // `tokens` is the prefix itself, not the whole request: the caller passes the
+    // first K tokens and their media description
+    preflight_result preflight_materialize(const server_tokens & prefix) const;
+
+private:
     std::unordered_map<uint64_t, inflight_identity> inflight;
 
     // what a hash already in flight means for a write that wants the same path.
@@ -1050,7 +1089,24 @@ struct server_disk_cache {
     // must be called with mtx held
     void inflight_erase_locked(uint64_t hash);
 
-private:
+    // what the committed entries already say about a write for `hash`.
+    //
+    // Shared by the preflight (which only needs to know whether exporting the
+    // state is worth it) and by store() (which acts on the answer). Keeping it in
+    // one place means the two agree on what "already stored" and "path conflict"
+    // mean - a second copy of this rule is exactly how the queued and committed
+    // halves drifted apart before.
+    //
+    // must be called with mtx held
+    enum class committed_verdict {
+        none,       // no usable entry holds this path
+        identical,  // a reusable entry with the same identity
+        conflict,   // a reusable entry with a different identity
+        held,       // only a quarantined entry holds it; the worker resolves the path
+    };
+
+    committed_verdict committed_check_locked(uint64_t hash, const disk_cache_prompt_identity & wanted, std::string * holder) const;
+
     // delete a broken entry (file + index + manifest); must not be called with mtx held
     void drop_entry(const std::string & path);
 

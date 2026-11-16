@@ -159,6 +159,77 @@ bool disk_cache_checkpoint_fits(const disk_cache_checkpoint_view & ckpt,
     return true;
 }
 
+const char * disk_cache_materialize_action_name(disk_cache_materialize_action action) {
+    switch (action) {
+        case disk_cache_materialize_action::wait_next_batch: return "wait_next_batch";
+        case disk_cache_materialize_action::export_state:    return "export_state";
+        case disk_cache_materialize_action::skip_export:     return "skip_export";
+        case disk_cache_materialize_action::cancel_plan:     return "cancel_plan";
+    }
+    return "unknown";
+}
+
+disk_cache_materialize_action disk_cache_decide_materialize_action(
+        const disk_cache_materialize_decision_input & in) {
+    // a plan that is not live, or belongs to a request that has moved on, must
+    // never be acted on: the slot may already hold another task's state
+    if (!in.armed || in.done) {
+        return disk_cache_materialize_action::cancel_plan;
+    }
+
+    if (!in.task_matches) {
+        return disk_cache_materialize_action::cancel_plan;
+    }
+
+    // the batch that reaches the prefix has not been decoded yet. this is the case
+    // that was once turned into a permanent failure: the view or the target is
+    // simply not there yet, and the next batch will bring it
+    if (in.tokens_filled < in.prefix_tokens) {
+        return disk_cache_materialize_action::wait_next_batch;
+    }
+
+    // positions compared to positions, and the two contexts are judged separately -
+    // the same verdict means something different depending on who is behind.
+    //
+    // the target is what decides whether this batch is the one. If it has not
+    // reached the prefix, the batch that does has not been decoded yet: that is a
+    // wait, and nothing has failed.
+    if (in.expected_position_end <= 0 || in.target_position_end < in.expected_position_end) {
+        return disk_cache_materialize_action::wait_next_batch;
+    }
+
+    // past the prefix, which cannot be undone: the state can only be exported as a
+    // longer prefix, so the optional capture ends here rather than producing a
+    // snapshot that does not describe what it claims
+    if (in.target_position_end > in.expected_position_end) {
+        return disk_cache_materialize_action::skip_export;
+    }
+
+    // The target sits exactly on the prefix, so this batch is the one that reaches
+    // it. Whatever the draft is doing now, it will not get another chance within
+    // this capture: the next batch moves past the prefix. A draft that disagrees -
+    // behind, ahead, or holding nothing - therefore cannot be paired up, and a
+    // snapshot from two disagreeing contexts would describe a prompt that was never
+    // executed.
+    if (in.has_draft && in.draft_position_end != in.expected_position_end) {
+        return disk_cache_materialize_action::skip_export;
+    }
+
+    // the state is capturable. whether exporting it is worth it is the disk tier's
+    // answer, and only its "nothing to gain" outcomes stop the export
+    switch (in.preflight) {
+        case disk_cache_preflight_verdict::export_needed:
+            return disk_cache_materialize_action::export_state;
+
+        case disk_cache_preflight_verdict::skip:
+        case disk_cache_preflight_verdict::conflict:
+        case disk_cache_preflight_verdict::invalid:
+            return disk_cache_materialize_action::skip_export;
+    }
+
+    return disk_cache_materialize_action::skip_export;
+}
+
 const char * disk_cache_materialize_skip_name(disk_cache_materialize_skip reason) {
     switch (reason) {
         case disk_cache_materialize_skip::none:             return "none";

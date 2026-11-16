@@ -2601,3 +2601,220 @@ std::unordered_map<uint64_t, disk_cache_inflight_identity> inflight;
 将实际文件修改、直接定位到的错误分支、确实执行过的单测/故障注入/端到端检查追加到 `change.md`。只有已实现并验证的总体语义写入 `projectSummary.md`。
 
 本 `betterModification.md` 只记录实验规划与算法修改日志，不填写预想的性能数值、未执行的实验结果、训练早停、计算资源报告和最终优劣判定。保留此前的全部规划记录，当前修复完成后再重新核对最新 `change.md` 与 baseline 差异，评估下一项算法实验。
+
+---
+
+# 2026-11-16 10-20 - test1_4
+
+## 一、实验目标
+
+**实验名称：公共前缀 KV 状态导出前的轻量级缓存准入（Pre-export Materialization Admission）**。
+
+当前公共前缀物化已经能在真实 prefill 安全点导出目标与草稿模型的完整序列状态，并经原有磁盘 worker 写盘、重启后恢复。但主动捕获的执行路径仍是：确定一个合格公共前缀 → 分段 prefill 到准确边界 → `server_prompt_cache::materialize()` 分配并导出完整 target/draft KV → `disk->store()` 才检查磁盘中是否已有同一身份、in-flight 是否重复、是否有可经济恢复的更长条目覆盖请求。
+
+本实验仅针对这一**准入判定发生在昂贵的 KV 状态导出之后**的资源开销。目标是在不修改任何模型计算和真实恢复语义的前提下，把现有磁盘层可确定、只依赖 token/media 身份和已提交条目元数据的判断提前。对于本来就会被已有磁盘条目或在途写入抑制的前缀，不执行无意义的完整序列状态导出、巨型缓冲分配和写入队列准备。
+
+本轮是**一次独立算法优化**，不是 KV 物理分块实验。严禁修改 opaque state 字节格式、降低 CRC 与媒体校验要求、绕开成本守卫，或者把 preflight 认为“已有覆盖”计算成真实 `reused_disk`。仅支持本机单用户、单实例、单 slot（`-np 1`）；不规划鉴权、多租户、并发 slot 调度和网络防护。
+
+## 二、规划前查验和 baseline 差异
+
+### 2.1 已查验的现有修改
+
+本规划编写前首先读取仓库 `change.md` 最新 **`change.md` 中 `2026-11-16 10-10` 的最新变更记录**，然后核对 `projectSummary.md`、上传的《2026-11-16-handover-v8-inflight-identity.md》、相关实现与提交差异。
+
+- 仓库：`A-lucky-boy/llama.cpp-dspine-diskCache`。
+- 本轮审查时 `main` HEAD：`4decdf40bb736ede4c344a11872bf36ee57581c3`（交付文档提交）。
+- 最近实际功能提交：`12075e4c244c76dd0de84dec07c1e950428e2e8b`。
+- 对照原始 baseline：`eb7681889f44304d2bd5b3e41572f5530af91a1d`。
+- 对比确认：baseline 已包含磁盘缓存、后台写队列及 hash-only in-flight 集合；当前代码新增了完整 token/media 身份判定、公共前缀目录、主动前缀导出、状态端点 position 检查、配额事务、隔离与提交事件。最新变更将 in-flight 改为 `unordered_map<hash, inflight_identity>`，由 `store()`、`mirror()` 共用同一身份判定，worker 的释放路径已改用统一辅助函数。
+- 静态检查 `tools/server/server-task.cpp`：`server_prompt_cache::materialize()` 在调用 `disk->store()` 之前执行 `llama_state_seq_get_size_ext/get_data_ext` 并分配完整状态缓冲；`server_disk_cache::store()` 此后才执行 `disk_cache_pack()`、完整身份去重、`inflight_check_locked()`、`covered_cheaply()` 和队列容量检查。这形成一个明确的可优化顺序，而非未知的性能瓶颈猜测。
+- 最新提交未发现需要阻止本轮优化的新明显正确性缺陷。现有故障注入、空闲镜像与媒体端到端测试仍有覆盖缺口；不得在文档中声明其已经通过，也不得借本轮扩大未验证媒体主动捕获的范围。
+
+实验人员动手前需重新查验**当时最新**的 `change.md`、HEAD、工作区状态与 `projectSummary.md`，再对照上述 baseline 和当前功能提交。若源码已变化或出现新错误，先处理实际错误，不能直接覆盖最新实现或混入新的缓存策略。
+
+### 2.2 必须保留的现有不变量
+
+1. 前缀目录 `observed / eligible / persisted` 与实际 `reused_disk` 是不同概念；只有真实有效磁盘文件才具有物理引用。
+2. 已提交条目与 in-flight 条目的“同一身份”都使用**完整 token + media 三元组**，hash 只能作为索引键。
+3. 长条目是否替代短条目，必须复用当前确定性媒体边界、最小长度和 `DISK_CACHE_MAX_BYTES_PER_TOKEN` 读盘成本规则，使用**已提交文件的真实 `size_file`**。
+4. 隔离条目不能参与可恢复覆盖、精确重复或前缀 `persisted` 登记；它仍按真实字节计入配额。
+5. 磁盘写入队列、配额准入、删除失败回滚与有序提交通知由现有磁盘层负责；预检查不能私自跳过最终提交校验。
+6. target/draft 的序列位置端点统一按 position 比较；输入含媒体时仍遵循 `media_state_unverified` 的保守主动写盘门禁。
+
+## 三、算法变更
+
+### 3.1 在完整 KV 导出之前增加纯元数据准入
+
+在 `server_disk_cache` 增加一个**只读、同步、线程安全**的 `preflight_materialize()`（命名可服从代码风格）。该 API 只接收前缀 token/media 身份，并返回明确的判定原因；不得接收、序列化或修改 `llama_context`，不得依赖还不存在的待写文件大小。
+
+建议语义（仅示意接口，不要求照搬命名）：
+
+```cpp
+enum class disk_cache_preflight_result {
+    export_needed,          // 未发现可静态确定的拒绝理由，允许继续导出
+    identical_committed,    // 已有身份完全相同且可复用的磁盘条目
+    covered_by_committed,   // 已有条目按现有媒体+token+成本规则覆盖本前缀
+    identical_inflight,     // 同一完整身份正在排队或写入
+    hash_path_conflict,    // 同 hash，但 token/media 身份不同
+    invalid_identity,      // 无法安全建立元数据身份
+    cache_unavailable,     // 当前磁盘层不可用
+};
+
+disk_cache_preflight_result preflight_materialize(const server_tokens & prefix) const;
+```
+
+具体实现必须：
+
+1. **复用**已有 `disk_cache_pack()`、`disk_cache_hash()`、`disk_cache_identity_equal()` / `disk_cache_classify_duplicate()`、`inflight_check_locked()` 和 `disk_cache_suppresses_write()`，不要重新编写另一套 token/media 匹配逻辑。
+2. 将前缀身份的 token/media 元数据在进入缓存锁前构造好；获取现有 `mtx` 后检查已提交 `entries` 与当前 in-flight 表，全部判断在该临界区内完成。不得在持锁时执行任何 KV state API、磁盘文件读写或大规模状态分配。
+3. 只有 `is_reusable_entry(e)` 为真时，才可将现存条目作为精确重复或成本合格的覆盖条目。对 `quarantined`、未知文件有效性、路径所有权尚待回收等状态**不可误报为可恢复覆盖**。
+4. 对 in-flight 的同 hash 请求，使用完整 token/media 身份区分真正重复与路径冲突。碰撞不是 `dedup`；不得覆盖先到条目。
+5. `covered_by_committed` 必须采用与现有 `covered_cheaply()` 相同的媒体边界、最小 token 数、尾部容忍与真实文件字节成本门槛。严禁以“LCP 很长”替代可恢复性判断，或用本次未导出的预估 KV 字节代替现存文件的 `size_file`。
+6. 对无法静态确认的情形，返回 `export_needed` 或明确的非覆盖状态；**不凭猜测**磁盘配额、最终 `pending.bytes`、worker 的下一次淘汰结果或文件 CRC 来阻断导出。
+7. 预检查仅用于决定**是否值得导出状态**；绝不写 `entries`、不更新目录 `persisted`、不改变后续 `load()` 的真实校验与恢复。
+
+### 3.2 物化路径调用顺序
+
+在 `tools/server/server-context.cpp::materialize_prefix()` 中，保持当前边界安全点与全部端点判定逻辑不变；在已经确认 `K`、目标/草稿位置及前缀 token 视图合法后、执行 `server_prompt_cache::materialize()` 之前，增加 preflight：
+
+```text
+目录选出 eligible K
+  → 原有 prefill 边界切分与 target/draft 同步
+  → 验证 request_id、token 视图、K、expected_position_end 和两处实际状态端点
+  → 构造仅包含前 K 个 token 和合法媒体身份的前缀元数据
+  → disk.preflight_materialize(prefix_identity)
+      ├─ identical_committed / covered_by_committed
+      │     → 记录 pre-export skip，不调用完整 KV 导出
+      ├─ identical_inflight
+      │     → 记录等待队列已有相同快照，不重复导出
+      ├─ hash_path_conflict / invalid_identity / cache_unavailable
+      │     → 记录准确拒绝原因，不执行重 KV 导出
+      └─ export_needed
+            → 原有 checkpoint 筛选
+            → server_prompt_cache::materialize()
+            → 原有 disk->store()
+            → 原有磁盘 worker、配额事务、manifest、有效提交通知
+```
+
+`preflight` 不修改当前请求的 KV，不改变 `K` 的位置、批次、采样结果、常规 RAM 缓存或用户响应。即便被预检查抑制，也仍是正常推理请求，后续 prefill/生成照常进行。
+
+**竞态处理**：preflight 与后续 `store()` 之间存在时间窗口。`store()`/worker 必须继续执行原有完整身份、in-flight、覆盖和容量判断，作为**最终权威检查**。不得因为 preflight 曾返回 `export_needed` 就绕过正式检查。若 preflight 发现已提交有效覆盖，而该条目稍后被淘汰，仅意味着本次可选物化失去一次缓存机会；不会生成错误 KV 或虚报 `persisted`，后续请求仍可重新触发捕获。可以保留现有事件 epoch/失效通知语义，不需要引入长期“前缀已处理”的全局标记。
+
+### 3.3 直接测试真实生产控制流，而不只测试谓词
+
+已有 `materialize_prefix()` 曾因改变 token 视图长度检查顺序，错误把“本批尚未填到 K”变成永久 skipped，纯元数据单测无法发现。此次新增的 preflight 会再引入一个早退点，因此要将**本次物化状态动作决策**抽为小型纯函数并由生产函数实际调用，避免单测只检查另一份相似实现。
+
+建议决策的输入包含 `armed/done`、当前 request_id 是否匹配、`K`、token 视图已填充长度、`expected_position_end`、实际 target/draft position 端点以及 preflight 结果；输出至少区分：
+
+- `wait_next_batch`：当前 token 视图未填满 K，或 target 状态尚未到达 K。保留 armed，不能置 done、不能调用 preflight 和状态导出。
+- `export_state`：token 视图足够、两处位置都恰好结束在 K、preflight 允许导出。
+- `skip_export`：已有经济可恢复覆盖、重复在途写入、身份冲突或确定性不可恢复条件。此处只终结本次可选物化，不改模型处理状态。
+- `cancel_plan`：请求身份改变、target/draft 超出 K、上下文迁移后不再具备准确捕获位置。不能使用旧 slot 快照。
+
+实现应尽量复用 `server-prefix-materialize.*` 现有纯函数 `disk_cache_check_capture_position_bounds()`，仅抽取当前控制流关键的状态转移，不重构整个 server 状态机；生产逻辑与单测必须通过同一个可测入口。
+
+**不得**在本轮把媒体主动物化门禁解除；真实多模态状态导出/恢复仍需要独立验证才能扩大能力范围。
+
+### 3.4 观察指标与日志口径
+
+在现有物化统计之外，为 preflight 单独记录检查次数、具体跳过原因和允许继续导出的次数（按项目现有 `/metrics` 风格实现，可采用累计计数）：
+
+```text
+cache_prefix_materialize_preflight_checked_total
+cache_prefix_materialize_preflight_skip_total{reason=...}   // 如现有 metrics 不支持标签可拆为命名计数
+cache_prefix_materialize_preflight_export_allowed_total
+```
+
+这里的 skipped 仅表示“不再进行**本次额外导出**”，不是磁盘命中、真实已复用 token 或有效快照提交。`scheduled`、`exported`、`cache_disk_entries/persisted_refs`、`restored`、`reused_disk` 继续各按原语义统计。预检查拦截的请求不应误增加 `n_enqueue_dedup`：该值表示实际走到磁盘入队判定的路径；可通过新增的 preflight 原因单独统计。
+
+## 四、预期修改文件
+
+| 文件 | 预期修改 |
+|---|---|
+| `tools/server/server-task.h` | 为磁盘层新增只读 preflight 结果枚举、方法声明和必要计数；不暴露 live KV 结构 |
+| `tools/server/server-task.cpp` | 复用现有 `disk_cache_pack`、`disk_cache_hash`、完整身份判定、`inflight_check_locked`、`covered_cheaply` 实现元数据预准入；原 `store()`、`mirror()`、worker 权威检查保持 |
+| `tools/server/server-context.cpp` | 在 `materialize_prefix()` 的精确安全边界之后、`server_prompt_cache::materialize()` 之前插入 preflight；按结果决定是否导出并记录诊断；既有 prefill 批次逻辑不变 |
+| `tools/server/server-prefix-materialize.h/.cpp` | 增加最小的物化动作决策纯函数，生产路径直接调用；保持 token/position 两种单位明确区分 |
+| `tools/server/server-common.h`（需要时） | 扩展 preflight 专用指标，避免与真实 cache hit 统计混用 |
+| `tools/server/tests/unit/test_prefix_materialize.cpp` | 追加 wait/export/skip/cancel 控制流、两种位置端点、`K == n_past`、`K == input_end` 和 preflight 结果分支单测 |
+| `tools/server/tests/unit/test_disk_cache_match.cpp` 或新增缓存元数据单测 | 追加已提交精确重复、成本合格覆盖、成本拒绝、隔离文件、同 hash 不同身份、in-flight 真重复与冲突测试 |
+| `test-run/pmat.py` 及独立缓存测试脚本 | 覆盖真实请求分叉、重启、重复捕获、队列未提交阶段、关闭态对照及实际导出次数核验 |
+| `change.md` | 仅记录开发人员真实实施的算法和代码变更 |
+| `projectSummary.md` | 仅在实现完成后更新已存在的预准入模块、数据流和统计口径 |
+
+## 五、数据流与流水线影响
+
+**原数据流**：
+
+```text
+eligible K → 精确 K 的 target/draft 安全点
+           → get_size_ext + resize(KV buffers) + get_data_ext
+           → disk.store() → 身份/覆盖/in-flight 判定 → 队列/worker
+```
+
+**调整后的数据流**：
+
+```text
+eligible K → 精确 K 的 target/draft 安全点
+           → 小型 token/media 元数据 preflight（磁盘锁内只读）
+                ├─ 已提交且有效覆盖 / 精确重复 → 不导出 KV
+                ├─ 同一身份已在途 → 不重复导出 KV
+                ├─ 同 hash 不同身份 → 明确拒绝，不导出 KV
+                └─ 无已有可用覆盖 → get_size_ext / resize / get_data_ext
+                                         → disk.store() 既有最终校验
+                                         → worker / 配额 / manifest / 事件通知
+```
+
+训练流水线无变化；不涉及数据集、反向传播、模型权重或训练 checkpoint。推理流水线只在可选主动物化支路中新增一次低成本的只读判断；单用户原 prefill、投机解码、采样、slot/RAM/Disk 实际复用与生成输出路径保持原样。`--cache-prefix-materialize` 关闭时，不能因新增实现而产生额外 KV 导出或额外 prefill 分段。
+
+## 六、兼容性与实现约束
+
+1. 继续使用现有 v8 快照、manifest v3、CRC64、target/draft 完整状态导出与恢复接口；不得增设不同版本的前缀文件。
+2. 不改变原 `768 KiB/token` 恢复成本守卫、4096-token 写入抑制、`--cache-disk-min-tokens`、媒体身份/边界和 checkpoint 筛选语义。
+3. 不允许 preflight 直接改变 `entries`、`inflight`、队列字节账本、隔离标记、配额、文件路径所有权或目录引用；不允许把 preflight 结果缓存为永不失效的全局准入表。
+4. 在 in-flight 和已提交条目查找时使用相同锁，返回值应为拥有自身数据的枚举/结果对象，不能把指向 `entries` 或 `inflight` 容器元素的裸指针带出锁。
+5. `store()` 和 worker 仍具有最终决定权，避免预检查与正式检查产生两个不同的缓存身份定义。
+6. 如果新预检查不能确定是否已有经济可恢复快照，继续执行现有导出路径，不凭无法核实的 KV 大小、队列未来容量或文件是否会腐坏而推断拒绝。
+7. 不能把缺少真实媒体输入验证的主动多模态物化从 `media_state_unverified` 中放行；原有多模态正常推理和既有完整快照行为不改变。
+8. 本地单用户 `-np 1` 即可；不开发 HTTP 安全、鉴权、多租户、多 slot 性能或网络访问层功能。
+
+## 七、验证检查清单
+
+### 7.1 前置版本及 baseline 复核
+
+- [ ] 施工前再次检查最新本地 `change.md`、`projectSummary.md`、HEAD、`git status --short` 与当前二进制构建版本。
+- [ ] 对比原 baseline 与当前新功能路径，确认本轮没有无关模型计算、磁盘格式、配额或网络改动。
+
+### 7.2 元数据准入及 in-flight 一致性
+
+- [ ] 相同 token/media 身份已经被有效磁盘条目持久化：应在 KV state size 查询和 buffer 分配之前被识别为无需导出。
+- [ ] 较长已提交快照能够通过全部媒体、token、最小长度、真实 `size_file` 成本守卫覆盖当前前缀：不重复导出；若成本守卫拒绝，则不能将其视为覆盖。
+- [ ] 已提交条目被隔离、删除、TTL 失效或路径被占用：不得被当成可用覆盖或精确成功重复。
+- [ ] 同一完整身份在队列中及 worker 已出队但尚未提交阶段：preflight 均能识别为 in-flight duplicate。
+- [ ] 同 hash、不同 token 长度或 media 身份：明确报路径冲突，不计入成功去重，不触碰先到条目。
+- [ ] 正常无重复的合格前缀：依旧进入现有完整状态导出与磁盘存储路径；不会因为新增 preflight 误阻断。
+- [ ] 故障/异常分支中，preflight 不修改 `queue_bytes`、in-flight 占位或文件状态；最终 `store()` 仍能进行相同的权威检查。
+
+### 7.3 控制流真实可测性
+
+- [ ] `slot.prompt.tokens.size() < K`：动作必须是 `wait_next_batch`，计划仍 armed；不得把导出跳过记为永久失败。
+- [ ] target 状态尚未到期望 position、draft 尚未同步：保守等待或沿用当前安全拒绝语义，不导出非法状态。
+- [ ] target/draft 两者恰好结束在 `pos_next(K)`，且 preflight 允许：只执行一次状态导出。
+- [ ] target/draft 已越过 K 或 request_id 变化：不能从更长状态导出标成短前缀，也不能复用前请求的计划。
+- [ ] `K == n_past` 时没有空 prefill batch；`K == input_end` 时在生成前捕获；二者均由真正的生产决策函数覆盖。
+- [ ] `media_state_unverified` 及 checkpoint 边界不被此次预准入逻辑绕过。
+
+### 7.4 单用户实际推理及日志核对
+
+- [ ] 使用独立缓存目录，构造 `A+B / A+C / A+D` 公共前缀与已有较长物理快照覆盖的请求序列；记录物化调度、preflight 拒绝原因、真实导出、真实磁盘入库四个层次。
+- [ ] 在本该被已提交有效快照覆盖的场景，核查完整 KV 导出 API 没有被调用（建议仅测试构建加入轻量函数调用计数，严禁把日志是否出现当成唯一证据）。
+- [ ] 已在途同一身份的重复请求不导出第二份状态；同 hash 不同身份使用单元测试/故障注入构造，不依赖自然碰撞。
+- [ ] 使用开启/关闭物化同配置请求，检查输出一致性、prompt token 分解恒等式；`reused_disk` 只表示实际磁盘恢复。
+- [ ] 让无已有覆盖的公共前缀通过原完整写盘链路，重启服务后验证真实 `source=disk`、`restored`、`reused_disk`，而非仅检查 `eligible/persisted` 数量。
+- [ ] 运行现有 match、quota、prefix-index、prefix-materialize 四套独立单测并补充本轮决策控制流测试；真实内存分配故障、worker 停止及媒体端到端若未实际执行须明确记录。
+
+## 八、记录范围
+
+本文件只记录本次独立实验的目标、修改位置、算法与数据流、对推理/训练流水线的影响、与既有实现的兼容性及验证检查清单。不写假定收益数字、尚未发生的实验结果、训练早停要求、计算报告或最终优劣判定规则。
+
+开发人员将**实际修改**记入 `change.md`，将**项目已落地的总体结构**写入 `projectSummary.md`；本规划不能替代实际代码提交或执行日志。

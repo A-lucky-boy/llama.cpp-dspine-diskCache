@@ -2104,6 +2104,12 @@ private:
         uint64_t scheduled = 0;
         uint64_t exported  = 0;
         uint64_t skipped   = 0;
+
+        // a pre-export admission check spared the full target/draft state export.
+        // kept apart from `skipped`, which means the state could not be paired up at
+        // all: these two are different outcomes, and neither is a cache hit
+        uint64_t preflight_skipped = 0;
+        uint64_t preflight_allowed = 0;
     } counters_materialize;
 
     // pick the common prefix this request should materialize. metadata only: it
@@ -2241,54 +2247,151 @@ private:
         const size_t K = slot.materialize.prefix_tokens;
 
         // `pos_next` is only defined for a prefix the token view actually holds, so
-        // an unfilled view is checked first. A mid-prompt batch leaves the view
-        // short of K, and that is not a failure - the batch that reaches it will
-        // arrive, so the plan stays armed
-        if (slot.prompt.tokens.size() < K) {
-            return;
-        }
-
         // K counts tokens; the contexts are indexed by positions. For text the two
         // coincide, but a media chunk occupies more positions than the tokens it
         // stands for, so a prefix containing one ends at a position that is not its
         // token count. `pos_next(K)` is the request's own mapping from one to the
-        // other - the same call the prefill batches use to place their tokens
-        const int64_t expected_end = (int64_t) slot.prompt.tokens.pos_next((int64_t) K);
-
-        if (expected_end <= 0) {
-            // the prefix maps to no positions: nothing can be captured from it
-            SLT_WRN(slot, "cache_stats: materialize = skipped (prefix %zu maps to position %lld)\n",
-                    K, (long long) expected_end);
-            slot.materialize.done = true;
-            counters_materialize.skipped++;
-            return;
-        }
+        // other - the same call the prefill batches use to place their tokens.
+        //
+        // it is only defined once the view holds the prefix, so an unfilled view
+        // maps to "no positions yet" and the decision below turns that into
+        // "wait", never into a refusal
+        const bool view_holds_prefix = slot.prompt.tokens.size() >= K;
+        const int64_t expected_end = view_holds_prefix
+                ? (int64_t) slot.prompt.tokens.pos_next((int64_t) K)
+                : -1;
 
         const llama_pos tgt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
         const llama_pos dft_pos_max = ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1;
 
-        // positions are compared to positions. target and draft are checked
-        // together, because a snapshot pairs them: a state copied from two contexts
-        // that disagree would describe a prompt that was never executed
-        const disk_cache_capture_bounds bounds = disk_cache_check_capture_position_bounds(
-                expected_end, (int64_t) tgt_pos_max + 1, ctx_dft != nullptr, (int64_t) dft_pos_max + 1);
+        // The admission check runs only once the state really is capturable.
+        // Asking before that would be meaningless - and the expensive part being
+        // skipped is the export itself, which only happens on the path below.
+        //
+        // It is deliberately the last input to the decision: the disk tier answers
+        // "is this worth exporting", which is a different question from "is the
+        // state capturable at all", and only the latter can end a plan for good
+        disk_cache_preflight_verdict preflight = disk_cache_preflight_verdict::export_needed;
 
-        if (bounds == disk_cache_capture_bounds::target_short) {
-            // the batch that ends at the prefix has not been decoded yet. this is
-            // not a failure: the next one will arrive, so the plan stays armed
-            return;
+        {
+            const disk_cache_materialize_action probe = disk_cache_decide_materialize_action({
+                    /* .armed                = */ slot.materialize.armed,
+                    /* .done                 = */ slot.materialize.done,
+                    /* .task_matches         = */ slot.materialize.task_id == slot.task->id,
+                    /* .prefix_tokens        = */ K,
+                    /* .tokens_filled        = */ slot.prompt.tokens.size(),
+                    /* .expected_position_end= */ expected_end,
+                    /* .target_position_end  = */ (int64_t) tgt_pos_max + 1,
+                    /* .has_draft            = */ ctx_dft != nullptr,
+                    /* .draft_position_end   = */ (int64_t) dft_pos_max + 1,
+                    /* .preflight            = */ disk_cache_preflight_verdict::export_needed,
+            });
+
+            if (probe == disk_cache_materialize_action::export_state) {
+                // the prefix is capturable: now ask the disk tier whether exporting
+                // it would be pointless. this is metadata only - token and media
+                // identity against the committed entries and the write queue, no
+                // context, no file, no buffer
+                server_tokens prefix_view = slot.prompt.tokens.clone();
+                prefix_view.keep_first(K);
+
+                switch (prompt_cache->disk->preflight_materialize(prefix_view)) {
+                    case server_disk_cache::preflight_result::export_needed:
+                        preflight = disk_cache_preflight_verdict::export_needed;
+                        break;
+
+                    case server_disk_cache::preflight_result::identical_committed:
+                        preflight = disk_cache_preflight_verdict::skip;
+                        SLT_INF(slot, "cache_stats: materialize = preflight skip (identical committed), prefix = %zu tokens\n", K);
+                        break;
+
+                    case server_disk_cache::preflight_result::covered_by_committed:
+                        preflight = disk_cache_preflight_verdict::skip;
+                        SLT_INF(slot, "cache_stats: materialize = preflight skip (covered by a committed entry), prefix = %zu tokens\n", K);
+                        break;
+
+                    case server_disk_cache::preflight_result::identical_inflight:
+                        preflight = disk_cache_preflight_verdict::skip;
+                        SLT_INF(slot, "cache_stats: materialize = preflight skip (identical already queued), prefix = %zu tokens\n", K);
+                        break;
+
+                    case server_disk_cache::preflight_result::hash_path_conflict:
+                        preflight = disk_cache_preflight_verdict::conflict;
+                        SLT_WRN(slot, "cache_stats: materialize = preflight conflict (path held by another identity), prefix = %zu tokens\n", K);
+                        break;
+
+                    case server_disk_cache::preflight_result::invalid_identity:
+                        preflight = disk_cache_preflight_verdict::invalid;
+                        SLT_WRN(slot, "cache_stats: materialize = preflight invalid (no usable identity), prefix = %zu tokens\n", K);
+                        break;
+
+                    case server_disk_cache::preflight_result::cache_unavailable:
+                        preflight = disk_cache_preflight_verdict::invalid;
+                        break;
+                }
+            }
         }
 
-        if (bounds != disk_cache_capture_bounds::exact) {
-            // the state cannot be paired up. nothing is exported and no file is
-            // queued - the prefix simply stays without its own snapshot
-            SLT_WRN(slot, "cache_stats: materialize = skipped (%s), prefix = %zu tokens, expected_end = %lld, target_end = %d, draft_end = %d\n",
-                    disk_cache_capture_bounds_name(bounds), K, (long long) expected_end,
-                    (int) tgt_pos_max + 1, (int) dft_pos_max + 1);
+        // the one decision the rest of this function follows. extracted so the same
+        // function the tests call is the one that runs here
+        const disk_cache_materialize_action action = disk_cache_decide_materialize_action({
+                /* .armed                = */ slot.materialize.armed,
+                /* .done                 = */ slot.materialize.done,
+                /* .task_matches         = */ slot.materialize.task_id == slot.task->id,
+                /* .prefix_tokens        = */ K,
+                /* .tokens_filled        = */ slot.prompt.tokens.size(),
+                /* .expected_position_end= */ expected_end,
+                /* .target_position_end  = */ (int64_t) tgt_pos_max + 1,
+                /* .has_draft            = */ ctx_dft != nullptr,
+                /* .draft_position_end   = */ (int64_t) dft_pos_max + 1,
+                /* .preflight            = */ preflight,
+        });
+
+        switch (action) {
+            case disk_cache_materialize_action::wait_next_batch:
+                // the batch that ends at the prefix has not been decoded yet. not a
+                // failure: the next one will arrive, so the plan stays armed
+                return;
+
+            case disk_cache_materialize_action::cancel_plan:
+                // the plan no longer describes this request. it is dropped without
+                // being counted as a refused export, because no export was ever
+                // considered for this state
+                slot.materialize = server_slot::prefix_materialize_plan();
+                return;
+
+            case disk_cache_materialize_action::skip_export: {
+                const disk_cache_capture_bounds bounds = disk_cache_check_capture_position_bounds(
+                        expected_end, (int64_t) tgt_pos_max + 1, ctx_dft != nullptr, (int64_t) dft_pos_max + 1);
+
+                if (bounds == disk_cache_capture_bounds::exact) {
+                    // the state was capturable; the disk tier had nothing to gain
+                    // from it. counted separately so a saved export is never read as
+                    // a refused one
+                    counters_materialize.preflight_skipped++;
+                } else {
+                    SLT_WRN(slot, "cache_stats: materialize = skipped (%s), prefix = %zu tokens, expected_end = %lld, target_end = %d, draft_end = %d\n",
+                            disk_cache_capture_bounds_name(bounds), K, (long long) expected_end,
+                            (int) tgt_pos_max + 1, (int) dft_pos_max + 1);
+                    counters_materialize.skipped++;
+                }
+
+                slot.materialize.done = true;
+                return;
+            }
+
+            case disk_cache_materialize_action::export_state:
+                break;
+        }
+
+        if (expected_end <= 0) {
+            // defensive: capturable decisions require a positive position end
             slot.materialize.done = true;
             counters_materialize.skipped++;
             return;
         }
+
+        counters_materialize.preflight_allowed++;
 
         server_prompt snapshot;
         snapshot.tokens = slot.prompt.tokens.clone();
@@ -3904,6 +4007,11 @@ private:
                     res->n_materialize_scheduled = counters_materialize.scheduled;
                     res->n_materialize_exported  = counters_materialize.exported;
                     res->n_materialize_skipped   = counters_materialize.skipped;
+
+                    // and the admission check's own outcomes: how many exports it
+                    // spared, and how many it let through
+                    res->n_preflight_skipped     = counters_materialize.preflight_skipped;
+                    res->n_preflight_allowed     = counters_materialize.preflight_allowed;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();

@@ -71,6 +71,10 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| 导出前先做元数据准入 | `server_disk_cache::preflight_materialize()` 在完整 KV 状态导出**之前**回答"这次导出是否值得"：只读、同步、持磁盘锁期间仅做 token/media 元数据比对，不碰 context、不做文件 IO、不做大分配。判定顺序为已提交身份 → in-flight 身份 → 成本合格覆盖；先查身份再查覆盖，否则同 hash 冲突会被误报成覆盖 |
+| 准入判定与写入判定同源 | 已提交条目判定抽为 `committed_check_locked()`，preflight、`store()`、`mirror()` 三处共用；隔离条目不终止扫描（同 hash 可能另有可用条目），只有可复用条目才决定结果 |
+| 保存的是被省下的导出数 | `cache_prefix_materialize_preflight_skip_total` 计 preflight 挡下的导出，`_export_allowed_total` 计放行的；两者都不是缓存命中，也不计入 `enqueue_dedup`、`restored` 或 `reused_disk` |
+| 物化动作由被测函数决定 | `disk_cache_decide_materialize_action()` 是生产路径实际调用的决策函数，输出 wait_next_batch / export_state / skip_export / cancel_plan。target 落后为等待；target 恰好到 K 而 draft 不一致为不成对（取消）；视图未填满恒为等待，绝不记为拒绝 |
 | 队列去重也须匹配完整身份 | 写队列中与正在写入的条目按 hash 索引，值保存**拥有自身内存**的完整 token/media 身份（只存 token 与媒体元数据，不持 KV 副本）。hash 命中且身份相同 → 合并去重；hash 命中但身份不同 → 计 hash 冲突并拒绝该次写入，不覆盖已有 `pc-<hash>.bin`、不改先到任务。占位自入队起可见，worker 出队后仍保留至提交或失败结束；入队分配失败时占位与字节记账一并回滚。七类 worker 失败分支的占位释放经静态核实，**运行时故障注入与并发场景尚未执行** |
 | 端点比较只在 position 域 | `K` 是 token 数，`llama_memory_seq_pos_max()+1` 是 position 数。纯文本两者相等，但媒体块的 `n_pos` 与 `n_tokens` 不同，含媒体前缀的 KV 末端位置不等于其 token 数。期望端点由 `server_tokens::pos_next(K)` 得出，**只与真实 position 比较**；token 数仍用于快照元数据、文件身份与最小长度判定 |
 | checkpoint 位置界取真实端点 | checkpoint 的位置上界来自已验证 exact 的 target `pos_max`，不对媒体路径使用文本专用 `K-1` 计算。`disk_cache_prefix_pos_max_text()` 仅保留给纯文本单测，生产路径不再引用 |

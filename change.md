@@ -2321,3 +2321,204 @@ std::unordered_map<uint64_t, inflight_identity> inflight;
   - **`inflight` 表在真实多请求并发下的行为**：本机 `-np 1` 单请求串行，两个请求同时进入 `store()` 的情形未构造。`mirror()` 路径（`--cache-idle-slots` / idle flush）本轮未开启，其 in-flight 判定改动的运行验证未执行
   - **媒体输入**：测试机无多模态模型；media 相关的 in-flight 分类由 `test_inflight_identity_verdict()` 与 `test_inflight_lifecycle()` 的元数据用例覆盖，`media_state_unverified` 主动捕获门禁保持原样，**未在真实媒体请求下验证**
   - **context shift / 取消 / decode 重试**：未构造
+
+# 2026-11-16 11-10 - Change Record（test1_4：导出前元数据准入）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 10-20 - test1_4` 实施 **Pre-export Materialization Admission**：把磁盘层能仅凭 token/media 元数据确定的判断，从"完整 KV 导出之后"提前到"导出之前"。基线 HEAD `4decdf4`，上一功能提交 `12075e4`。未改 v8 快照、manifest v3、CRC64、媒体身份编码、成本守卫与配额策略。
+
+### 问题
+
+主动捕获的执行顺序是：prefill 精确切到 K → `server_prompt_cache::materialize()` 调 `get_size_ext` / `resize` 完整状态缓冲 / `get_data_ext` 导出 target+draft → 才轮到 `disk->store()` 判断"是否已有同身份条目、是否已有更长的经济可恢复条目覆盖、in-flight 是否重复"。
+
+后三项判断只需要 token/media 元数据，却发生在数百 MiB 的状态导出之后。
+
+### 新增 `server_disk_cache::preflight_materialize()`
+
+只读、同步、`const`。返回七种结果：
+
+```
+export_needed / identical_committed / covered_by_committed
+identical_inflight / hash_path_conflict / invalid_identity / cache_unavailable
+```
+
+实现要点：
+
+- 复用 `disk_cache_pack()` / `disk_cache_hash()` / `disk_cache_classify_duplicate()` / `inflight_check_locked()` / `covered_cheaply()`，不重写任何匹配逻辑
+- 前缀身份在**进入锁之前**构造，持锁期间只做元数据比对——不调用 KV state API、不做文件 IO、不做大分配
+- 判定顺序：已提交身份 → in-flight 身份 → 成本合格覆盖
+- 不接收、不序列化、不修改 `llama_context`
+- 不写 `entries`、不改 `inflight`、不动字节账本、不更新目录 `persisted`
+- `invalid_identity` 覆盖"打包失败"与"低于本层最小 token 数"两种情况——两者都意味着这次写入本来就无法成立
+
+### 判定顺序为何重要（本轮测试发现）
+
+`covered_cheaply()` 只问"是否有更长条目能经济地服务这个前缀"，它**没有 hash 可比**。因此若先查覆盖再查身份，一个同 hash 但身份不同的条目会被报成 `covered_by_committed`（一次"无害的跳过"），而实际语义是**路径冲突**。
+
+`test_preflight_conclusions()` 的第 5 组用例把这一点固定下来：同一个 committed 条目相对 `wanted` 同时满足"前缀覆盖为真"与"身份相同为假"，preflight 必须先报冲突。
+
+### 新增 `committed_check_locked()`
+
+`store()`、`mirror()` 各有一份几乎相同的已提交条目循环，现抽为单一方法三处共用：
+
+```cpp
+enum class committed_verdict { none, identical, conflict, held };
+committed_verdict committed_check_locked(uint64_t hash, const disk_cache_prompt_identity & wanted, std::string * holder) const;
+```
+
+**语义修正**：原 `store()` 循环遇到 quarantined 条目时 `continue`（继续找同 hash 的其他条目），而 `mirror()` 也是 `continue`。抽出的版本保留了这一行为——**隔离条目不再终止扫描**，因为"每个映射到该 hash 的条目共享同一路径"，同一 hash 下可能同时存在隔离条目与可用条目。只有**可复用**条目才决定结果；若整轮只见到隔离条目则返回 `held`。
+
+### 新增 `disk_cache_decide_materialize_action()`
+
+规划 §3.3 要求把控制流抽为生产路径实际调用的纯函数。返回四种动作：
+
+- `wait_next_batch`：视图未填满 K，或 target 尚未到达 K
+- `export_state`：视图足够、两处位置恰好等于 `pos_next(K)`、preflight 允许
+- `skip_export`：状态不可配对，或 preflight 判定无需导出
+- `cancel_plan`：计划未 armed / 已 done / task_id 不再匹配
+
+**target 与 draft 的分开判定**（本轮测试发现）：初版把 `draft_short` 与 `target_short` 一并归入 `wait_next_batch`，但两者含义不同——
+
+- target 落后 ⇒ 抵达 K 的那个批次还没解码，这是等待
+- target **恰好**抵达 K 而 draft 不一致 ⇒ 本批就是抵达 K 的批次，draft 不会再有机会（下一批就越过 K 了），这是不成对，必须取消
+
+因此实现按 target 先判（落后→等待、越过→取消），再加"target 恰好到 K 时 draft 必须同样到 K"，而非直接映射 `disk_cache_capture_bounds` 的六个枚举。视图未填满是**最先**的判断，且恒为等待——这正是前一轮曾误改为硬失败的地方。
+
+### 指标
+
+新增两个计数，与真实命中严格分开：
+
+```
+cache_prefix_materialize_preflight_skip_total            // 被省下的导出
+cache_prefix_materialize_preflight_export_allowed_total  // 放行的导出
+```
+
+二者都不是缓存命中，不计入 `enqueue_dedup`、`restored`、`reused_disk`。`scheduled` / `exported` / `skipped` 语义不变，`skipped` 仍专指"状态无法配对"。
+
+## 修改文件
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`preflight_result` 枚举与方法声明（public）、`committed_verdict` 与 `committed_check_locked()` 声明、`server_task_result_metrics` 两个新字段
+- 具体变更：见上
+- 修改原因：规划 §3.1、§4
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 `committed_check_locked()` 与 `preflight_materialize()`（置于 `store()` 之前）；`store()` 与 `mirror()` 的循环改调用 helper；metrics 注册
+- 具体变更：见上
+- 修改原因：规划 §3.1、§2.2
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-context.cpp
+- 修改后路径：同名文件
+- 修改位置：`materialize_prefix()`；`materialize_counters`；metrics 采集
+- 具体变更：撤销原先内联的 endpoint 判定段，改为一次 preflight 探测（仅在状态确实可捕获时发起）+ 一次决策调用 + 按动作分支；`materialize_counters` 增 `preflight_skipped` / `preflight_allowed`
+- 修改原因：规划 §3.2、§3.3、§3.4
+
+### tools/server/server-prefix-materialize.h / .cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-prefix-materialize.h、.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：新增动作枚举、输入结构、决策函数
+- 具体变更：`disk_cache_materialize_action`、`disk_cache_preflight_verdict`、`disk_cache_materialize_decision_input`、`disk_cache_decide_materialize_action()`、`disk_cache_materialize_action_name()`
+- 修改原因：规划 §3.3
+
+### tools/server/tests/unit/test_prefix_materialize.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_prefix_materialize.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：新增 `test_materialize_action()`
+- 具体变更：24 组检查——未 armed/已 done/task 不匹配、视图未填满（含 0）、target 落后（含负值）、draft 落后（target 已到 K ⇒ 取消）、两处恰好在 `pos_next(K)`（含位置≠token 数）、target/draft 越过、preflight 三种拒绝、视图未填满优先于 preflight、四个动作名互异
+- 修改原因：规划 §3.3、§7.3
+
+### tools/server/tests/unit/test_disk_cache_match.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_match.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：新增 `test_preflight_conclusions()`
+- 具体变更：7 组——精确重复、成本合格覆盖、**成本守卫拒绝不得报覆盖**、无关前缀、同 hash 不同身份（并说明身份与覆盖是独立问题、preflight 先查身份）、低于最小长度、媒体 id 不同
+- 修改原因：规划 §7.2
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：行为边界；projectSummary §3.1 不变量表
+- 具体变更：新增"导出前先做元数据准入""准入判定与写入判定同源""保存的是被省下的导出数""物化动作由被测函数决定"四条不变量
+- 修改原因：规划 §4、§8
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real），本轮 2 次
+- 检查结果：通过，`0 FAILED`。`--version` 为 `0.9.0-dev (build 37, commit 4decdf4)`
+
+- 已执行检查：**preflight 端到端生效**（`test-run/logs/fix11-p1.log`，`A+B / A+C / A+D` 三请求序列后接第四个）
+- 检查结果：**通过，节省了一次真实导出**。
+
+  ```
+  task 14: materialize = scheduled, prefix = 2102 tokens, n_past = 1476
+           materialize = exported, prefix = 2102 tokens          # 首次：无覆盖，正常导出
+  task 22: materialize = scheduled, prefix = 2101 tokens, n_past = 1478
+           materialize = preflight skip (covered by a committed entry), prefix = 2101 tokens
+
+  exported_total            1   （上一轮同样的序列是 2）
+  preflight_skip_total      1
+  preflight_export_allowed  1
+  cache_disk_entries        1
+  persisted_refs            1
+  ```
+
+  该请求在上一轮会导出并排队一次 703.82 MiB 的写入（被 `covered_cheaply` 在 **store 之后**挡下），本轮在导出**之前**就被拦住。输出 sha 与既往逐字节一致（`f283d36a836120c4` / `452bdcadc89d353f` / `ad661337d3aa8896` / `b9febb26949711a2`），推理未受影响
+
+- 已执行检查：**决策纯函数单测**（`test_materialize_action()`，24 组）
+- 检查结果：通过。本轮该测试**两次抓到实现缺陷**：
+  1. 初版把 `draft_short`/`draft_missing` 归入 `wait_next_batch`。但 target 恰好到 K 时 draft 落后已无补救机会（下一批越过 K），应取消。修正为按 target/draft 分别判定
+  2. 修正过程中的中间版本把 `expected_position_end <= 0` 混入 target 判定，被"视图未填满"用例暴露顺序问题，最终将视图检查置于最前
+
+- 已执行检查：**preflight 结论单测**（`test_preflight_conclusions()`，7 组）
+- 检查结果：通过。其中第 5 组先失败过一次：我原以为"同 hash 不同身份"应当同时不构成覆盖，实测 `suppresses_write` 返回 true——因为该条目确实是 `wanted` 的更长前缀。这澄清了两者是**独立问题**，`covered_cheaply` 没有 hash 可比，因此 preflight 必须先查身份、后查覆盖，否则冲突会被报成覆盖。已把这一结论写进测试注释与实现注释
+
+- 已执行检查：**重启后磁盘真实恢复**（`fix11-p1r.log`）
+- 检查结果：通过。`cache_scan_end: 1 entries, 538.51 MiB`、`1 snapshot(s) registered`；恢复 `source = disk, reused_disk = 2102, restored = 2102, read_bytes = 564668394`（与文件大小一致）；恒等式 `0 + 0 + 2102 + 394 = 2496` 成立
+
+- 已执行检查：**开启/关闭态输出一致性**（`fix11-off.log` vs `fix11-p1.log`，各 4 个相同请求）
+- 检查结果：通过。**8 个请求 sha 逐字节一致**。关闭态 `scheduled`/`exported`/`skipped`/`preflight_skip`/`preflight_allowed` 五项全 0、`cache_disk_entries 0`
+
+- 已执行检查：四套独立单测
+- 检查结果：通过。`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`
+
+- 已执行检查：恒等式抽查（`fix11-p1.log`）
+- 检查结果：通过。`2504 = 0+0+0+2504`、`2468 = 1476+0+0+992`、`2506 = 1476+0+0+1030`、`2540 = 1478+0+0+1062`
+
+- 已执行检查：清理
+- 检查结果：通过。测试缓存目录、临时编译脚本与可执行文件、`__pycache__`、根目录 `.obj` 均已删除；`test-run/` 为 1.3 MB
+
+- 未执行的检查及原因：
+  - **导出 API 调用计数核验**（规划 §7.4 建议"仅测试构建加入轻量函数调用计数"）：**未实施**。本轮判定 preflight 生效的证据是 `exported_total` 由 2 降为 1 并伴随 `preflight (covered by a committed entry)` 日志，这属于**间接证据**。规划明确指出"严禁把日志是否出现当成唯一证据"——我未能构造更直接的手段（如为 `llama_state_seq_get_data_ext` 加调用计数），因此这一点未达规划要求
+  - **`identical_committed` 与 `identical_inflight` 的端到端触发**：本机 `-np 1` 单请求串行，同一前缀的精确重复请求会被 slot 复用（`reused_slot`）在更早阶段拦下，从未走到 preflight。这两个分支**只有单测覆盖**
+  - **`hash_path_conflict` 的端到端**：需真实 hash 碰撞，规划本身即要求用元数据夹具而非依赖自然碰撞。**未在运行中触发**
+  - **`invalid_identity` / `cache_unavailable`**：单测覆盖逻辑，运行中未触发
+  - **真实内存分配失败、worker 停止**：未注入
+  - **媒体输入端到端**：测试机无多模态模型。`media_state_unverified` 主动捕获门禁未变，与 preflight 的相对顺序（门禁在规划阶段，preflight 在捕获阶段）未在真实媒体请求下验证
+  - **context shift / 取消 / decode 重试**：`cancel_plan` 分支单测覆盖，运行中未构造

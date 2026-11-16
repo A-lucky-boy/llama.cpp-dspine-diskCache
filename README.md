@@ -313,6 +313,7 @@ prefill 吞吐（冷缓存、单次全量）：6K 约 1.3–1.4K t/s，90K 约 1
 
 - CUDA 后端只支持按层切分（`-sm layer`）；`-sm row` 在模型加载阶段即被拒绝。
 - 生效的非 aLoRA 适配器下，共享缓存对该 slot 不写入；slot 自身的增量续算仍可用。
+- **导出前先做一次元数据准入**：`--cache-prefix-materialize` 在分配并导出完整 target/draft 状态**之前**，先用 token/media 元数据问一次磁盘层"这次导出值不值得"。只读、同步，持锁期间不访问 context、不做文件 IO、不做大分配。判定顺序是已提交身份 → 在途身份 → 成本合格覆盖；先查身份再查覆盖，否则同 hash 的冲突会被误报成"已被覆盖"。被挡下的导出单独计入 `cache_prefix_materialize_preflight_skip_total`，它**不是**缓存命中，也不计入 `enqueue_dedup`。
 - **队列去重同样要求完整身份**：等待写入与正在写入的条目按 hash 索引，但值保存拥有自身内存的完整 token/media 身份（只存 token 与媒体元数据，不持 KV 副本）。hash 命中且身份相同才合并去重；hash 命中而身份不同则计 hash 冲突并拒绝该次写入——既不覆盖已有的 `pc-<hash>.bin`，也不改动先到的写任务。占位自入队起即可见，worker 出队后仍保留到提交或失败结束；入队分配失败时占位与字节记账一并回滚。
 - **端点比较只在位置域进行**：`K` 是 token 数，`pos_max + 1` 是位置数。纯文本两者相等，但媒体块占据的位置数多于它代表的 token 数，因此含媒体前缀的 KV 末端位置不等于其 token 数。期望端点由 `server_tokens::pos_next(K)` 得出，只与真实位置比较；token 数仍用于快照元数据、文件身份与最小长度判定。
 - **checkpoint 的位置界取真实端点**：来自已验证 exact 的 target `pos_max`，不对媒体路径沿用文本专用的 `K-1` 计算。
