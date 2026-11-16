@@ -4232,3 +4232,113 @@ A -> B -> C(disk,2457) -> A
 - 未开启未验证的媒体状态导出；`media_state_unverified` 门禁不变（规划 §2.3.7）
 - 测试全程使用隔离缓存目录，**未写入** `E:\llama.cpp.cache`
 - 未上传小说原文与图片二进制；诊断代码在定位完成后已全部移除，正式构建不含诊断输出
+
+# 2026-11-16 20-40 - Change Record（--cache-ram 与磁盘层启用关系的核验）
+
+## 变更概述
+
+**本轮为核验轮，未修改 `tools/` 下任何源码。** 起因是对上一轮交付说明中一句表述的追问："Disk-only 对照未执行——实测 `--cache-ram 0` 会使 `--cache-disk` 整体失效"。用户据此提出：如果 `--cache-ram` 始终保持在 10 GiB 以上，是否就不会有问题。
+
+核验结论：**该关系是反的，加大 `--cache-ram` 不能规避该崩溃**。同时**修正了上一轮的一处表述不当**——"实测"一词用得不准确（当时的依据是源码阅读，未实际运行），本轮补做了实际运行。
+
+## 一、核验项与结论
+
+### 1.1 `--cache-ram 0` 与磁盘层的关系（已实测）
+
+**上一轮表述**："实测 `--cache-ram 0` 会使 `--cache-disk` 整体失效"。**该表述不准确**：当时的依据是阅读源码（`server-context.cpp` 中 `init_disk()` 位于 `if (cache_ram_mib != 0)` 分支内），并未实际运行。本轮补做实际运行。
+
+**实测**（`test-run/start_ram0.bat`，`--cache-ram 0` 且保留 `--cache-disk`）：
+
+```
+W srv load_model: --cache-disk requires the RAM prompt cache, use `--cache-ram N` to enable it
+I srv load_model: prompt cache is disabled - use `--cache-ram N` to enable it
+W srv       init: --cache-idle-slots requires --cache-ram, disabling
+```
+
+且 `test-run/cache-ram0` **目录未被创建**——磁盘层从未初始化。
+
+**结论**：`--cache-ram 0` 是唯一会禁用磁盘层的取值。**门槛是 `≠ 0`，不是"足够大"**：1 MiB 与 100 GiB 在"磁盘层是否启用"上没有区别。
+
+### 1.2 加大 `--cache-ram` 能否规避该崩溃（不能）
+
+三个独立理由，均有实测依据：
+
+**(a) 崩溃复现时使用的就是大 RAM。** 上一轮全部崩溃复现（含诊断轮）所用参数为 `--cache-ram 25600`（25 GiB），远未触及 RAM 上限：
+
+```
+attr-cold.log:  prompt cache is enabled, size limit: 25600 MiB  →  GGML_ASSERT ×1（崩溃）
+diag-cold.log:  prompt cache is enabled, size limit: 25600 MiB  →  完整轨迹
+```
+
+**(b) 磁盘写入不要求 RAM 填满。** 落盘由空闲定时器 `cache_disk_idle_flush` 触发，把 RAM 条目**镜像**一份（`mirror()` 复制，RAM 条目保留）。在 25 GiB RAM 配置下实际发生：
+
+```
+1.10.406.146 I srv flush_to_dis: disk cache: mirrored 3 prompt(s) from the RAM cache
+```
+
+请求量远不足以填满 25 GiB，3 个条目仍被主动镜像到磁盘。
+
+**(c) 镜像预算随 RAM 增长而封顶，不随之无限增长。**
+
+```
+budget = max(1536 MiB, RAM/4)，再 min 到 6144 MiB
+```
+
+| `--cache-ram` | 镜像预算 |
+|---|---|
+| 0 | （磁盘层不启用） |
+| 8 GiB | 2 GiB |
+| 25 GiB | 6 GiB |
+| 100 GiB / `-1` | 6 GiB（封顶） |
+
+`--cache-ram -1`（无限制）与 100 GiB 得到**相同**的 6 GiB 预算。
+
+### 1.3 根本原因与 RAM 大小无关
+
+该缺陷位于分词器（详见 `2026-11-16 19-20` 条目）：纯文本请求产生的容器被标 `has_mtmd=false`（含义为"本次输入不含媒体"），却被 slot 当作"该容器不允许承载媒体"使用。只要**先有文本进入缓存、随后来图片请求**即触发——崩溃发生在"把已恢复的容器交给图片请求"这一步，与条目来自 RAM 还是磁盘、RAM 是否填满**均不相干**。
+
+### 1.4 对上一轮"未完成检查"项的澄清
+
+上一轮记录"Disk-only 对照未执行"的原因是"`--cache-ram 0` 会使 `--cache-disk` 失效，无法在保留磁盘层的前提下关闭 RAM"。经本轮核验，**该原因成立**（§1.1 已实测），但表述中"实测"一词应更正为"源码依据，本轮补测确认"。
+
+该项仍是**未执行的检查**：无法在保留磁盘层的前提下关闭 RAM，故 Slot/RAM 与 Disk 的分离对照在本机配置下不可构造。
+
+## 二、修改文件
+
+### test-run/start_ram0.bat（新增）
+
+- 修改类型：新增
+- 修改后路径：test-run/start_ram0.bat
+- 修改位置：全文件
+- 具体变更：以 `--cache-ram 0` 且保留 `--cache-disk` 启动，用于确认磁盘层在 RAM 缓存关闭时的实际行为；其余参数与 `test-run/start_nodisk.bat` 一致（模型、mmproj、`-c`、KV 类型、投机解码配置均固定）
+- 修改原因：把上一轮基于源码的结论补上实际运行证据
+
+### **源码：未修改**
+
+`tools/` 下无任何改动。本轮为核验性质。
+
+## 三、验证执行记录
+
+- 已执行检查：`--cache-ram 0` + `--cache-disk` 实际启动
+- 检查结果：通过。三条警告/提示如 §1.1 所示，磁盘目录未创建
+
+- 已执行检查：复核大 RAM 配置下是否仍落盘
+- 检查结果：确认。`--cache-ram 25600` 下 `mirrored 3 prompt(s) from the RAM cache`
+
+- 已执行检查：复核崩溃复现时所用 RAM 值
+- 检查结果：确认。`attr-cold.log` / `diag-cold.log` 均为 `size limit: 25600 MiB`，且前者含 1 次断言
+
+- 已执行检查：清理
+- 检查结果：通过。`test-run/cache-ram0` 已删除
+
+- **未执行的检查及原因**（延续，未因本轮改变）：
+  - **Disk-only 对照**：**未执行**。需在保留磁盘层的前提下关闭 RAM，实测不可构造（§1.1）
+  - **`--cache-ram` 取极大值（如 100 GiB / `-1`）下的崩溃复现**：**未执行**。§1.2(b)(c) 已说明为何大 RAM 不影响该缺陷，且 `-1` 与 100 GiB 的镜像预算同为 6 GiB；重复一次完整复现不产生新信息，故未做。如需彻底的端到端确认，此项列为可选
+  - 其余既有未验证项（队列异常注入、精确崩溃窗口、`touch_entry`、有媒体映射容器的 `bind_media_mode` 分支等）**仍未验证**
+
+## 四、范围确认
+
+- 未修改任何源码、参数默认值与算法（本轮为核验）
+- 未改动 `E:\llama.cpp.cache`；测试使用隔离目录 `test-run/cache-ram0`，用后删除
+- 未上传日志原文、小说原文或图片二进制
+- 未把源码阅读结论表述为实测结果；§1.1 已明确区分并对上一轮表述作出更正
