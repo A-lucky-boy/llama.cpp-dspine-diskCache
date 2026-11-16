@@ -4,10 +4,10 @@
 |---|---|
 | 仓库 | `A-lucky-boy/llama.cpp-dspine-diskCache` |
 | 本次交付起点 | `a85e66c`（会话前 HEAD，第十一轮交付说明） |
-| 本次交付终点 | 分支 `main` 顶端（功能提交 `1f15c1b`） |
-| 功能提交 | `1f15c1b`（全部代码与测试改动） |
+| 本次交付终点 | 分支 `main` 顶端（功能提交 `1f15c1b`，交付前自查修正 `2ba93f4`） |
+| 功能提交 | `1f15c1b`（分段 codec 与导出计数）、`2ba93f4`（`read_bytes` 语义修正，见 §4.4） |
 | 规划依据 | `betterModification.md` → `2026-11-16 11-25 - test1_5` |
-| 构建产物 | `0.9.0-dev (build 41, commit 1f15c1b)`，MSVC 19.44.35226，sm_86-real + sm_89-real |
+| 构建产物 | `0.9.0-dev (build 42, commit 2ba93f4)`，MSVC 19.44.35226，sm_86-real + sm_89-real |
 | 交付性质 | **独立算法实验（物理存储格式）** + **上一轮欠账补齐**（规划 §6.1 第 3 项） |
 
 本轮实现规划 §3 的 Segmented Lossless Snapshot Codec，并补上上一轮明确欠下的"导出 API 直接调用计数"验证。逐项实现细节见 `change.md` 的 `2026-11-16 12-20` 条目；项目现状见 `projectSummary.md`。
