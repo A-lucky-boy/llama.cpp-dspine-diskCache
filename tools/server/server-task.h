@@ -694,6 +694,8 @@ struct disk_cache_counters {
     uint64_t n_write_bytes          = 0;
     uint64_t n_write_rejected       = 0; // entries rolled back because they did not fit, cumulative
     uint64_t n_rollback_failed      = 0; // rollbacks whose file could not be deleted and had to be quarantined
+    uint64_t n_write_failed         = 0; // writes that did not commit, for any reason
+    uint64_t n_write_orphaned       = 0; // failed writes that left a file at the final path, quarantined until reclaimed
     uint64_t n_quota_unreclaimed    = 0; // transactions that ended over quota because a physical removal failed
 
     // prefix materialization: scheduling and export are reported separately from a
@@ -911,6 +913,40 @@ struct server_disk_cache_payload {
     common_state_data main;
     common_state_data drft;
     std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
+};
+
+// how a write finished, in the terms the ledger needs.
+//
+// A plain bool is not enough. The file is renamed into place before its size is
+// measured, so a write can fail *after* the final path exists. Reporting only "false"
+// would leave the worker believing no file was produced, while a fully written
+// snapshot sits on disk outside `entries` and `total_size` - and the next write of
+// the same hash would find the path taken by something nothing is tracking.
+//
+// The distinction the caller needs is whether the final path is gone, still there, or
+// of unknown state; only the first is an ordinary failure.
+enum class disk_cache_write_outcome {
+    committed,          // the file is on disk, measured, and may be indexed
+    failed_clean,       // nothing was written, or the partial file was confirmed removed
+    failed_orphaned,    // the final path exists, or its removal could not be confirmed
+};
+
+struct disk_cache_write_result {
+    disk_cache_write_outcome outcome = disk_cache_write_outcome::failed_clean;
+
+    // the final path, always set: the worker must be able to quarantine exactly this
+    // path without recomputing it
+    std::string path;
+
+    // the real size when it could be measured. Zero when it could not - never a
+    // guess: an estimated size must not be used to sign a recoverable snapshot into
+    // the ledger as if it were measured.
+    size_t size_file = 0;
+
+    // the length the writer knows it wrote, from the stream position after flush.
+    // Only a lower bound on what exists on disk, so it is kept for accounting a
+    // quarantined file and for cross-checking, never for quota release
+    size_t written_bytes = 0;
 };
 
 // an entry queued for the background writer
@@ -1145,7 +1181,14 @@ private:
     // serialize and atomically commit an entry. `path_owned` tells the writer that
     // the target name has already been resolved as unowned under the cache lock,
     // which is the only situation in which an existing file there may be replaced
-    bool write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out, bool path_owned = false);
+    // Writes the entry and reports how it finished. The caller owns every ledger
+    // decision; this function only touches bytes and the filesystem.
+    //
+    // On `committed` (and only then) `path_out` and `size_out` hold the final path and
+    // its measured size. On `failed_orphaned` the result carries the path and the best
+    // known byte count so the caller can quarantine it under the lock.
+    disk_cache_write_result write_entry(const server_disk_cache_pending & pending,
+            std::string & path_out, size_t & size_out, bool path_owned = false);
     // read, validate and decode one entry file. every checksum and the
     // packed<->index consistency are verified here, before the caller restores
     // anything into the contexts

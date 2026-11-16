@@ -180,9 +180,192 @@ void test_state_sizes_match_the_observed_snapshot() {
     CHECK_EQ(L.payload_end, 564668394);
 }
 
+// ---------------------------------------------------------------------------
+// the EOF / segment-range check read_entry() now performs
+//
+// `seekg()` cannot prove a segment range exists: a stream may be positioned past
+// EOF and still report `good()`, and the shortfall only surfaces on a read. A
+// skipped checkpoint is never read, so a table whose last skipped segment runs past
+// the end went unnoticed. The reader therefore takes the real file end and requires
+// the table to account for it exactly.
+//
+// These cases drive the same arithmetic on the same inputs, including the overflow
+// the check exists to catch.
+// ---------------------------------------------------------------------------
+
+// sum the segment table with overflow detection, the way the reader does
+enum class range_verdict { ok, overflow, mismatch, outside };
+
+range_verdict check_segment_range(const std::vector<uint64_t> & stored,
+                                  uint64_t payload_start, uint64_t file_end) {
+    if (file_end < payload_start) {
+        return range_verdict::mismatch;
+    }
+
+    uint64_t total = 0;
+
+    for (uint64_t n : stored) {
+        if (total > UINT64_MAX - n) {
+            return range_verdict::overflow;
+        }
+        total += n;
+    }
+
+    if (total != file_end - payload_start) {
+        return range_verdict::mismatch;
+    }
+
+    // every segment must sit inside the payload
+    uint64_t off = 0;
+
+    for (uint64_t n : stored) {
+        if (off > total || n > total - off) {
+            return range_verdict::outside;
+        }
+        off += n;
+    }
+
+    return range_verdict::ok;
+}
+
+void test_segment_range_accepts_an_exact_file() {
+    const std::vector<uint64_t> segs = { 100, 200, 300, 400 };
+    CHECK(check_segment_range(segs, 1000, 2000) == range_verdict::ok);
+
+    // an empty payload with no segments is consistent
+    CHECK(check_segment_range({}, 500, 500) == range_verdict::ok);
+}
+
+void test_segment_range_rejects_a_truncated_file() {
+    // the table promises 1000 bytes but the file holds fewer: this is the case a
+    // skipped last checkpoint used to hide, because nothing read there
+    const std::vector<uint64_t> segs = { 100, 200, 300, 400 };
+    CHECK(check_segment_range(segs, 1000, 1999) == range_verdict::mismatch);
+
+    // and a file longer than the table accounts for is equally wrong
+    CHECK(check_segment_range(segs, 1000, 2001) == range_verdict::mismatch);
+}
+
+void test_segment_range_rejects_overflow() {
+    // two segments that sum past 2^64: a corrupt table could otherwise wrap and
+    // appear to fit a small file
+    const std::vector<uint64_t> segs = { UINT64_MAX, 1 };
+    CHECK(check_segment_range(segs, 0, 0) == range_verdict::overflow);
+
+    // near-miss: the sum saturates exactly at the limit
+    CHECK(check_segment_range({ UINT64_MAX - 1, 1 }, 0, UINT64_MAX) == range_verdict::ok);
+    CHECK(check_segment_range({ UINT64_MAX, 1 }, 0, UINT64_MAX) == range_verdict::overflow);
+}
+
+void test_segment_range_rejects_a_payload_start_past_eof() {
+    CHECK(check_segment_range({}, 2000, 1999) == range_verdict::mismatch);
+}
+
+void test_range_check_matches_the_real_snapshot() {
+    // The v8 snapshot the experiment wrote: header ends at 8830, the file is
+    // 564668394 bytes, and the seven segments account for the difference exactly.
+    const std::array<uint64_t, 2> states = sample_states();
+    const auto ckpts = sample_ckpts(2);
+
+    const layout L = compute_layout(VERSION_V8, 206, 8416, states, ckpts);
+
+    std::vector<uint64_t> stored;
+    stored.push_back(states[0]);
+    stored.push_back(states[1]);
+    for (const auto & c : ckpts) {
+        stored.push_back(c[0]);
+        stored.push_back(c[1]);
+        stored.push_back(c[2]);
+    }
+
+    CHECK_EQ(stored.size(), 2 + 3 * ckpts.size());
+
+    // in v8 every segment is verbatim, so stored == raw and the sum is the payload
+    CHECK(check_segment_range(stored, (uint64_t) L.payload_start, (uint64_t) L.payload_end) == range_verdict::ok);
+    CHECK_EQ(L.payload_end, 564668394);
+}
+
+void test_range_check_covers_v9_with_a_smaller_payload() {
+    // v9: the same raw segments, some stored shorter. The payload the file holds is
+    // the sum of *stored* lengths, not raw ones - using the raw sizes would reject
+    // every encoded file
+    const std::array<uint64_t, 2> states = sample_states();
+    const auto ckpts = sample_ckpts(2);
+
+    const layout L = compute_layout(VERSION_V9, 206, 8416, states, ckpts);
+
+    std::vector<uint64_t> raw;
+    raw.push_back(states[0]);
+    raw.push_back(states[1]);
+    for (const auto & c : ckpts) {
+        raw.push_back(c[0]);
+        raw.push_back(c[1]);
+        raw.push_back(c[2]);
+    }
+
+    uint64_t raw_total = 0;
+    for (uint64_t n : raw) {
+        raw_total += n;
+    }
+
+    // the snapshot compressed by 38980 bytes across three segments
+    const uint64_t saved = 38980;
+    const uint64_t stored_total = raw_total - saved;
+
+    const uint64_t payload_start = (uint64_t) L.payload_start;
+    const uint64_t file_end      = payload_start + stored_total;
+
+    std::vector<uint64_t> stored = raw;
+    stored[1] -= 24842; // drft
+    stored[4] -= 7070;  // ck0.dft
+    stored[7] -= 7068;  // ck1.dft
+
+    CHECK_EQ(raw_total - stored_total, saved);
+    CHECK(check_segment_range(stored, payload_start, file_end) == range_verdict::ok);
+
+    // the same table against the *raw* total must be rejected: that is the file a
+    // reader would have to find if it used raw lengths
+    CHECK(check_segment_range(stored, payload_start, payload_start + raw_total) == range_verdict::mismatch);
+
+    // the v8 layout of the same content is a different payload start, so a v9 file
+    // measured with the v8 offset does not line up
+    const layout v8 = compute_layout(VERSION_V8, 206, 8416, states, ckpts);
+    CHECK(check_segment_range(stored, (uint64_t) v8.payload_start, file_end) == range_verdict::mismatch);
+}
+
+void test_range_check_with_skipped_last_checkpoint() {
+    // The reported scenario: the *last* checkpoint is not selected, so its segments
+    // are only seeked over. If its declared length ran past EOF nothing would read
+    // there, and a `seekg().good()` check would not notice.
+    const std::vector<uint64_t> stored = { 1000, 2000, 3000 };
+    const uint64_t payload_start = 100;
+
+    // a file that ends exactly at the table's total
+    CHECK(check_segment_range(stored, payload_start, payload_start + 6000) == range_verdict::ok);
+
+    // a file truncated inside the last, skipped segment
+    CHECK(check_segment_range(stored, payload_start, payload_start + 5999) == range_verdict::mismatch);
+
+    // truncated right at the boundary between the second and third
+    CHECK(check_segment_range(stored, payload_start, payload_start + 3000) == range_verdict::mismatch);
+}
+
 } // namespace
 
 int main() {
+    test_v8_payload_follows_checkpoint_table();
+    test_v8_has_no_padding_gap();
+    test_v9_reserves_a_table();
+    test_version_is_taken_from_the_header();
+    test_state_sizes_match_the_observed_snapshot();
+    test_segment_range_accepts_an_exact_file();
+    test_segment_range_rejects_a_truncated_file();
+    test_segment_range_rejects_overflow();
+    test_segment_range_rejects_a_payload_start_past_eof();
+    test_range_check_matches_the_real_snapshot();
+    test_range_check_covers_v9_with_a_smaller_payload();
+    test_range_check_with_skipped_last_checkpoint();
+
     test_v8_payload_follows_checkpoint_table();
     test_v8_has_no_padding_gap();
     test_v9_reserves_a_table();

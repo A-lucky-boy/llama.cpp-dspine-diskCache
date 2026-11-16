@@ -71,7 +71,10 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
-| v8 写入不留段表 | 段表预留与回填同置于 `if (segmented)` 内，`codec=none` 的 payload 紧随 checkpoint 元数据表，与原有 v8 布局等价。缺陷期为无条件预留 `28×(2+3N)` 字节，使文件头声明与实际字节不符；现有独立布局夹具覆盖 N=0/1/2 |
+| 解码流须被精确消费（两个收尾点同一规则） | `is_complete_stream(out, want, pos, src_len)` 是唯一判定，纯字面量收尾与匹配收尾**都调用它**。缺陷期纯字面量分支只查 `out == want`，使「重复串+一个不可匹配字节」这类以字面量收尾的有效流可被追加任意字节而仍被接受 |
+| 文件末端须与段表累计一致 | `read_entry()` 取真实 `file_end`，用受检加法累加各段 `stored_len`，要求 `payload_bytes == file_end - payload_start`，并与索引 `size_file` 交叉核对。`seekg().good()` 不能证明区间存在——流可定位到 EOF 之后仍报 good，而未选中的 checkpoint 从不读取。v8/v9 同规则，用 **stored** 而非 raw 长度 |
+| 写入结果的三种去向 | `committed` / `failed_clean` / `failed_orphaned`。最终路径在测大小之前就已 rename 到位，所以"失败"不等于"没有文件"。孤儿文件由 worker 在锁内登记为 `quarantined` 条目：不可查找、不可去重、不可发布，但计入 `total_size`，待确认真实删除后释放 |
+| 状态段可独立编码 | 段表预留与回填同置于 `if (segmented)` 内，`codec=none` 的 payload 紧随 checkpoint 元数据表，与原有 v8 布局等价。缺陷期为无条件预留 `28×(2+3N)` 字节，使文件头声明与实际字节不符；现有独立布局夹具覆盖 N=0/1/2 |
 | 哈希窗口与最小匹配是两个常量 | `LZ_HASH_BYTES=4`（哈希读取字节数）与 `LZ_MIN_MATCH=3`（最短匹配）分开定义，查找端与插入端都用剩余长度 >= 4 判断。混用二者曾使查找端比插入端弱一个字节，在 `n-pos==3` 时越界读 `p[3]`（ASan 已在 `lz_hash` 定位） |
 | 编码流须被精确消耗 | decoder 除 `out == want` 外还要求 `pos == src_len`，并拒绝 bit0 以外的 flags 位。配套地，编码器在循环恰于 match 处结束时不再追加空字面量令牌 |
 | 状态段可独立编码 | `--cache-disk-codec lz` 写 v9：target 状态、draft 状态、每个 checkpoint 的 spec/tgt/dft 共 2+3N 个独立段各自编码，压缩后不缩小则原样存。**不串联成单一流**——`read_entry()` 只恢复一个 checkpoint，串联会强迫解压无关段。每段有自己的原始长度/磁盘长度/编码器 ID/编码字节 CRC |

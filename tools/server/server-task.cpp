@@ -1763,6 +1763,14 @@ std::string server_task_result_metrics::to_metrics() {
             "Rejected writes whose file could not be deleted and became quarantined entries",
             (double) cache_disk.n_rollback_failed
         }, {
+            "cache_disk_write_failed_total",
+            "Disk cache writes that did not commit",
+            (double) cache_disk.n_write_failed
+        }, {
+            "cache_disk_write_orphaned_total",
+            "Failed writes that left a file at the final path; quarantined until the file is confirmed removed",
+            (double) cache_disk.n_write_orphaned
+        }, {
             "cache_disk_quota_unreclaimed_total",
             "Admission transactions that could not really reclaim the quota because a removal failed",
             (double) cache_disk.n_quota_unreclaimed
@@ -3040,7 +3048,7 @@ void server_disk_cache::save_manifest() {
     }
 }
 
-bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out, bool path_owned) {
+disk_cache_write_result server_disk_cache::write_entry(const server_disk_cache_pending & pending, std::string & path_out, size_t & size_out, bool path_owned) {
     namespace fs = std::filesystem;
 
     const uint64_t hash = disk_cache_hash(pending.ids, pending.media_indices, pending.media_token_counts, pending.media_ids);
@@ -3049,11 +3057,16 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
     const std::string path = dir + "/" + name;
     const std::string tmp  = path + ".tmp";
 
+    // The result carries the path from the start so every exit can hand the caller a
+    // path to quarantine, whether or not the rename happened
+    disk_cache_write_result result;
+    result.path = path;
+
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             SRV_ERR("disk cache: cannot open '%s' for writing\n", tmp.c_str());
-            return false;
+            return result; // nothing was created: the tmp path never opened
         }
 
         // `segmented` decides both the version stamp and the payload encoding, so
@@ -3208,7 +3221,17 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
             std::error_code ec;
             fs::remove(tmp, ec);
             SRV_ERR("disk cache: failed to write '%s'\n", tmp.c_str());
-            return false;
+            return result; // the tmp file was removed; the final path was never touched
+        }
+
+        // How many bytes this writer produced. Kept only as a floor on the file's
+        // size: the directory entry and any filesystem block padding are not visible
+        // here, so it is used to account for an orphan, never to release quota or to
+        // sign a snapshot as recoverable
+        const std::streamoff written = f.tellp();
+
+        if (written > 0) {
+            result.written_bytes = (size_t) written;
         }
     }
 
@@ -3222,7 +3245,7 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
             SRV_ERR("disk cache: refusing to write '%s': the path is not claimed\n", path.c_str());
             std::error_code ec_drop;
             fs::remove(tmp, ec_drop);
-            return false;
+            return result; // only the tmp file existed, and it was removed
         }
     }
 
@@ -3238,17 +3261,31 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
     }
     if (ec) {
         SRV_ERR("disk cache: failed to rename '%s': %s\n", tmp.c_str(), ec.message().c_str());
+
         std::error_code ec_rm;
         fs::remove(tmp, ec_rm);
-        return false;
+
+        // The rename did not take, so the final path should not exist. It is checked
+        // rather than assumed: a prior crashed write could have left something there,
+        // and a path this process cannot account for is not the same as an absent one
+        std::error_code ec_final;
+        if (fs::exists(path, ec_final) && !ec_final) {
+            SRV_ERR("disk cache: '%s' exists after a failed rename; leaving it for the caller to quarantine\n",
+                    path.c_str());
+            result.outcome = disk_cache_write_outcome::failed_orphaned;
+        }
+
+        return result;
     }
 
     // The caller uses the size this reports as the entry's real footprint: quota
     // accounting, the read-cost guard and the prefix directory's physical reference
-    // all key off it. Guessing would be worse than failing - a zero would look like
-    // a free entry and a stale value would misstate the quota - so a failure to
-    // measure is a failed write, and the file just committed is removed rather than
-    // left as an unaccounted object.
+    // all key off it. Guessing would be worse than failing, so a failure to measure
+    // cannot be reported as a commit.
+    //
+    // The file is on disk by now, though, so "failed" is not enough either: if it
+    // cannot be removed, something exists at the final path that no ledger knows
+    // about. That is a distinct outcome and the caller has to hear about it.
     std::error_code ec_size;
     const uintmax_t fsize = fs::file_size(path, ec_size);
 
@@ -3258,13 +3295,41 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         std::error_code ec_rm;
         fs::remove(path, ec_rm);
 
-        return false;
+        // Removal is only believed when the path is observably gone. `fs::remove`
+        // reports success or failure, but the question that matters is whether
+        // anything is still there, so it is asked directly
+        std::error_code ec_still;
+        const bool still_there = fs::exists(path, ec_still) && !ec_still;
+
+        if (still_there || ec_still) {
+            SRV_ERR("disk cache: '%s' could not be removed after a failed size query%s; "
+                    "leaving it for the caller to quarantine\n",
+                    path.c_str(), ec_still ? " (its state could not be confirmed)" : "");
+
+            result.outcome = disk_cache_write_outcome::failed_orphaned;
+            return result;
+        }
+
+        result.outcome = disk_cache_write_outcome::failed_clean;
+        return result;
+    }
+
+    result.outcome = disk_cache_write_outcome::committed;
+    result.size_file = (size_t) fsize;
+
+    // Cross-check the measured size against what the writer produced. They need not be
+    // equal - block padding and directory metadata are not part of the stream - but a
+    // measured size *below* the stream length means the file is not the one just
+    // written, which is worth saying out loud while the entry is still unindexed
+    if (result.written_bytes != 0 && result.size_file < result.written_bytes) {
+        SRV_WRN("disk cache: '%s' is %zu bytes but %zu were written\n",
+                path.c_str(), result.size_file, result.written_bytes);
     }
 
     path_out = path;
-    size_out = (size_t) fsize;
+    size_out = result.size_file;
 
-    return true;
+    return result;
 }
 
 disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_entry & e, size_t lcp, server_disk_cache_payload & out) {
@@ -3490,6 +3555,81 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
     }
 
     const std::streamoff hdr_end = f.tellg();
+
+    // The segment table describes where each payload segment lives, but nothing so
+    // far has checked that those ranges exist in the file. `seekg()` cannot answer
+    // that: a stream may be positioned past EOF and still report `good()` - the C++
+    // standard leaves a seek beyond the end successful, and the shortfall only shows
+    // up when someone actually reads there. A skipped checkpoint is never read, so a
+    // table whose last skipped segment runs past EOF would go unnoticed.
+    //
+    // So the file's real end is taken from the stream, and the layout the table
+    // implies must account for it exactly.
+    const std::streamoff payload_start = hdr_end;
+
+    f.seekg(0, std::ios::end);
+    const std::streamoff file_end = f.tellg();
+
+    if (file_end < 0 || payload_start < 0 || file_end < payload_start) {
+        SRV_WRN("disk cache: '%s' cannot be sized, treating it as unreadable\n", e.path.c_str());
+        return disk_cache_read_status::io_error;
+    }
+
+    // Every segment's stored length, added with overflow detection: a corrupt table
+    // could otherwise wrap and appear to fit.
+    uint64_t payload_bytes = 0;
+
+    for (const auto & d : seg_table) {
+        if (payload_bytes > UINT64_MAX - d.stored_len) {
+            SRV_WRN("disk cache: '%s' declares segment lengths that overflow\n", e.path.c_str());
+            return disk_cache_read_status::corrupt;
+        }
+
+        payload_bytes += d.stored_len;
+    }
+
+    // the payload must end exactly where the file does: the format has nothing after
+    // it, so a shortfall means a segment runs past the end and a surplus means the
+    // file is not the one the header describes
+    const uint64_t file_bytes = (uint64_t) (file_end - payload_start);
+
+    if (payload_bytes != file_bytes) {
+        SRV_WRN("disk cache: '%s' segment table accounts for %" PRIu64 " bytes but the payload holds %" PRIu64 "\n",
+                e.path.c_str(), payload_bytes, file_bytes);
+        return disk_cache_read_status::corrupt;
+    }
+
+    // the index recorded a file size when the entry was committed; the file must
+    // still match it, the same way size_main and size_drft already must
+    if (e.size_file != 0 && e.size_file != (size_t) file_end) {
+        SRV_WRN("disk cache: '%s' is %zu bytes but the index records %zu\n",
+                e.path.c_str(), (size_t) file_end, e.size_file);
+        return disk_cache_read_status::corrupt;
+    }
+
+    // each segment's start and end must sit inside the payload, checked explicitly so
+    // a bad offset is reported as such rather than surfacing later as a short read
+    {
+        uint64_t off = 0;
+
+        for (const auto & d : seg_table) {
+            if (off > payload_bytes || d.stored_len > payload_bytes - off) {
+                SRV_WRN("disk cache: '%s' has a segment outside the payload\n", e.path.c_str());
+                return disk_cache_read_status::corrupt;
+            }
+
+            off += d.stored_len;
+        }
+    }
+
+    // the checks above and the reads below must see the same file: the position is
+    // restored to the payload start only after the range check has passed
+    f.seekg(payload_start, std::ios::beg);
+
+    if (!f) {
+        SRV_WRN("disk cache: '%s' cannot be positioned at its payload\n", e.path.c_str());
+        return disk_cache_read_status::io_error;
+    }
 
     // how many physical bytes this read actually consumed. It must stay the
     // *stored* count: an encoded segment occupies less on disk than it decodes to,
@@ -4884,13 +5024,61 @@ void server_disk_cache::worker() {
             continue;
         }
 
-        const bool ok = write_entry(pending, path, size_file, /*path_owned=*/true);
+        const disk_cache_write_result write = write_entry(pending, path, size_file, /*path_owned=*/true);
+
+        const bool ok = write.outcome == disk_cache_write_outcome::committed;
 
         {
             std::lock_guard<std::mutex> lock(mtx);
 
             queue_bytes -= std::min(queue_bytes, bytes);
             inflight_erase_locked(hash);
+
+            // A write that failed after the final path came into being leaves a file
+            // that nothing has classified: `entries` does not hold it, so no lookup
+            // can match it, yet the path is taken and `total_size` does not include
+            // its bytes. Left alone it would be invisible to quota accounting until
+            // the next startup scan - and a later write of the same hash would find
+            // the path occupied by something the ledger never recorded.
+            //
+            // So it is entered as a quarantined record: excluded from lookups, from
+            // dedup and from any recoverable reference, but counted, and reclaimable
+            // once the file is confirmed gone.
+            if (write.outcome == disk_cache_write_outcome::failed_orphaned) {
+                server_disk_cache_entry orphan;
+                orphan.path      = write.path;
+                orphan.hash      = hash;
+                orphan.tokens    = pending.ids;
+                orphan.media_indices = pending.media_indices;
+                orphan.media_token_counts = pending.media_token_counts;
+                orphan.media_ids = pending.media_ids;
+                orphan.size_main = pending.main->size();
+                orphan.size_drft = pending.drft->size();
+
+                // The real size was never obtained. The writer's own byte count is the
+                // only figure available and it is a floor, not the footprint: the
+                // ledger owes an honest number, so the bytes actually written are
+                // charged and the uncertainty is recorded rather than papered over.
+                //
+                // This entry is quarantined, which is what keeps an estimate from
+                // being used as if it were measured - a quarantined record can never
+                // be looked up, matched, or published to the prefix directory.
+                orphan.size_file = write.written_bytes;
+
+                SRV_WRN("disk cache: quarantining unaccounted '%s' (~%.2f MiB by the writer's count, real size unknown)\n",
+                        orphan.path.c_str(), write.written_bytes/(1024.0*1024.0));
+
+                orphan.quarantined = true;
+
+                total_size += orphan.size_file;
+                entries.push_back(orphan);
+
+                counters.n_write_orphaned++;
+            }
+
+            if (!ok) {
+                counters.n_write_failed++;
+            }
 
             if (ok) {
                 server_disk_cache_entry committed;

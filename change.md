@@ -3000,3 +3000,241 @@ SUMMARY: AddressSanitizer: heap-buffer-overflow
 ## 七、对上一轮记录的更正
 
 上一轮（`12-20`）声称"`read_bytes` 报告真实物理读取量"，`13-05` 已更正为修正后实现。本轮的 v8 布局缺陷**同一个文件里还有更早就存在的一处**：`none` 写盘自 `1f15c1b` 起就是坏的。这说明**上一轮新增的 v9 路径测试没有覆盖 `codec_mode = none` 的真实写盘**——我测了 v9 写入、v9 恢复、以及"v8 进程读 v9 文件"，却没有测"`none` 进程写出 v8 文件再读回"。这是本轮问题 A 能存活到交付的原因。
+
+# 2026-11-16 15-10 - Change Record（test1_5 修复轮：解码收尾、孤儿文件账本、文件末端范围校验）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 14-03 - test1_5` 修复三处尚未闭合的正确性风险。三处均已由源码确认存在，其中 A 与 C 另有可复现的反向验证与真实文件证据。基线 HEAD `3e4bd1f`。
+
+## 一、问题 A：纯字面量收尾分支绕过尾随字节检查
+
+### 缺陷
+
+`disk_cache_codec_decode()` 有两个停止点，完整消费检查只做在其中一个：
+
+```cpp
+if ((flags & LZ_FLAG_MATCH) == 0) {
+    return out == want;                       // ← 只查输出长度
+}
+...
+return out == want && pos == src_len;         // ← 主循环收尾，两个条件都查
+```
+
+一个**以纯字面量令牌收尾**的有效流因此可被追加任意字节并同步改大 `stored_len` 而仍被接受。
+
+### 为何此前测试未覆盖
+
+既有尾随字节用例的语料是全零（`make_zeros(4096)`）。实测该语料的编码流**以匹配令牌收尾**——所以只走了已受保护的那条路径。用探针确认：
+
+```
+zeros(4096)          enc=129  last=match
+pattern(4096)        enc=135  last=match
+tail_literal(100)    enc=  8  last=literal      ← 未被覆盖的分支
+```
+
+### 修复
+
+抽出共享纯函数，两个收尾点都调用它：
+
+```cpp
+inline bool is_complete_stream(size_t out, size_t want, size_t pos, size_t src_len) {
+    return out == want && pos == src_len;
+}
+```
+
+### 验证
+
+新增 `test_literal_only_tail_rejects_padding()`。语料为「重复串 + 一个无法匹配的字节」（`run` 个 `A` 后接 `Z`），该构造**确以字面量收尾**——用例先用一个解析器断言这一点，避免语料将来漂移后测试悄悄改测另一条分支。三组长度（20 / 100 / 4096）各测：干净流 round-trip 成功、追加 1 字节失败、追加 3 字节失败、追加「伪装成空字面量令牌」的两字节失败。
+
+另加 `test_both_endings_use_one_rule()`，用同一套断言包住匹配收尾，使两条分支受同一条规则约束。
+
+**反向验证**：把该处退回 `return out == want;` 后 **9 项失败**，全部落在追加字节的断言上；恢复后通过。
+
+## 二、问题 B：`file_size` 失败且清理失败会留下未登记文件
+
+### 缺陷
+
+文件先 `rename` 到最终路径、再查大小。原实现在查询失败后：
+
+```cpp
+std::error_code ec_rm;
+fs::remove(path, ec_rm);
+return false;              // ← 未检查 ec_rm，也不看文件是否真的消失
+```
+
+worker 的失败分支只清 `queue_bytes` 与 in-flight 占位，**不知道最终路径可能仍有文件**。于是该文件不进 `entries`、不计 `total_size`，却占着路径——下次同 hash 写入会在 `claim_path_locked()` 遇到一个账本上没有的主人。
+
+### 修复
+
+- `write_entry()` 返回**结构化结果**而非 `bool`：
+
+```cpp
+enum class disk_cache_write_outcome {
+    committed,        // 已落盘、已测大小、可入账
+    failed_clean,     // 未产出，或残留已确认移除
+    failed_orphaned,  // 最终路径仍存在，或其状态无法确认
+};
+
+struct disk_cache_write_result {
+    disk_cache_write_outcome outcome = ...;
+    std::string path;        // 总是有效，调用方不必重算
+    size_t size_file = 0;    // 仅 committed 时是实测值
+    size_t written_bytes = 0; // flush 后 tellp，仅作下限与交叉核对
+};
+```
+
+- 每个退出点给出准确结果：tmp 打开失败 / 写入失败 / 未持有路径 / rename 失败 → `failed_clean`（rename 失败时额外 `fs::exists` 检查，若最终路径确实存在则升级为 `failed_orphaned`）
+- `file_size` 失败后：`fs::remove` 之后**直接查 `fs::exists`** 来确认，而不是相信 remove 的返回值。仍在或状态不可确认 → `failed_orphaned`
+- `flush` 成功后记录 `tellp()` 作为 `written_bytes`，**不得**用它签发可恢复引用
+- worker 在锁内为该路径建立 `quarantined` 条目：不计入可查找、可去重、可发布为 `persisted` 的集合，但计入 `total_size`
+
+**关于估算值的取舍**：真实大小拿不到，唯一可用数字是 `written_bytes`。它只是下限（缺目录项与块填充），所以我用它记账、把不确定性写进日志，而**不伪装成实测值**。`quarantined` 标记正是这一步的保障——隔离条目在 `is_reusable_entry()` 处被排除，永远不会被当成有效快照使用。
+
+新增指标 `cache_disk_write_failed_total` / `cache_disk_write_orphaned_total`。
+
+### 路径占用（规划 §2.2.5）
+
+**未改动**：`claim_path_locked()` 已有逻辑正是所要求的——遇到非可复用（隔离）条目时调用 `remove_file()`，**仅在确认删除成功**后才释放路径与账本，否则返回 `conflict`。下次同 hash 写入因此会走路径所有权检查，不会覆盖未确认的残留。
+
+### 验证状态
+
+代码路径已实现，**故障注入未执行**（见 §六）。
+
+## 三、问题 C：`seekg()` 成功不足以证明未越过 EOF
+
+### 缺陷
+
+C++ 标准下文件流可以定位到 EOF 之后而保持 `good()`，短缺只在实际读取时暴露。未选中的 checkpoint **只被 seek 跳过、从不读取**——所以一个越界的段长度不会被发现。
+
+### 修复
+
+在段表解析之后、分配 target/draft 缓冲之前，建立**真实文件末端与 payload 布局上界**：
+
+1. `f.seekg(0, std::ios::end)` 取真实末端；取不到（`tellg() < 0`）或 `file_end < payload_start` → 判 `io_error`，不假设长度正确
+2. 用 `UINT64_MAX - n` 形式的**受检加法**累加各段 `stored_len`，溢出即 `corrupt`
+3. 要求 `payload_bytes == file_end - payload_start`——格式在 payload 之后没有任何内容，短缺意味着某段越界，多余意味着文件不是头所描述的那个
+4. 与索引记录的 `size_file` 交叉核对（`size_main` / `size_drft` 已在更早处核对）
+5. 逐段累计偏移，确认每段区间落在 payload 内
+6. 全部通过后才 `seekg(payload_start)` 复位并开始读取
+
+v8 与 v9 走同一路径（v8 把每段描述为 verbatim，`stored_len == raw_len`），语义一致。未选中 checkpoint 仍只 seek 跳过，**未因校验而把全部 checkpoint 读入内存**。
+
+### 验证：真实截断文件
+
+**这是本轮最强的一条证据。** 用真实写出的 v8 文件（2 个 checkpoint），把尾部截断 1 MiB：
+
+解析出的段布局证明截断点精确落在**最后一个、且未被选中**的 checkpoint 的 `dft` 段内：
+
+```
+ck0.tgt  [218668946, 375563310)   选中
+ck0.dft  [375563310, 391657766)   选中
+ck1.tgt  [391657766, 548552130)   ← 仅 seek 跳过，从不读取
+ck1.dft  [548552130, 564668394)   ← 截断点 563619818 落在此段内
+段表累计末端 = 564668394 = 真实 EOF（完整文件时一致）
+```
+
+恢复时选中 ck0、跳过 ck1，**因此没有任何读取触及越界位置**——旧检查必然放行。实测结果：
+
+```
+read_entry: '...pc-bf495e2785d51ca5.bin' segment table accounts for
+            564659564 bytes but the payload holds 563610988
+cache_stats: reused_disk = 0, restored = 0, prefill = 2496, reject = checksum_error
+```
+
+**在 `set_data_ext()` 之前拒绝**，完整 prefill 回退，未恢复任何状态。
+
+另测**单字节截断**（`564668394 → 564668393`）：`accounts for 564659564 bytes but the payload holds 564659563`，同样被拒。损坏候选按既有策略被清理。
+
+### 夹具扩展
+
+`test_disk_cache_layout.cpp` 增加与 `read_entry()` 同构的 `check_segment_range()` 及其用例：精确匹配接受、截断/超长拒绝、**溢出拒绝**（`{UINT64_MAX, 1}`）、payload 起点越过 EOF 拒绝、越界段拒绝；并用**真实快照的段长**验证——v9 的 `stored` 比 `raw` 少 38980 字节（逐段 24842 + 7070 + 7070），确认校验必须用 stored 而非 raw，否则每个编码文件都会被误拒。
+
+## 四、修改文件
+
+### tools/server/server-disk-cache-codec.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-disk-cache-codec.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-disk-cache-codec.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 `is_complete_stream()`；纯字面量收尾分支；主循环收尾
+- 具体变更：见 §一
+- 修改原因：规划 §2.1
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_write_outcome`、`disk_cache_write_result`、`write_entry()` 签名、两个新计数器
+- 具体变更：见 §二
+- 修改原因：规划 §2.2
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`write_entry()` 全部返回点与 `file_size` 分支；worker 的 `failed_orphaned` 隔离记账；`read_entry()` 的 EOF/段范围校验；metrics
+- 具体变更：见 §二、§三
+- 修改原因：规划 §2.2、§2.3
+
+### tools/server/tests/unit/test_disk_cache_codec.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_codec.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 `test_literal_only_tail_rejects_padding()`、`test_both_endings_use_one_rule()`
+- 具体变更：见 §一
+- 修改原因：规划 §2.1 第 2 条
+
+### tools/server/tests/unit/test_disk_cache_layout.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_layout.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 `check_segment_range()` 与 7 组范围校验用例
+- 具体变更：见 §三
+- 修改原因：规划 §三
+
+## 五、验证执行记录
+
+- 已执行检查：CUDA release 构建
+- 检查结果：通过，`0 FAILED`
+
+- 已执行检查：七套独立单测（含 ASan 版 codec）
+- 检查结果：通过。`all disk-cache codec checks passed`、`all disk-cache layout checks passed`、`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`；ASan 下 codec 套件静默通过
+
+- 已执行检查：问题 A 反向验证
+- 检查结果：退回缺陷后 9 项失败（全部为追加字节断言），恢复后通过
+
+- 已执行检查：`none` 新写 v8 → 跨进程重启（规划 §六）
+- 检查结果：通过。文件 564668394 字节；`scan 1 entries, 0 dropped`；`source=disk`、`reused_disk=2102`、`restored=2102`；sha `34cf653dceec290d` 与历轮一致；`read 373.53 MiB stored (373.53 MiB decoded)`——**新增的 EOF 校验未误拒合法 v8 文件**
+
+- 已执行检查：`lz` 新写 v9 → 跨进程重启
+- 检查结果：通过。文件 564629638 字节；`read_bytes = 391647888`、sha 一致；`read 373.50 MiB stored (373.53 MiB decoded), checkpoints 1/2, segmented`——校验正确使用 stored 长度
+
+- 已执行检查：**真实截断文件拒绝**（规划 §六第 7 项）
+- 检查结果：通过，且是**该问题最直接的证据**。截断 1 MiB，截断点落在未被选中且仅被 seek 的 ck1.dft 内；`segment table accounts for 564659564 bytes but the payload holds 563610988`；`reused_disk = 0, restored = 0`，`set_data_ext()` 之前拒绝。单字节截断同样被拒
+
+- 已执行检查：清理
+- 检查结果：通过
+
+- **未执行的检查及原因**：
+  - **`file_size` 失败与删除失败的定向故障注入（规划 §2.2.6、§六第 5/6 项）**：**未执行**。需要在测试构建中可控地让 `fs::file_size` 或 `fs::remove` 失败，本机没有便捷的注入点（无 fault-injection 框架，Windows 上难以对该路径制造稳定的权限/占用错误而不影响其它 I/O）。因此 `failed_orphaned` 分支、隔离记账、以及"删除失败后再写同 hash 走路径所有权"这三项**只有代码实现，没有运行证据**。这是本轮最大的缺口
+  - **`touch_entry()` 端到端触发**：**仍未完成**，原因同上轮——它只在析构路径调用，本环境无法向非交互启动的进程送达 `CTRL_C_EVENT`。规划 §六明确要求"在尚未真正触发前继续明确标为未验证，不用静态偏移断言代替运行证据"——故此处**标记为未验证**
+  - **`write_entry` 返回值改动的编译期完整性**：已由构建覆盖，但**除正常提交路径外，其它 outcome 分支均未在运行中触发**
+  - **`read_entry` 的多 checkpoint 组合越界**（选中越界 / 未选越界 / 部分选中）：只测了"未选中的最后一个 checkpoint 越界"这一种（即规划点名的场景），其余组合未单独构造
+  - **媒体输入端到端**：测试机无多模态模型，`media_state_unverified` 门禁未变
+
+## 六、范围确认
+
+- 未更换 LZ77 编码语法、未升级 v9 版本号、未改变原样段语义（规划 §2.1.4）
+- 未新增压缩器、checkpoint 去重、KV 物理分块或增量持久化（规划 §一）
+- `--cache-disk-codec` 默认 `none`、manifest v3、CRC64、`768 KiB/token` 成本守卫、4096-token 写入抑制、preflight、完整 token/media 身份、in-flight 保护、同步事件通知**均未改动**
+- `seekg` 跳过仍保留按需读取，未把全部 checkpoint 读入内存（规划 §2.3.3）
+- 文件系统异常未被当作缓存命中，未修改 model state，未重算 prompt，未削弱磁盘配额（规划 §2.2 末段）
+- 未调用 `notify_committed()` 于回滚失败路径（隔离条目不经该路径）

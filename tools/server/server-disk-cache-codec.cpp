@@ -81,6 +81,22 @@ inline uint32_t lz_hash(const char * p) {
     return h & (LZ_HASH_SIZE - 1);
 }
 
+// Whether a finished token stream is well formed: the decoded output reached the
+// length the header declared, and every encoded byte was consumed.
+//
+// The decoder has two ways to stop - a trailing literal-only token, or a stream that
+// ends right on a match - and both must apply this one rule. It lives here, as a
+// pure function, so the two endings cannot diverge again: the literal-only branch
+// once checked the output length alone, which accepted a valid stream padded with
+// arbitrary trailing bytes.
+//
+// This is a structural check, not a substitute for the caller's CRC over the decoded
+// bytes: it catches a stream that contradicts its own header, not one that is merely
+// damaged.
+inline bool is_complete_stream(size_t out, size_t want, size_t pos, size_t src_len) {
+    return out == want && pos == src_len;
+}
+
 // append one token: `lits` bytes of literal data, optionally followed by a match
 void put_token(std::vector<char> & out, const char * lits, size_t lit_len,
                size_t match_len, size_t match_dist) {
@@ -321,9 +337,13 @@ bool disk_cache_codec_decode(const void * src_ptr, size_t src_len, disk_cache_se
         }
 
         if ((flags & LZ_FLAG_MATCH) == 0) {
-            // a literal-only token ends the stream. if output is still outstanding,
-            // the stream is short
-            return out == want;
+            // a literal-only token ends the stream. It must satisfy the same
+            // completeness rule as the match-ended path below: the output has to
+            // reach `want` *and* the input has to be consumed exactly. Checking only
+            // the output length let a valid stream be padded with arbitrary trailing
+            // bytes - the earlier test only appended junk after a *match* token, so
+            // this branch went uncovered
+            return is_complete_stream(out, want, pos, in_len);
         }
 
         if (pos >= in_len) {
@@ -358,12 +378,9 @@ bool disk_cache_codec_decode(const void * src_ptr, size_t src_len, disk_cache_se
         out += len;
     }
 
-    // The output reached its declared length. The stream must also have been
-    // consumed exactly: a well-formed stream ends on the final token, so anything
-    // left over means the encoded bytes do not describe what the header claims.
-    //
-    // This is a structural check, not a substitute for the caller's CRC over the
-    // decoded bytes - it catches a stream that is internally inconsistent rather
-    // than one that is merely damaged.
-    return out == want && pos == src_len;
+    // Both endings - a trailing literal-only token and a stream that finishes on a
+    // match - must satisfy the same completeness rule. It lives in one function so
+    // the two cannot drift: the literal-only path previously checked only the output
+    // length, which accepted a valid stream with arbitrary bytes appended.
+    return is_complete_stream(out, want, pos, src_len);
 }

@@ -467,6 +467,175 @@ void test_non_canonical_stream_rejected() {
     }
 }
 
+// A stream that ends on a *literal-only* token, padded with junk, must be rejected.
+//
+// The decoder has two ways to stop: on a match, or on a trailing literal-only token.
+// The padding test above uses an all-zero corpus, and the encoder finishes that on a
+// match - so only one of the two endings was ever exercised, and the literal-only
+// branch went on checking the output length alone. A valid stream like `run + one
+// unmatchable byte` ends on a literal, so it was accepted with arbitrary bytes
+// appended.
+//
+// The corpus below is chosen for exactly that property, and the helper below
+// confirms it before the assertion runs - a test that silently stopped exercising
+// the literal-only ending would otherwise keep passing.
+void test_literal_only_tail_rejects_padding() {
+    // a repeated run, then one byte that cannot match anything before it
+    auto tail_literal = [](size_t run) {
+        std::vector<char> v(run, 'A');
+        v.push_back('Z');
+        return v;
+    };
+
+    // the stream must end on a literal, or this test would be about the other branch
+    auto ends_on_literal = [](const std::vector<char> & enc) {
+        size_t pos = 0;
+        size_t out = 0;
+
+        while (pos < enc.size()) {
+            const uint8_t flags = (uint8_t) enc[pos++];
+
+            uint64_t lit = 0;
+            int shift = 0;
+            while (true) {
+                if (pos >= enc.size() || shift > 63) {
+                    return false;
+                }
+                const uint8_t b = (uint8_t) enc[pos++];
+                lit |= (uint64_t) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    break;
+                }
+                shift += 7;
+            }
+
+            pos += (size_t) lit;
+            out += (size_t) lit;
+
+            if ((flags & 0x01) == 0) {
+                return true; // stopped on a literal-only token
+            }
+
+            if (pos >= enc.size()) {
+                return false;
+            }
+            const size_t len = (size_t) (uint8_t) enc[pos++] + 3;
+
+            uint64_t d = 0;
+            shift = 0;
+            while (true) {
+                if (pos >= enc.size() || shift > 63) {
+                    return false;
+                }
+                const uint8_t b = (uint8_t) enc[pos++];
+                d |= (uint64_t) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    break;
+                }
+                shift += 7;
+            }
+
+            out += len;
+        }
+
+        return false;
+    };
+
+    for (size_t run : { (size_t) 20, (size_t) 100, (size_t) 4096 }) {
+        const std::vector<char> v = tail_literal(run);
+
+        std::vector<char> enc;
+        const disk_cache_codec_id id = disk_cache_codec_encode(v.data(), v.size(), enc);
+
+        if (id != disk_cache_codec_id::lz || enc.size() >= v.size()) {
+            continue; // this length did not compress; nothing to assert here
+        }
+
+        CHECK(ends_on_literal(enc));
+
+        disk_cache_segment_desc d;
+        d.raw_len    = v.size();
+        d.stored_len = enc.size();
+        d.codec      = disk_cache_codec_id::lz;
+
+        // the clean stream round-trips and is fully consumed
+        std::vector<char> back;
+        CHECK(disk_cache_codec_decode(enc.data(), enc.size(), d, back));
+        CHECK(back == v);
+
+        // one appended byte, with the declared length updated to match, must fail
+        {
+            std::vector<char> padded = enc;
+            padded.push_back((char) 0x00);
+
+            disk_cache_segment_desc pd = d;
+            pd.stored_len = padded.size();
+
+            std::vector<char> out;
+            CHECK(!disk_cache_codec_decode(padded.data(), padded.size(), pd, out));
+        }
+
+        // so must several
+        {
+            std::vector<char> padded = enc;
+            padded.push_back((char) 0x5A);
+            padded.push_back((char) 0x00);
+            padded.push_back((char) 0xFF);
+
+            disk_cache_segment_desc pd = d;
+            pd.stored_len = padded.size();
+
+            std::vector<char> out;
+            CHECK(!disk_cache_codec_decode(padded.data(), padded.size(), pd, out));
+        }
+
+        // and a trailing byte that would itself look like an empty literal token
+        {
+            std::vector<char> padded = enc;
+            padded.push_back((char) 0x00); // flags: no match
+            padded.push_back((char) 0x00); // lit_len = 0
+
+            disk_cache_segment_desc pd = d;
+            pd.stored_len = padded.size();
+
+            std::vector<char> out;
+            CHECK(!disk_cache_codec_decode(padded.data(), padded.size(), pd, out));
+        }
+    }
+}
+
+// The two endings must agree. A stream that finishes on a match was already covered;
+// this asserts the same corpus property holds when the padding sits after a match,
+// so the pair of cases brackets both branches with one rule.
+void test_both_endings_use_one_rule() {
+    // ends on a match
+    {
+        std::vector<char> v = make_zeros(4096);
+
+        std::vector<char> enc;
+        const disk_cache_codec_id id = disk_cache_codec_encode(v.data(), v.size(), enc);
+        CHECK(id == disk_cache_codec_id::lz);
+
+        disk_cache_segment_desc d;
+        d.raw_len    = v.size();
+        d.stored_len = enc.size();
+        d.codec      = disk_cache_codec_id::lz;
+
+        std::vector<char> back;
+        CHECK(disk_cache_codec_decode(enc.data(), enc.size(), d, back));
+        CHECK(back == v);
+
+        std::vector<char> padded = enc;
+        padded.push_back((char) 0x11);
+
+        disk_cache_segment_desc pd = d;
+        pd.stored_len = padded.size();
+
+        std::vector<char> out;
+        CHECK(!disk_cache_codec_decode(padded.data(), padded.size(), pd, out));
+    }
+}
+
 void test_boundary_windows_encode_and_decode() {
     // Every position where the four-byte hash window closes or opens, checked on
     // both sides so an off-by-one in either guard shows up as a different result
@@ -587,6 +756,8 @@ int main() {
     test_backreference_into_nothing_rejected();
     test_literal_overrun_rejected();
     test_non_canonical_stream_rejected();
+    test_literal_only_tail_rejects_padding();
+    test_both_endings_use_one_rule();
     test_boundary_windows_encode_and_decode();
     test_empty_encoded_segment_rejected();
     test_encode_is_deterministic();
