@@ -7,6 +7,8 @@
 | 本次交付终点 | 分支 `main` 顶端 |
 | 规划依据 | `betterModification.md` → `2026-11-16 18-45 - test1_5`；算法规划文档 `v16_mtmd_transition_repair.md` |
 | 交付性质 | 单项功能性崩溃修复 + 定向回归（规划 §一、§七） |
+| 功能提交 | `71dbd17`（`bind_media_mode`、同步点、媒体迁移单测与混合矩阵脚本） |
+| 构建产物 | `output\llama-server.exe` **build 58**（commit `71dbd17`），MSVC 19.44.35226 |
 
 **结论：崩溃已修复。** 上一轮记录的真实功能错误——"纯文本磁盘快照恢复后发送图片请求导致进程因 `GGML_ASSERT(has_mtmd)` 退出"——在本轮定位到真正的错源并修复。
 
