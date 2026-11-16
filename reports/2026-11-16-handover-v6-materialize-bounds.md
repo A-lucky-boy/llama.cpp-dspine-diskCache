@@ -4,10 +4,10 @@
 |---|---|
 | 仓库 | `A-lucky-boy/llama.cpp-dspine-diskCache` |
 | 本次交付起点 | `010c68a`（会话前 HEAD，第七轮交付说明提交） |
-| 本次交付终点 | `7aedd56` |
-| 功能提交 | `7aedd56` |
+| 本次交付终点 | `d0537f1` |
+| 功能提交 | `d0537f1` |
 | 规划依据 | `betterModification.md` → `2026-11-16 01-12 - test1_3` |
-| 构建产物 | `0.9.0-dev (build 30, commit 7aedd56)`，MSVC 19.44.35226，sm_86-real + sm_89-real |
+| 构建产物 | `0.9.0-dev (build 31, commit d0537f1)`，MSVC 19.44.35226，sm_86-real + sm_89-real |
 | 交付性质 | **正确性修复 + 回归补充**（规划 §1 明示不是新算法实验） |
 
 本轮为上一轮（`ab6bac2` 公共前缀主动物化）的边界收紧。规划 §1 列出四个问题，全部处理；另外补上规划要求的配置依赖诊断，并在实现过程中**自查发现一处交付级测试缺口**（见 §5）。
@@ -273,9 +273,10 @@ disk_cache_checkpoint_fits({ ... }, K, disk_cache_prefix_pos_max_text(K))
 
 | 项 | 值 |
 |---|---|
-| 本地 HEAD | `7aedd56` |
+| 本地 HEAD | `d0537f1` |
 | 远端 | `git@github.com:A-lucky-boy/llama.cpp-dspine-diskCache.git` |
 | 分支 | `main` |
-| 工作树 | 本轮改动已提交；推送状态见提交后的实际结果 |
+| 工作树 | 干净（无未提交改动） |
+| 构建产物版本串 | `0.9.0-dev (build 31, commit d0537f1)` —— 与交付终点一致 |
 
-本轮全部改动（含交付文档与 §5.2 的测试缺口修复）在最终提交后推送至 `main`。
+本轮全部改动（含交付文档与 §5.2 的测试缺口修复）已在 `d0537f1` 提交并推送至 `main`。
