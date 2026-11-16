@@ -4,7 +4,9 @@
 |---|---|
 | 仓库 | `A-lucky-boy/llama.cpp-dspine-diskCache` |
 | 本次交付起点 | `3e4bd1f`（会话前 HEAD，第十三轮交付说明） |
-| 本次交付终点 | 分支 `main` 顶端 |
+| 本次交付终点 | 分支 `main` 顶端（功能提交 `2b8d7af`） |
+| 功能提交 | `2b8d7af`（三处修复与新增测试） |
+| 构建产物 | `0.9.0-dev (build 47, commit 2b8d7af)`，MSVC 19.44.35226，sm_86-real + sm_89-real |
 | 规划依据 | `betterModification.md` → `2026-11-16 14-03 - test1_5` |
 | 交付性质 | **缺陷修复轮**（规划 §一：不启动新的存储优化算法实验） |
 
