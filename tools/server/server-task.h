@@ -22,6 +22,7 @@
 #include "server-disk-cache-match.h"
 
 #include "server-disk-cache-quota.h"
+#include "server-disk-cache-quarantine.h"
 #include "server-prefix-index.h"
 #include "server-prefix-materialize.h"
 #include "mtmd-helper.h"
@@ -1314,10 +1315,24 @@ private:
     //
     // The read must happen before the scan decides what is usable; the write only
     // ever adds or removes names, never reclassifies a file as good.
-    bool load_quarantine(std::set<std::string> & out) const;
-    void save_quarantine(const std::set<std::string> & names) const; // atomic; mtx must be held
-    void quarantine_paths_add(const std::vector<std::string> & paths); // mtx must be held
-    void quarantine_paths_drop(const std::string & path);             // mtx must be held
+    // Reads the record and reports how it went. `absent` and `io_failure` are kept
+    // apart because one lets the directory be used and the other does not.
+    disk_cache_quarantine_status load_quarantine(std::set<std::string> & out) const;
+
+    // Writes the record atomically and reports whether it landed. The caller must act
+    // on a failure: the record is what keeps an uncommitted path from being read back
+    // as a usable snapshot after a restart, so a write that did not land must stop the
+    // transaction that would have created that path.
+    disk_cache_commit_status save_quarantine(const std::set<std::string> & names) const; // mtx must be held
+
+    disk_cache_commit_status quarantine_paths_add(const std::vector<std::string> & paths); // mtx must be held
+    disk_cache_commit_status quarantine_paths_drop(const std::string & path);             // mtx must be held
+
+    // True when the record could not be trusted at startup. The disk tier stays
+    // disabled for the rest of the run rather than treating the directory as sound:
+    // entries already registered would otherwise be served from paths whose
+    // quarantine state is unknown.
+    bool quarantine_untrusted = false;
 
     // entry names (file name only, not the full path) currently marked unusable
     std::set<std::string> quarantined_names;

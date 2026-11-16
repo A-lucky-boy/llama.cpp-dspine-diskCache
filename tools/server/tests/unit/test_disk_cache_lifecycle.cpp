@@ -21,8 +21,11 @@
 // calls, not through a copy of the rule.
 
 #include "server-disk-cache-quota.h"
+#include "server-disk-cache-quarantine.h"
 
 #include <cstdio>
+#include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -264,6 +267,275 @@ void test_preexisting_path_is_never_measured_by_this_write() {
     CHECK(origin::this_attempt != origin::preexisting);
 }
 
+// ---------------------------------------------------------------------------
+// the quarantine record's format
+//
+// The record exists to exclude paths, so the failure that matters is the one where a
+// damaged file is accepted as "a list that simply has fewer names": a name that is
+// absent because it was lost looks exactly like a name that was never recorded, and
+// the path it should have excluded gets registered as a usable snapshot instead.
+//
+// The previous line-based format had no way to tell those apart. These cases pin down
+// that the current one does.
+// ---------------------------------------------------------------------------
+
+std::string name_of(int n) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "pc-%016x.bin", (unsigned) n);
+    return std::string(buf);
+}
+
+void test_entry_name_shape() {
+    CHECK(disk_cache_is_entry_name("pc-0123456789abcdef.bin"));
+    CHECK(disk_cache_is_entry_name("pc-ABCDEF0123456789.bin"));
+
+    CHECK(!disk_cache_is_entry_name(""));                            // empty
+    CHECK(!disk_cache_is_entry_name("pc-.bin"));                     // no digits
+    CHECK(!disk_cache_is_entry_name("pc-0123456789abcde.bin"));      // 15 digits
+    CHECK(!disk_cache_is_entry_name("pc-0123456789abcdefg.bin"));    // 17
+    CHECK(!disk_cache_is_entry_name("pc-0123456789abcdeg.bin"));     // non-hex
+    CHECK(!disk_cache_is_entry_name("xx-0123456789abcdef.bin"));     // wrong prefix
+    CHECK(!disk_cache_is_entry_name("pc-0123456789abcdef.bin2"));    // wrong suffix
+    CHECK(!disk_cache_is_entry_name("pc-quarantine.dat"));           // not an entry
+    CHECK(!disk_cache_is_entry_name("../pc-0123456789abcdef.bin"));  // no traversal
+}
+
+void test_record_round_trips() {
+    const std::set<std::string> names = { name_of(1), name_of(2), name_of(3) };
+
+    const std::string bytes = disk_cache_quarantine_serialize(names);
+    CHECK(!bytes.empty());
+
+    std::set<std::string> back;
+    CHECK(disk_cache_quarantine_parse(bytes, back) == quarantine_parse::ok);
+    CHECK(back == names);
+}
+
+void test_empty_set_round_trips() {
+    const std::string bytes = disk_cache_quarantine_serialize({});
+
+    std::set<std::string> back;
+    CHECK(disk_cache_quarantine_parse(bytes, back) == quarantine_parse::ok);
+    CHECK(back.empty());
+}
+
+void test_serialization_is_deterministic() {
+    // the same set must always produce the same bytes, or a checksum comparison across
+    // runs would be meaningless
+    std::set<std::string> a = { name_of(7), name_of(3), name_of(5) };
+    std::set<std::string> b = { name_of(5), name_of(7), name_of(3) };
+
+    CHECK(disk_cache_quarantine_serialize(a) == disk_cache_quarantine_serialize(b));
+}
+
+void test_truncated_record_is_rejected() {
+    const std::set<std::string> names = { name_of(1), name_of(2), name_of(3) };
+    const std::string bytes = disk_cache_quarantine_serialize(names);
+
+    // dropping the last name and the checksum: the count no longer matches, and the
+    // checksum is gone
+    for (size_t cut = 1; cut <= bytes.size(); cut++) {
+        const std::string short_bytes = bytes.substr(0, bytes.size() - cut);
+
+        std::set<std::string> out;
+        const quarantine_parse r = disk_cache_quarantine_parse(short_bytes, out);
+
+        // a truncated record may parse as "not our format" while it is too short to
+        // even hold the header, but it must never come back as a valid list
+        CHECK(r != quarantine_parse::ok);
+    }
+}
+
+void test_removing_a_record_from_the_bytes_is_caught() {
+    // This is the case the old format could not detect: delete one whole record
+    // (its length and its name) without touching anything else, and the file still
+    // looks structurally plausible. The checksum is what makes it detectable.
+    const std::set<std::string> names = { name_of(1), name_of(2), name_of(3) };
+    std::string bytes = disk_cache_quarantine_serialize(names);
+
+    const size_t header = 8 + 4 + 4;
+    const size_t rec1   = 4 + name_of(1).size();
+
+    // drop the second record, leaving count and checksum stale
+    bytes.erase(header + rec1, 4 + name_of(2).size());
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse(bytes, out) == quarantine_parse::corrupt);
+}
+
+void test_crc_corruption_is_caught() {
+    // The mutation has to leave the record *structurally* valid, or the case would pass
+    // on a length or name check instead and prove nothing about the checksum.
+    //
+    // Flipping the low bit of a hex digit does exactly that: '0' becomes '1', which is
+    // still a hex digit, so the name is still well formed, the counts still agree and
+    // the layout is unchanged. The checksum is the only thing that can notice.
+    const std::set<std::string> names = { name_of(1), name_of(2) };
+    std::string bytes = disk_cache_quarantine_serialize(names);
+
+    // find a hex digit inside the first name and flip its low bit
+    const size_t name_off = 8 + 4 + 4 + 4; // magic + version + count + name_len
+    CHECK(bytes[name_off] == 'p');
+    const size_t digit = name_off + 3;     // the first hex digit after "pc-"
+
+    const char before = bytes[digit];
+    bytes[digit] = (char) (before ^ 0x01);
+
+    // confirm the mutation keeps the name well formed, so the test is about the checksum
+    const std::string mutated = bytes.substr(name_off, 23);
+    CHECK(disk_cache_is_entry_name(mutated));
+    CHECK(mutated != name_of(1));
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse(bytes, out) == quarantine_parse::corrupt);
+}
+
+void test_a_silently_shorter_list_is_caught() {
+    // The scenario the old format could not detect: one whole record is gone, and the
+    // bytes are then made internally consistent - the count is reduced to match and the
+    // checksum is recomputed. Nothing about the structure or the names is wrong. Only a
+    // checksum that was written before the removal could tell, and this is exactly why
+    // the format carries one over the whole body.
+    //
+    // Concretely: a record that once held two names is edited down to one, correctly.
+    const std::set<std::string> two = { name_of(1), name_of(2) };
+    std::string original = disk_cache_quarantine_serialize(two);
+
+    // rebuild the same record with only the first name, done properly
+    std::string shortened = disk_cache_quarantine_serialize({ name_of(1) });
+
+    CHECK(original != shortened);
+    CHECK(shortened.size() < original.size());
+
+    // both are valid records on their own - which is the point: the shortened one is
+    // indistinguishable from a record that never held the second name
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse(original,  out) == quarantine_parse::ok);
+    CHECK(disk_cache_quarantine_parse(shortened, out) == quarantine_parse::ok);
+
+    // At startup the file on disk is whatever is there, so this is not detectable from
+    // the file alone. What protects against it is that the record is only ever written
+    // as a whole, atomically - so a name cannot disappear without the file being
+    // replaced in one step, and a half-replaced file is caught by the checksum.
+    //
+    // The checksum therefore has to be verified, or a record could be edited in place
+    // to drop a name and still read back cleanly. That is the property asserted here.
+    {
+        std::string edited = original;
+        // drop the last record's bytes and patch the count, then leave the checksum
+        // stale: a structurally plausible, silently shorter list
+        const size_t header = 8 + 4 + 4;
+        const size_t rec1   = 4 + name_of(1).size();
+
+        edited.erase(header + rec1, 4 + name_of(2).size());
+
+        uint32_t one = 1;
+        memcpy(&edited[12], &one, 4); // count now says 1
+
+        CHECK(disk_cache_quarantine_parse(edited, out) == quarantine_parse::corrupt);
+    }
+}
+
+void test_trailing_garbage_is_caught() {
+    const std::set<std::string> names = { name_of(1) };
+    std::string bytes = disk_cache_quarantine_serialize(names);
+
+    // append a byte before the checksum: the checksum then covers it and the extra
+    // data has nowhere to go in the layout
+    bytes.insert(bytes.size() - 8, 1, 'X');
+
+    std::set<std::string> out;
+    const quarantine_parse r = disk_cache_quarantine_parse(bytes, out);
+
+    // the checksum moved, so this is a mismatch rather than a layout error - either
+    // way it must not be accepted
+    CHECK(r != quarantine_parse::ok);
+}
+
+void test_unknown_name_in_record_is_rejected() {
+    // A record naming something that is not an entry file was not written by this code.
+    //
+    // Built by mutating a valid record rather than hand-assembling one: the checksum is
+    // recomputed by the serializer, so the case isolates the name check. A
+    // hand-assembled body with a wrong checksum would fail for the checksum instead and
+    // prove nothing about the name validation.
+    const std::string good = name_of(1);
+
+    // overwrite the ".bin" suffix with something that is not an entry name
+    std::string bad = good;
+    bad.replace(bad.size() - 4, 4, ".txt");
+
+    CHECK(!disk_cache_is_entry_name(bad));
+
+    // a record that names it must be refused, whatever the checksum says
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse(disk_cache_quarantine_serialize({ bad }), out) == quarantine_parse::corrupt);
+}
+
+void test_legacy_format_upgrades() {
+    // the old format: one name per line, no header, no checksum
+    const std::string legacy = name_of(1) + "\n" + name_of(2) + "\n";
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse_legacy(legacy, out) == quarantine_migrate::ok);
+    CHECK(out.size() == 2);
+    CHECK(out.count(name_of(1)) == 1);
+    CHECK(out.count(name_of(2)) == 1);
+
+    // and the upgraded form parses in the current format
+    std::set<std::string> again;
+    CHECK(disk_cache_quarantine_parse(disk_cache_quarantine_serialize(out), again) == quarantine_parse::ok);
+    CHECK(again == out);
+}
+
+void test_legacy_tolerates_crlf_and_blank_lines() {
+    const std::string legacy = name_of(1) + "\r\n\r\n" + name_of(2) + "\r\n";
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse_legacy(legacy, out) == quarantine_migrate::ok);
+    CHECK(out.size() == 2);
+}
+
+void test_legacy_truncated_tail_is_refused() {
+    // no trailing newline: the file may have been cut mid-name, and the old format
+    // cannot say which names it used to hold
+    const std::string cut_mid_name = name_of(1) + "\n" + std::string("pc-0123456789ab");
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse_legacy(cut_mid_name, out) == quarantine_migrate::corrupt);
+}
+
+void test_legacy_with_bad_line_is_refused() {
+    const std::string bad = name_of(1) + "\nnot-an-entry\n";
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse_legacy(bad, out) == quarantine_migrate::corrupt);
+}
+
+void test_legacy_rejects_duplicates() {
+    const std::string dupe = name_of(1) + "\n" + name_of(1) + "\n";
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse_legacy(dupe, out) == quarantine_migrate::corrupt);
+}
+
+void test_legacy_does_not_claim_the_current_format() {
+    // a current-format record must not be mistaken for a legacy one, or the upgrade
+    // path would rewrite a valid file
+    const std::string current = disk_cache_quarantine_serialize({ name_of(1) });
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse_legacy(current, out) == quarantine_migrate::not_old_format);
+}
+
+void test_binary_garbage_is_not_read_as_legacy() {
+    // arbitrary bytes must not be silently read as a short list
+    const std::string garbage = std::string("\x00\x01\x02\x03\xff\xfe", 6);
+
+    std::set<std::string> out;
+    CHECK(disk_cache_quarantine_parse_legacy(garbage, out) == quarantine_migrate::not_old_format);
+}
+
 } // namespace
 
 int main() {
@@ -278,6 +550,23 @@ int main() {
     test_healthy_protected_replacement_is_safe();
     test_only_this_attempt_may_be_charged_written_bytes();
     test_preexisting_path_is_never_measured_by_this_write();
+    test_entry_name_shape();
+    test_record_round_trips();
+    test_empty_set_round_trips();
+    test_serialization_is_deterministic();
+    test_truncated_record_is_rejected();
+    test_removing_a_record_from_the_bytes_is_caught();
+    test_crc_corruption_is_caught();
+    test_a_silently_shorter_list_is_caught();
+    test_trailing_garbage_is_caught();
+    test_unknown_name_in_record_is_rejected();
+    test_legacy_format_upgrades();
+    test_legacy_tolerates_crlf_and_blank_lines();
+    test_legacy_truncated_tail_is_refused();
+    test_legacy_with_bad_line_is_refused();
+    test_legacy_rejects_duplicates();
+    test_legacy_does_not_claim_the_current_format();
+    test_binary_garbage_is_not_read_as_legacy();
 
     if (g_failures == 0) {
         std::printf("all disk-cache lifecycle checks passed\n");

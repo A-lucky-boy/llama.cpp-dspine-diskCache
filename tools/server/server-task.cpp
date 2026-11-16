@@ -2416,17 +2416,46 @@ server_disk_cache::server_disk_cache(const std::string & dir, const std::string 
         return;
     }
 
-    // The quarantine record is read before the scan, because it is what tells the
-    // scan which files must not come back as usable. Loading it afterwards would
-    // mean the entries were already registered.
+    // The quarantine record is read before the scan, because it is what tells the scan
+    // which files must not come back as usable. Loading it afterwards would mean the
+    // entries were already registered.
     //
-    // It is read without the lock: nothing else is running yet, and the set is
-    // filled before the worker thread exists
-    load_quarantine(quarantined_names);
+    // The three outcomes are not interchangeable. A confirmed absence is the normal
+    // state of a cache that never failed a write, and the scan proceeds. A record that
+    // exists but cannot be validated is different: its whole purpose is to exclude
+    // paths, so being unable to read it means every entry whose path it might have
+    // named is suspect - and a name that is missing from a damaged record looks
+    // exactly like a name that was never there.
+    //
+    // Rather than publish entries whose quarantine state is unknown, the disk tier is
+    // disabled for this run. Inference is unaffected; only the disk cache is withheld,
+    // and the directory is left untouched so the record can be inspected.
+    {
+        std::set<std::string> loaded;
+        const disk_cache_quarantine_status qs = load_quarantine(loaded);
 
-    if (!quarantined_names.empty()) {
-        SRV_WRN("disk cache: %zu path(s) were left quarantined by a previous run; "
-                "they stay unusable until their files are confirmed gone\n", quarantined_names.size());
+        if (qs == disk_cache_quarantine_status::valid) {
+            quarantined_names = std::move(loaded);
+
+            if (!quarantined_names.empty()) {
+                SRV_WRN("disk cache: %zu path(s) were left quarantined by a previous run; "
+                        "they stay unusable until their files are confirmed gone\n", quarantined_names.size());
+            }
+        } else if (qs == disk_cache_quarantine_status::absent) {
+            // nothing was ever quarantined: the ordinary case
+        } else {
+            quarantine_untrusted = true;
+            active = false;
+
+            SRV_ERR("disk cache: the quarantine record in '%s' cannot be trusted (%s); "
+                    "the disk cache is disabled for this run and the directory is left as it is, "
+                    "because entries whose quarantine state is unknown must not be served\n",
+                    dir.c_str(),
+                    qs == disk_cache_quarantine_status::invalid ? "its contents do not validate"
+                                                                : "it could not be read");
+
+            return;
+        }
     }
 
     scan();
@@ -2949,7 +2978,15 @@ void server_disk_cache::scan() {
 
         if (surviving.size() != quarantined_names.size()) {
             quarantined_names = std::move(surviving);
-            save_quarantine(quarantined_names);
+
+            // A failure to record the clearing is not a correctness problem in either
+            // direction: the names kept on disk are the ones whose files were absent,
+            // and the next startup re-checks each of them against the directory anyway.
+            // It is reported rather than ignored so the discrepancy is visible
+            if (save_quarantine(quarantined_names) != disk_cache_commit_status::committed) {
+                SRV_WRN("%s", "disk cache: could not record the cleared quarantine entries; "
+                        "the previous record stays on disk and will be re-checked at the next startup\n");
+            }
         }
     }
 
@@ -2960,96 +2997,203 @@ void server_disk_cache::scan() {
             total_size/(1024.0*1024.0), (ggml_time_us() - t_scan_start)/1000.0);
 }
 
-// The quarantine sidecar: entry file names that must not be treated as usable until
-// the file is confirmed removed or measured.
+// The quarantine record: entry file names that must not be treated as usable until
+// the file is confirmed removed or the write that made it is confirmed committed.
 //
-// Why a sidecar rather than a manifest field: manifest v3 is a format whose
-// compatibility is required, and its records describe usable snapshots. A path that
-// exists only because a write failed is a different kind of fact, and one that must
-// outlive the process that learned it - an in-memory flag cannot do that, and adding
-// a field to the existing index would mean every older reader sees a record it does
-// not understand.
+// Why a separate file rather than a manifest field: manifest v3 is a format whose
+// compatibility is required, and each of its records describes a *usable* snapshot. A
+// path that exists because a write did not finish is a different kind of fact, and one
+// that has to outlive the process that learned it - an in-memory flag cannot do that.
 //
-// The format is one name per line. That has a useful failure mode: a torn write
-// yields fewer names, and a missing name means "ordinary entry", which the normal
-// startup validation then re-checks from the file itself. It never means "treat a
-// broken file as good".
-void server_disk_cache::save_quarantine(const std::set<std::string> & names) const {
+// ---------------------------------------------------------------------------
+// format
+//
+//   magic "LLDSCQ01" (8)
+//   version  uint32
+//   count    uint32
+//   for each record, in ascending name order:
+//       name_len uint32
+//       name     name_len bytes
+//   crc64    uint64   over everything above
+//
+// The count and the checksum are what make a damaged record *detectable*. The
+// previous line-based format had no such thing: a truncated file simply yielded
+// fewer names, and "a list that is missing a name" is indistinguishable from "a
+// list that never had it". That matters because a missing name does not mean "no
+// quarantine" - it means a path that should be excluded gets registered as a usable
+// snapshot instead.
+//
+// So an unreadable record is never treated as an empty one. The reader reports
+// `absent` only when it has confirmed there is no file, and `invalid`/`io_failure`
+// when there is one it cannot trust; the caller decides what that costs.
+
+// The format itself lives in server-disk-cache-quarantine.{h,cpp}: it is a file
+// format with its own rules, and the reader's behaviour on a damaged record is the
+// point of it, so it is exercised by unit tests on bytes rather than only through a
+// running server.
+
+disk_cache_commit_status server_disk_cache::save_quarantine(const std::set<std::string> & names) const {
     namespace fs = std::filesystem;
 
     const std::string path = dir + "/" + DISK_CACHE_QUARANTINE_NAME;
     const std::string tmp  = path + ".tmp";
 
     if (names.empty()) {
-        // nothing is quarantined: remove the record rather than leave an empty file.
-        // An absent sidecar and an empty one mean the same thing, and absence avoids
-        // a stray file in the cache directory
+        // no paths are excluded: an absent record and an empty one mean the same
+        // thing, and absence avoids a stray file in the cache directory
         std::error_code ec;
         fs::remove(path, ec);
-        return;
+
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            SRV_ERR("disk cache: cannot remove the empty quarantine record '%s' (%s)\n",
+                    path.c_str(), ec.message().c_str());
+            return disk_cache_commit_status::failed;
+        }
+
+        return disk_cache_commit_status::committed;
     }
+
+    const std::string bytes = disk_cache_quarantine_serialize(names);
 
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
-            SRV_WRN("disk cache: cannot write the quarantine record '%s'; "
-                    "quarantined paths will be re-validated from their files at startup\n", tmp.c_str());
-            return;
+            SRV_ERR("disk cache: cannot open the quarantine record '%s' for writing\n", tmp.c_str());
+            return disk_cache_commit_status::failed;
         }
 
-        for (const auto & n : names) {
-            // a name that cannot be round-tripped would corrupt the record, so it is
-            // left out and the file is validated normally instead
-            if (n.empty() || n.size() > 256 || n.find('\n') != std::string::npos) {
-                continue;
-            }
-
-            f << n << '\n';
-        }
-
+        f.write(bytes.data(), (std::streamsize) bytes.size());
         f.flush();
+
         if (!f) {
             f.close();
             std::error_code ec;
             fs::remove(tmp, ec);
-            SRV_WRN("disk cache: failed to write the quarantine record '%s'\n", tmp.c_str());
-            return;
+            SRV_ERR("disk cache: failed to write the quarantine record '%s'\n", tmp.c_str());
+            return disk_cache_commit_status::failed;
         }
     }
 
-    // atomic swap: a reader either sees the previous record or this one, never a
-    // half-written list
+    // Atomic replace. Measured on the target machine: std::filesystem::rename over an
+    // existing target succeeds and leaves no source behind, so no Win32-specific
+    // ReplaceFileW fallback is needed here (test-run/fsprobe.cpp records the check).
+    //
+    // The old record is never removed first: doing so would open a window with no
+    // record at all, which reads as "nothing is quarantined".
     std::error_code ec;
     fs::rename(tmp, path, ec);
 
     if (ec) {
         std::error_code ec_rm;
         fs::remove(tmp, ec_rm);
-        SRV_WRN("disk cache: failed to commit the quarantine record '%s'\n", path.c_str());
+
+        SRV_ERR("disk cache: failed to replace the quarantine record '%s' (%s); "
+                "the previous record, if any, is unchanged\n", path.c_str(), ec.message().c_str());
+
+        return disk_cache_commit_status::failed;
     }
+
+    return disk_cache_commit_status::committed;
 }
 
-bool server_disk_cache::load_quarantine(std::set<std::string> & out) const {
-    std::ifstream f(dir + "/" + DISK_CACHE_QUARANTINE_NAME, std::ios::binary);
-    if (!f) {
-        return false; // no record from a previous run
+disk_cache_quarantine_status server_disk_cache::load_quarantine(std::set<std::string> & out) const {
+    namespace fs = std::filesystem;
+
+    const std::string path = dir + "/" + DISK_CACHE_QUARANTINE_NAME;
+
+    // "there is no record" and "there is one I cannot read" must not be conflated, so
+    // existence is established explicitly before opening
+    std::error_code ec_exists;
+    const bool present = fs::exists(path, ec_exists);
+
+    if (ec_exists) {
+        SRV_ERR("disk cache: cannot determine whether a quarantine record exists (%s)\n",
+                ec_exists.message().c_str());
+        return disk_cache_quarantine_status::io_failure;
     }
 
-    std::string line;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-
-        if (!line.empty() && line.size() <= 256) {
-            out.insert(line);
-        }
+    if (!present) {
+        return disk_cache_quarantine_status::absent;
     }
 
-    return true;
+    std::string bytes;
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            SRV_ERR("%s", "disk cache: a quarantine record exists but cannot be opened\n");
+            return disk_cache_quarantine_status::io_failure;
+        }
+
+        bytes.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+        if (f.bad()) {
+            SRV_ERR("%s", "disk cache: failed while reading the quarantine record\n");
+            return disk_cache_quarantine_status::io_failure;
+        }
+
+        // The handle is closed here, before anything below may try to replace the file.
+        //
+        // On Windows a rename onto a target that is still open fails with "Access is
+        // denied" - measured, not assumed (test-run/fsprobe2.cpp). The migration path
+        // below writes the same file this function just read, so leaving the stream
+        // alive would make every upgrade fail. Scoping the read is what keeps the two
+        // operations from overlapping.
+    }
+
+    std::set<std::string> parsed;
+
+    switch (disk_cache_quarantine_parse(bytes, parsed)) {
+        case quarantine_parse::ok:
+            out = std::move(parsed);
+            return disk_cache_quarantine_status::valid;
+
+        case quarantine_parse::corrupt:
+            return disk_cache_quarantine_status::invalid;
+
+        case quarantine_parse::not_current_format:
+            break;
+    }
+
+    // An older record: one name per line, no header, no checksum. It is upgraded only
+    // when every line is a plausible entry name and the file ends on a line boundary.
+    //
+    // The unavoidable limitation, recorded here rather than papered over: the old
+    // format could not prove it was complete, so a name that was lost before the
+    // upgrade cannot be recovered from the bytes. What the upgrade does guarantee is
+    // that a file which is *visibly* truncated or holds impossible contents is refused
+    // instead of being accepted as a shorter list.
+    SRV_INF("%s", "disk cache: upgrading a quarantine record from the previous line format\n");
+
+    std::set<std::string> legacy;
+
+    switch (disk_cache_quarantine_parse_legacy(bytes, legacy)) {
+        case quarantine_migrate::ok:
+            break;
+
+        case quarantine_migrate::corrupt:
+            return disk_cache_quarantine_status::invalid;
+
+        case quarantine_migrate::not_old_format:
+            // neither a current record nor a plausible old one: this file was not
+            // written by either version of the writer
+            SRV_ERR("%s", "disk cache: quarantine record is in no recognised format\n");
+            return disk_cache_quarantine_status::invalid;
+    }
+
+    out = legacy;
+
+    // rewrite in the current format. A failure here is reported but does not discard
+    // what was read: the names are known now, and the caller is about to treat them as
+    // authoritative. The next write will try again
+    if (save_quarantine(out) != disk_cache_commit_status::committed) {
+        SRV_WRN("disk cache: could not upgrade the quarantine record in place; "
+                "the names were read and are being honoured\n", "");
+    }
+
+    return disk_cache_quarantine_status::valid;
 }
 
-void server_disk_cache::quarantine_paths_add(const std::vector<std::string> & paths) {
+disk_cache_commit_status server_disk_cache::quarantine_paths_add(const std::vector<std::string> & paths) {
     namespace fs = std::filesystem;
 
     // mtx must be held
@@ -3062,24 +3206,45 @@ void server_disk_cache::quarantine_paths_add(const std::vector<std::string> & pa
         }
     }
 
-    if (changed) {
-        save_quarantine(quarantined_names);
+    if (!changed) {
+        return disk_cache_commit_status::committed; // already excluded
     }
+
+    if (save_quarantine(quarantined_names) != disk_cache_commit_status::committed) {
+        // The in-memory set was updated but the record did not land. The caller has to
+        // know: a path that will be excluded only in this process is exactly the state
+        // a restart would lose
+        return disk_cache_commit_status::failed;
+    }
+
+    return disk_cache_commit_status::committed;
 }
 
-void server_disk_cache::quarantine_paths_drop(const std::string & path) {
+disk_cache_commit_status server_disk_cache::quarantine_paths_drop(const std::string & path) {
     namespace fs = std::filesystem;
 
     // mtx must be held
     const std::string name = fs::path(path).filename().string();
     if (name.empty()) {
-        return;
+        return disk_cache_commit_status::committed;
     }
 
-    if (quarantined_names.erase(name) > 0) {
-        save_quarantine(quarantined_names);
+    if (quarantined_names.erase(name) == 0) {
+        return disk_cache_commit_status::committed; // was not excluded
     }
+
+    if (save_quarantine(quarantined_names) != disk_cache_commit_status::committed) {
+        // The file is gone, but the record still names it. Putting the name back keeps
+        // memory and disk agreed, and the effect is only that a non-existent path stays
+        // listed - which the next startup clears. Losing the removal would be worse:
+        // the record would claim a path is excluded when the caller has just freed it
+        quarantined_names.insert(name);
+        return disk_cache_commit_status::failed;
+    }
+
+    return disk_cache_commit_status::committed;
 }
+
 
 bool server_disk_cache::load_manifest(std::map<std::string, disk_cache_manifest_meta> & out) {
     std::ifstream f(dir + "/" + DISK_CACHE_INDEX_NAME, std::ios::binary);
@@ -5332,6 +5497,37 @@ void server_disk_cache::worker() {
             }
 
             path_ok = path_owner_scratch == disk_cache_path_owner::free;
+
+            // The quarantine mark is written *before* the write, not after a failure.
+            //
+            // This is the ordering that matters. The rename makes the final path
+            // visible; everything after it - the size query, the admission pass, the
+            // manifest - can still fail, and the process can stop between any two
+            // steps. If the mark were written only once a failure was detected, a
+            // process that died in one of those windows would leave a file at the path
+            // with nothing recorded about it, and the next startup's header check
+            // would register it as an ordinary snapshot: the header proves the bytes
+            // are *a* snapshot, not that this path was ever successfully committed.
+            //
+            // Marking first means the worst case is a mark for a path that turned out
+            // fine - which the commit below withdraws, and which a startup clears if
+            // the file is absent. The mark is never wrong in the dangerous direction.
+            if (path_ok) {
+                if (quarantine_paths_add({ target }) != disk_cache_commit_status::committed) {
+                    // The record did not land, so this path would become visible with
+                    // no durable record of its state. Nothing has been written yet, so
+                    // the final path is untouched and the existing entries are intact -
+                    // declining the write is the whole cost
+                    SRV_ERR("disk cache: refusing to write '%s': its quarantine mark could not be "
+                            "recorded, so a restart could not tell the result was uncommitted\n",
+                            target.c_str());
+
+                    quarantine_paths_drop(target); // undo the in-memory part of the failed add
+                    quarantine_untrusted = true;
+
+                    path_ok = false;
+                }
+            }
         }
 
         if (!path_ok) {
@@ -5423,11 +5619,21 @@ void server_disk_cache::worker() {
                     ++n_size_unknown_paths;
                 }
 
-                // Recorded before the entry is published to `entries`, so the
-                // exclusion outlives this process: the in-memory flag is enough while
-                // this run lasts, but a restart would read the file back as ordinary
-                // unless the record says otherwise
-                quarantine_paths_add({ orphan.path });
+                // The durable mark was already written before this write began, so the
+                // exclusion already outlives this process. Re-recording it here would
+                // be redundant, and would also mask a case worth noticing: if the mark
+                // is somehow absent now, something removed it mid-transaction
+                const std::string orphan_name =
+                        std::filesystem::path(orphan.path).filename().string();
+
+                if (quarantined_names.count(orphan_name) == 0) {
+                    SRV_WRN("disk cache: '%s' is an orphan but carries no quarantine mark; "
+                            "recording one now\n", orphan.path.c_str());
+
+                    if (quarantine_paths_add({ orphan.path }) != disk_cache_commit_status::committed) {
+                        quarantine_untrusted = true;
+                    }
+                }
 
                 entries.push_back(orphan);
 
@@ -5637,7 +5843,24 @@ void server_disk_cache::worker() {
                 }
 
                 if (have_committed) {
-                    notify_committed(committed);
+                    // The transaction is finished and the entry is usable, so the
+                    // write-ahead mark has served its purpose and is withdrawn.
+                    //
+                    // Withdrawing it here, rather than when the file appeared, is what
+                    // keeps the two states consistent: between the rename and this
+                    // point the path was deliberately marked unusable, and only the
+                    // completed admission is evidence that it may be used.
+                    //
+                    // If the withdrawal cannot be recorded, the mark stays. That leaves
+                    // a usable file listed as quarantined until the next startup, which
+                    // costs a cache hit - the alternative would be a path whose state
+                    // memory and disk disagree about
+                    if (quarantine_paths_drop(path) != disk_cache_commit_status::committed) {
+                        SRV_WRN("disk cache: could not withdraw the quarantine mark for '%s'; "
+                                "it stays excluded until the next startup clears it\n", path.c_str());
+                    } else {
+                        notify_committed(committed);
+                    }
                 }
             }
         }

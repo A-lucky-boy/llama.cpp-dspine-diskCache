@@ -35,6 +35,8 @@ add_library(${TARGET} STATIC
     server-disk-cache-match.h
     server-disk-cache-quota.cpp
     server-disk-cache-quota.h
+    server-disk-cache-quarantine.cpp
+    server-disk-cache-quarantine.h
     server-prefix-materialize.cpp
     server-prefix-materialize.h
 )

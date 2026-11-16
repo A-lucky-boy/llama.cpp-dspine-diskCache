@@ -71,6 +71,10 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| 隔离记录是可校验格式 | `pc-quarantine.dat` 带 magic、version、记录数、确定性排序与**整份 body 的 CRC64**，读取严格校验并拒绝非法条目名、重复记录与尾随字节。无校验的逐行格式无法区分"少了几个名字"与"从来没有过"，而少一个名字就是本应被排除的路径被登记为可用。旧格式仅在每行合法且以换行结束时可原子升级——**升级前已丢失的名字不可追溯**，这是格式本身无法自证的 |
+| 隔离标记先于文件可见 | 侧车登记**在写 tmp 与 rename 之前**，提交确认后才撤销。原顺序（先写文件、失败后登记）在 rename 之后到 manifest 之间有多个可崩溃窗口，进程在那里停止会留下无记录的文件，而下次启动的 header 校验会把它当普通快照——header 只证明"这是一份快照"，不证明"这个路径曾被成功提交" |
+| 侧车不可读时禁用磁盘层 | 构造函数区分 `absent`/`valid`/`invalid`/`io_failure`。存在但无法校验时 `active=false` 且**不执行 scan**，目录与文件逐字节保留。正常推理不受影响，但 `reused_disk=0`、不再写盘 |
+| Windows 上读取方持有目标时无法替换 | 实测（`test-run/fs_replace_probe.cpp`）：rename 到**仍被打开**的目标以 `Access is denied` 失败，关闭后可成功。因此读取侧车的流必须在可能写回之前关闭——升级路径曾因此在每次运行都失败 |
 | 路径状态分三态 | `confirmed_absent` / `confirmed_present` / `unknown`。`fs::exists` 返回 false **并带错误码**表示查询未得到答案，不等于"文件不存在"；只有确认不存在才允许 `failed_clean`。`!path_owned` 下查询报错时不得继续 rename——所有权证明是覆写安全的前提 |
 | 隔离状态跨重启持久化 | 隔离信息在独立侧车 `pc-quarantine.dat`（每行一个条目名），不放进 manifest v3——那是描述可用快照的格式。侧车在 `scan()` **之前**读取；隔离检查置于 manifest 与 header 两个分支之前，两者都无法重新判其为可用。**不对称规则**：存在从不解除隔离，只有确认文件消失才解除 |
 | 孤儿记账按来源区分 | `written_bytes` 来自新写临时文件，若 rename 失败则最终路径上可能是更早的文件，该计数不对应它。`disk_cache_write_origin` 区分 `this_attempt` 与 `preexisting_unverified`；只有"本次放置且拿到实测大小"才可记账（`disk_cache_orphan_chargeable()`） |

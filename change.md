@@ -3434,3 +3434,191 @@ bool size_unknown = false;      // 路径占用空间但大小未能测得
 - `claim_path_locked()` 仍协调路径所有权；隔离只收紧错误路径的写入权限
 - 未调用 `notify_committed()` 于任何隔离路径；`notify_invalidated()` 仍只在锁内按真实生命周期交付
 - `--cache-disk-codec` 默认 `none`、`768 KiB/token` 守卫、4096-token 写入抑制、preflight、完整身份匹配、in-flight 保护**均未改动**
+
+# 2026-11-16 17-10 - Change Record（test1_5 修复轮：侧车可校验格式、写前标记、启动 fail-closed）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 15-22 - test1_5` 完善 `pc-quarantine.dat` 的事务一致性。规划 §二列出的 1–5 条均已由源码确认，第 6 条（Windows 替换语义）我实测后发现**规划的前提不完整**，并在实现中修掉了一个由此暴露的真实缺陷。基线 HEAD `03d806c`。
+
+## 一、已确认缺陷与修复
+
+### 1.1 侧车格式：无法区分"少了几个名字"与"从来没有过"
+
+**缺陷**：原格式是无 magic、无版本、无记录数、无校验的逐行文本。`load_quarantine()` 逐行读取，`if (!line.empty() && line.size() <= 256) out.insert(line);`——一个被截断的文件只是**返回更少的名字**，与"本来就没有那些名字"无法区分。而缺少一个名字意味着本应被排除的路径会被登记为可用快照。
+
+**修复**：新格式带 magic、version、记录数、确定性排序（`std::set` 升序）、逐条长度与**整份内容 CRC64**：
+
+```
+magic "LLDSCQ01" (8) | version u32 | count u32 | { name_len u32, name } * | crc64 u64
+```
+
+读取严格校验：magic/version 匹配、CRC 覆盖整个 body、每条名字长度合法、名字必须是 `pc-<16 hex>.bin` 形状、**不得重复**、记录必须恰好耗尽 body。任何一条不满足 → `corrupt`。
+
+**旧格式一次性迁移**：只有在**每行都是合法条目名**且**文件以换行结束**时才接受并原子升级。末尾无换行视为可能写到一半 → `corrupt`。含 NUL 或非打印字节 → 不是旧格式。
+
+**如实记录的不可追溯限制**：旧格式无法自证完整，因此升级前已经丢失的名字无法从字节恢复。迁移能保证的是：*可见地*截断或含非法内容的旧文件被拒绝，而不是被读成"短一点的名单"。
+
+### 1.2 写入与保存返回值
+
+`save_quarantine()` / `quarantine_paths_add()` / `quarantine_paths_drop()` 由 `void` 改为返回 `disk_cache_commit_status`。写入、flush、目标替换的失败不再只写日志后继续：
+
+- **添加失败** → worker **拒绝该次写入**，`path_ok = false`，最终路径不被触碰，`entries` 不变
+- **撤销失败** → 把名字放回内存集合，保持内存与磁盘一致，下次启动继续保守隔离
+- **scan 末尾清理失败** → 记录警告，旧记录留在盘上待下次启动复核
+
+**格式**：新格式独立成 `server-disk-cache-quarantine.{h,cpp}`。原因是它有自己的正确性规则（头、计数、校验和），而这些规则**需要在字节层面被测**——读取端在损坏记录上的行为正是格式的全部意义所在。
+
+### 1.3 启动 fail-closed
+
+`load_quarantine()` 返回 `absent` / `valid` / `invalid` / `io_failure`。构造函数显式检查：
+
+```text
+absent      → 正常空标记，继续 scan
+valid       → 载入标记后 scan
+invalid/io_failure → active = false，禁用磁盘层，保留目录与文件，不执行 scan
+```
+
+规划 §三.3 要求"禁止把当前目录文件作为可恢复缓存发布"。实现为 `active = false` + 提前返回——**扫描根本不执行**，因此不存在"先登记再撤销"的窗口。正常推理不受影响。
+
+### 1.4 写前标记（事务顺序）
+
+**缺陷**：原顺序是"写文件 → rename 可见 → 失败后才登记隔离"。rename 之后到 manifest 之间有准入、配额、通知多个步骤，进程可在任意两步之间停止。若在那些窗口崩溃，路径上会留下文件而无任何记录，下次启动的 header 校验会把它登记为**普通快照**——header 只能证明"这是一份快照"，不能证明"这个路径曾被成功提交"。
+
+**修复**：标记提前到**最终路径可见之前**：
+
+```text
+持锁确认路径所有权与身份
+  → 侧车登记并确认真正持久化
+      ├─ 失败：拒绝写入，不动最终路径，entries 不变
+      └─ 成功：写 tmp → rename → 取真实 file_size → 准入/配额/manifest
+              → 事务确认提交且条目可用 → 才撤销标记
+```
+
+最坏情况变成"为一个最终成功的写入留了一条标记"，由提交路径或下次启动按"文件不存在"清除。**标记在危险方向上永不错误**。
+
+## 二、实测发现：规划 §二第 6 条的前提不完整
+
+规划要求验证 Windows 上 `fs::rename` 能否替换已存在目标，"即便单次新建侧车成功，也不能据此断定后续新增/撤销可以覆盖旧侧车"。
+
+我写了探针（现为 `test-run/fs_replace_probe.cpp`，作为长期回归检查）。第一版探针（同一进程内新建两个文件再 rename）**通过**。但真实迁移路径**失败**：
+
+```
+save_quarant: failed to replace the quarantine record
+              'test-run/cache-leg/pc-quarantine.dat' (Access is denied.)
+```
+
+分离变量后定位到确切条件：
+
+```
+replace existing   : ok
+create target      : ok
+replace while open : Access is denied. (expected failure)   ← 目标被打开时
+replace after close: ok
+```
+
+**Windows 上，rename 到一个仍被打开的目标会以 Access is denied 失败。** 而 `load_quarantine()` 在同一个函数里先读该文件、再经迁移路径写回——**读取流仍然活着**时替换，所以每次升级都会失败。
+
+这是我上一轮引入的缺陷，本轮测试暴露并修复：把读取的 `std::ifstream` **限定在独立作用域内**，在可能发生写入之前关闭句柄。
+
+**规划的前提（"单次新建成功不足以证明后续可替换"）是对的，但方向猜错了**：真正的障碍不是"重命名语义不支持替换"，而是"读取方持有自己的目标"。仅按规划字面实现（换用 `ReplaceFileW`）会掩盖真正的原因。规划的实测要求因此是有价值的——它逼出了这条。
+
+## 三、修改文件
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：移除本地重复的侧车枚举，改为包含新头文件；侧车接口改为返回状态类型；新增 `quarantine_untrusted`
+- 具体变更：见 §一
+- 修改原因：规划 §三、§四
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：构造函数启动 fail-closed；`save_quarantine`/`load_quarantine`/`quarantine_paths_add/drop` 全部重写；`load_quarantine` 读取作用域收紧（§二）；worker 写前标记与提交后撤销；孤儿分支改为不重复登记；scan 尾部保存失败处理
+- 具体变更：见 §一、§二
+- 修改原因：规划 §三
+
+### tools/server/server-disk-cache-quarantine.h / .cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 修改位置：全文件
+- 具体变更：侧车格式的序列化/解析/旧格式迁移，含条目名形状校验
+- 修改原因：规划 §三.2（格式可校验、可测）
+
+### tools/server/CMakeLists.txt
+
+- 修改类型：修改
+- 修改前路径：tools/server/CMakeLists.txt
+- 修改前备份：无（本文件此前未被本轮备份流程覆盖；改动为纯追加两行源文件）
+- 修改后路径：同名文件
+- 修改位置：源文件列表
+- 具体变更：加入 `server-disk-cache-quarantine.cpp/.h`
+- 修改原因：新模块需要参与构建
+
+### tools/server/tests/unit/test_disk_cache_lifecycle.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_lifecycle.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 16 组侧车格式用例
+- 具体变更：见 §四
+- 修改原因：规划 §四
+
+### test-run/fs_replace_probe.cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 修改位置：全文件
+- 具体变更：原子替换语义的实测与长期回归检查
+- 修改原因：规划 §三.2（Windows 替换语义须实测）
+
+## 四、验证执行记录
+
+- 已执行检查：CUDA release 构建，本轮 7 次（其中 6 次为我的编译错误修正）
+- 检查结果：通过，`0 FAILED`。失败均为我自己的问题：`\n` 在 Python 字符串中被二次转义成字面换行；`SRV_ERR`/`SRV_WRN` 是变参宏，**单参数调用会展开成尾随逗号**（`C2059`），我新写的 10 处消息触发；一处缺 `fs` 别名
+
+- 已执行检查：九套独立测试（新增 fs 替换探针）
+- 检查结果：通过。codec / layout / lifecycle / match / quota / prefix-index / materialize / ASan codec / fs replace
+
+- 已执行检查：侧车格式单测
+- 检查结果：通过，27 组。**反向验证**：不校验 CRC 后 **2 项失败**；不校验名字形状后 1 项失败
+
+- 已执行检查：正常 v8 写入 + 提交
+- 检查结果：通过。564668394 字节；**无侧车产生**——写前标记在提交后被正确撤销
+
+- 已执行检查：**旧格式迁移真实文件**
+- 检查结果：通过（修复 §二 缺陷后）。侧车由 24 字节逐行格式升级为 51 字节新格式（magic `LLDSCQ01`），条目保持隔离
+
+- 已执行检查：**三种损坏侧车 fail-closed**
+- 检查结果：通过。截断 / 错 magic / 错 CRC 三种均报 `cannot be trusted`，**`scan performed: 0`**——一次都没登记；`active=false`；目录与损坏侧车**逐字节保留**待排查
+
+- 已执行检查：fail-closed 下推理正确性
+- 检查结果：通过。sha 一致；`reused_disk = 0`；**写盘次数 0**；目录未被改动
+
+- 已执行检查：清理
+- 检查结果：通过
+
+- **未执行的检查及原因**：
+  - **规划 §七第 6 项：四个精确中断点的异常结束**（写前标记成功→rename 前、rename 后未进 manifest、manifest 事务中断、commit 后侧车清理前）：**未执行**。需要在这四处可控地结束进程，本机没有相应的注入点；用 `taskkill /F` 只能杀死进程，无法选择停止位置。因此**写前标记的崩溃恢复语义只有代码推理与静态顺序，没有运行复现**。这是本轮最大缺口
+  - **侧车写入/替换失败的故障注入**：**未执行**。同上——无法让 `save_quarantine` 的写入或 replace 在受控条件下失败。§一.2 的失败分支（拒绝写入、撤销失败放回名字）**只有代码实现，没有运行证据**。写在只读目录之类的手段会影响其它 I/O，未采用
+  - **`touch_entry()` 端到端**：**仍未验证**（析构路径，本环境送不达 `CTRL_C_EVENT`），与前两轮相同
+  - **`n_size_unknown_paths` 在侧车失败后的语义**：未单独构造
+  - **媒体输入端到端**：测试机无多模态模型，`media_state_unverified` 门禁未变
+
+## 五、范围确认
+
+- 未改 v8/v9 payload、manifest v3、CRC64、完整 token/media 身份、原 target/draft 恢复语义（规划 §六.2）
+- 未改 `768 KiB/token` 守卫、4096-token 抑制、in-flight 完整身份判定、preflight（规划 §六.3）
+- 只有完成实际物理提交的可复用条目才发 `notify_committed()`；撤销标记失败时**不发送**通知
+- `pc-quarantine.dat` 仍是唯一持久隔离依据，未新增第二套文件名索引（规划 §六.4）
+- 未改 `src/llama-context.cpp` 的 state 协议、模型参数、DSpine 解码流程（规划 §五）
+- 未新增压缩器、KV 分块、checkpoint 去重
+- 配额算法未改；未知占用仍不可被视为零字节
