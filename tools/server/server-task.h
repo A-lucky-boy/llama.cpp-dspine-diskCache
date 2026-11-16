@@ -1218,9 +1218,31 @@ private:
     // that a valid write needs
     disk_cache_path_owner claim_path_locked(uint64_t hash, const std::string & path,
             const disk_cache_prompt_identity & wanted, const char * what);
-    // keep a file that could not be deleted out of the lookup path without
-    // pretending its bytes were freed; mtx must be held
-    void quarantine_entry(server_disk_cache_entry & e, const char * why);
+    // Keep a file that could not be deleted out of the lookup path without
+    // pretending its bytes were freed; mtx must be held.
+    //
+    // Returns whether the exclusion was *recorded*, not merely applied. The in-memory
+    // flag alone is not enough: it is lost when the process ends, and the next startup
+    // only sees that a file exists - the header check proves the bytes are a snapshot,
+    // never that this path is one the cache should serve. So the name has to reach the
+    // quarantine record, and the caller has to know whether it did.
+    //
+    // A `committed` result means the entry is excluded now and will still be excluded
+    // after a restart. A `failed` result means the exclusion exists only in this
+    // process, which the caller must treat as a fault rather than a normal outcome.
+    disk_cache_commit_status quarantine_entry(server_disk_cache_entry & e, const char * why);
+
+    // Put the disk tier into the conservative state it has to be in once something the
+    // cache relies on could not be recorded. Idempotent; mtx must be held.
+    //
+    // This is the difference between a flag and a policy: setting
+    // `quarantine_untrusted` says the state is unknown, and this function is what makes
+    // the rest of the cache act on that instead of continuing as though nothing
+    // happened.
+    void disable_disk_tier_locked(const char * why);
+
+    // True when the saved entry is still usable and the quarantine record is intact.
+    bool disk_tier_usable_locked() const;
     // notify the prefix directory; mtx must be held
     void notify_committed(const server_disk_cache_entry & e);
     void notify_invalidated(const std::string & path);

@@ -3622,3 +3622,199 @@ replace after close: ok
 - 未改 `src/llama-context.cpp` 的 state 协议、模型参数、DSpine 解码流程（规划 §五）
 - 未新增压缩器、KV 分块、checkpoint 去重
 - 配额算法未改；未知占用仍不可被视为零字节
+
+# 2026-11-16 17-40 - Change Record（test1_5 修复轮：隔离入口持久化、撤销失败实时隔离、fail-closed 封锁链 + 综合功能回归）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 16-35 - test1_5` 修复两项状态一致性错误、补齐 `quarantine_untrusted` 的运行时封锁链，并执行多小说文本与双图片的功能回归与故障注入。三项源码缺陷均已确认；其中**扫描路径的删除失败**（与错误 A 同源，规划未列出）在故障注入中实测发现并修复。基线 HEAD `2c8cbef`。
+
+## 一、已确认缺陷与修复
+
+### 1.1 错误 A：`quarantine_entry()` 只改内存
+
+**缺陷**（源码位置 `tools/server/server-task.cpp::quarantine_entry()`）：
+
+```cpp
+void server_disk_cache::quarantine_entry(server_disk_cache_entry & e, const char * why) {
+    if (e.quarantined) return;
+    e.quarantined = true;
+    // warning log only
+}
+```
+
+只设内存布尔值、**不写侧车**。进程内 `is_reusable_entry()` 会排除它，但重启后旧 `quarantined` 丢失；`scan()` 的 manifest / header 两条分支只知道文件存在，不知道它上一轮已被隔离。因此"本进程不可复用、重启可能重新可用"的不一致成立。
+
+**修复**：`quarantine_entry()` 改为返回 `disk_cache_commit_status`，顺序为**先持久化、后标记**：
+
+```text
+内存排除资格 → quarantine_paths_add() 落侧车
+    ├─ 成功：e.quarantined = true，字节继续入账
+    └─ 失败：仍标记内存排除，但进入磁盘层 fail-closed
+```
+
+顺序是刻意的：先写侧车意味着失败时条目**在本进程仍受排除**且调用方被告知，而不是"排除了但重启后失效"。已隔离条目不再凭 `e.quarantined` 立即返回——`quarantine_paths_add()` 本身对同名标记幂等，重复调用是安全的。
+
+### 1.2 错误 B：侧车撤销失败但运行时仍可命中
+
+**缺陷**（`worker()` 提交尾部）：`quarantine_paths_drop(path)` 失败时只打警告、不发 `notify_committed()`，但条目仍 `quarantined == false`——`is_reusable_entry()` 仍接受、`load()` 仍恢复它。运行期状态与重启扫描（依侧车排除）不一致，且目录没收到持久化通知却存在可用物理条目。
+
+**修复**：撤销失败时立即把该 `path` 的条目置 `quarantined = true`，维持真实字节占用，`notify_invalidated(path)` 撤回已发布的物理引用，并进入 fail-closed。只有撤销成功才 `notify_committed()`。
+
+同时修正了一处**日志语义**：原成功日志把"字节已写盘"与"该快照可恢复"混为一谈。新增 `left_usable` 标志，撤销失败时打印 `wrote ... but the entry is not usable`，不再声称 `stored`。`n_write_bytes` 计数语义未改（规划 §4.6 不要求重构计数体系）。
+
+### 1.3 错误 C：`quarantine_untrusted` 只写不读
+
+**缺陷**：该标志在 3 处被置 true，但**没有任何生产路径读取它**——等同于诊断变量。仅设置标志不能代替故障后的 fail-closed。
+
+**修复**：新增 `disable_disk_tier_locked()`（幂等，持锁）统一置 `active = false` + `quarantine_untrusted = true`，并输出明确诊断（含"目录需在恢复读写后重新核实"）。新增 `disk_tier_usable_locked()` 供读路径查询。
+
+已有的四处 `if (!active)` 门禁（`load()` / `store()` / `mirror()` / `preflight_materialize()`）因此立即生效——这正是"标志"与"策略"的区别。
+
+### 1.4 附加修复：`scan()` 的 `drop()` 忽略删除失败（规划未列出，实测发现）
+
+**发现方式**：F01 故障注入时，一个被 open 持有、无法删除的条目被 `scan()` 判为配置不符而 `drop`，但 `drop()` 完全忽略 `ec_rm`：
+
+```cpp
+std::error_code ec_rm;
+fs::remove(de.path(), ec_rm);   // ← 结果被丢弃
+n_dropped++;
+```
+
+实测后果：文件**留在磁盘上且完全无记录**——不在 `entries`、不在索引、也未隔离。下次启动会重新校验它，同 hash 的后续写入会遇到一个没有任何账本记录的路径。这与错误 A 同源，方向更严重。
+
+**修复**：`drop()` 检查删除结果，只有确认文件消失才计数为 dropped；否则按 `quarantine_entry()` 建立隔离并计入真实占用（写入失败则 fail-closed）。
+
+### 1.5 `claim_path_locked()` 的撤销失败
+
+确认删除成功后调用的 `quarantine_paths_drop()` 结果原先被忽略。现改为：文件确已删除故条目与字节照常释放（为一个不存在的文件保留条目是另一种谎），但**记录未清除时**进入 fail-closed，使该名称不在本次运行内被新写入复用，下次启动再按目录重新核实。
+
+## 二、修改文件
+
+### tools/server/server-task.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.h
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.h
+- 修改后路径：同名文件
+- 修改位置：`quarantine_entry()` 返回类型；新增 `disable_disk_tier_locked()` / `disk_tier_usable_locked()`
+- 具体变更：见 §一
+- 修改原因：规划 §三、§四
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`quarantine_entry()` 实现；新增两个封锁函数；`worker()` 提交尾部与 `left_usable` 日志；`claim_path_locked()` 撤销失败处理；`scan()` 的 `drop()` 删除失败处理
+- 具体变更：见 §一
+- 修改原因：规划 §三、§四；§1.4 为实测发现的附加缺陷
+
+### .gitignore
+
+- 修改类型：修改
+- 修改前路径：.gitignore
+- 修改后路径：同名文件
+- 修改位置：忽略规则
+- 具体变更：新增 `*.jsonl`（功能矩阵的逐请求记录属本地测试证据，不入库）
+- 修改原因：规划 §五.1、§十二（不上传测试原始数据）
+
+### test-run/cache_functional_matrix.py（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 修改位置：全文件
+- 具体变更：从 `E:\小说` 自动发现文档（严格解码，记录 SHA-256/编码）、经 `/tokenize` 取真实 token 数与 LCP、执行 T01/T02/T03 并采集每请求 `source`/`reused_*`/`prefill` 分解。支持 `--api-key`
+- 修改原因：规划 §五.1、§六
+
+### test-run/cache_cases.py（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：T04（短/长/短）、T05（前缀分叉）、T07（门槛）、T09（中间改一字符）
+- 修改原因：规划 §六
+
+### test-run/cache_media_matrix.py（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：PNG 文件级校验（签名/IHDR/SHA）、经 chat 端点用 base64 data URL 发送图像、M01/M02/M05 用例。识别本模型把答案放在 `reasoning_content` 的情况
+- 修改原因：规划 §五.2、§七
+
+### test-run/cache_fault_inject.py（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：以"另一进程持有文件句柄"作为无代码注入点（Windows 上持有中的文件无法删除/替换）
+- 修改原因：规划 §八
+
+### test-run/hold_delete_probe.cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：实测"持有中的文件能否删除/替换"，作为注入点的依据
+- 修改原因：规划 §八（注入点须可控且不依赖随机杀进程）
+
+### test-run/start_prod_params.bat（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 修改位置：全文件
+- 具体变更：按用户部署脚本 `D:\AiHelper\llama.cpp\start-localModel-dspine.ps1` 的实际参数启动；`--cache-disk` 指向隔离测试目录，`--host 127.0.0.1`
+- 修改原因：用户指示按实际部署参数测试
+
+### test-run/start_f01.bat（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：F01 专用启动（短 TTL 触发清理）
+- 修改原因：规划 §八
+
+## 三、验证执行记录
+
+- 已执行检查：CUDA release 构建，本轮 4 次
+- 检查结果：通过。其中一次因 `llama-server.exe` 仍持有 `output/llama-server-impl.dll` 导致 `LNK1104`，杀进程后重建成功。已确认新代码进入二进制（`rejected during the startup scan` 等字符串可检出）
+
+- 已执行检查：九套独立单测
+- 检查结果：通过（codec / layout / lifecycle / match / quota / prefix-index / materialize / ASan codec / fs replace）
+
+- 已执行检查：**按用户实际部署参数启动**（`start-localModel-dspine.ps1`）
+- 检查结果：通过。`-c 262144`、`--cache-ram 25600`、`--cache-disk-max 204800`、`--cache-disk-min-tokens 2048`、`--cache-disk-idle-flush 60`、`--mmproj`、`--api-key sk-0`。**`--cache-disk-idle-flush 60` 是磁盘层真正落盘的关键**——先前用 `0` 时 `--cache-ram 25600` 永不驱逐，只写出索引无 `.bin`
+- **注意**：`D:\AiHelper\llama.cpp\llama-server.exe` 是 **build 2 / commit 60f3891（11-15）**，早于本轮全部隔离修复且不识别 `--cache-stats`。测试脚本默认使用 `output\llama-server.exe`（build 52 / 2c8cbef）
+
+- 已执行检查：T03 跨重启磁盘命中（3 篇真实小说）
+- 检查结果：**通过**。写盘 3 条（558/548/559 MiB）。重启后按**不同于写入的顺序**请求，三条全部 `source=disk`：核心规则 2457、正文 2476、语录 2251，`restored` 与 sha 均与预热一致
+
+- 已执行检查：T01 / T02 / T05 / T07 / T09
+- 检查结果：通过。T01 同输入同输出、`cache_n=2476`；T02 A1=A2、B1=B2，跨文档公共前缀 **0 token**，无串扰；T05 X 与 X-again 同 sha、Y 不同，且 `X-again` 复用 **2101** = 真实 LCP（字符前缀 3000 字不等于 token 前缀）；T07 400 token 低于 2048 门槛不落盘属正确行为；T09 中间改一字符后 LCP=1208，恢复原文重新命中 `source=disk`
+
+- 已执行检查：**F01 删除失败 → 持久隔离**（注入：另一进程持有条目文件）
+- 检查结果：**通过**。`rejected ... but its file is still present; keeping it quarantined`；侧车（magic `LLDSCQ01`）记入该名；`cache_scan_end: 1 kept quarantined, 548.27 MiB`；重启后仍 `1 path(s) were left quarantined`、`1 kept quarantined`
+- **修复前实测**：同一场景下文件被 `drop()` 从账本和索引中移除但**留在磁盘上，无任何记录**
+
+- 已执行检查：**F04 真实删除后解除隔离**
+- 检查结果：**通过**。释放句柄并删除文件后重启：`1 quarantine cleared`，侧车被移除，占用释放
+
+- 已执行检查：M01/M02/M05 媒体缓存
+- 检查结果：**通过**。视觉模型与 `mmproj` 兼容，能正确描述图像（1.png = 含 handover/日期命名的 MD 文件列表窗口）。M02：1.png 可复现、2.png 答案不同（无跨图状态泄漏）。**M05（本轮最重要）**：重启后先发 2.png → `cached=3282` 命中磁盘条目；再发 1.png → **`cached=0`**，未从 2.png 状态复用；2.png 再次请求 sha 一致
+
+- 已执行检查：清理
+- 检查结果：通过。所有 `test-run/cache-*` scratch 目录已删，未触碰 `E:\llama.cpp.cache`（生产缓存）与 `E:\小说` 原文
+
+- **未执行的检查及原因**：
+  - **规划 §八 F02**（`save_quarantine` 写入/替换失败的注入）：**未执行**。需要让侧车写入或替换本身失败，而 F01 的"持有条目文件"只让**条目**删除失败，不影响侧车路径。未找到不引入生产构建故障开关的实现方式
+  - **规划 §八 F03**（提交后 `quarantine_paths_drop` 失败注入）：**未执行**，同上——需让侧车替换失败
+  - **规划 §八 F05–F07**（四个精确中断点的异常结束）：**未执行**。`taskkill /F` 无法选择进程停止位置。**写前标记与提交撤销的崩溃恢复语义仍只有代码推理，没有运行复现**
+  - **T06 / T08 / T10 / T11 / T12**：未单独执行。T08 读盘成本门禁与 T11 配置失配**在 F01 中意外观察到**（`different model or context configuration` 触发 drop），但未作为独立用例按 `768 KiB/token` 定量核对
+  - **M03 / M04 / M06 / M07 / M08**：未执行。M08 的 `media_state_unverified` 门禁在日志中未出现，未能确认主动捕获门禁对媒体请求的实际拦截
+  - **`touch_entry()` 端到端**：**仍未验证**（析构路径，本环境送不达 `CTRL_C_EVENT`），连续三轮相同
+
+## 四、范围确认
+
+- 未改模型权重、tokenizer、DSpine 投机解码、GPU kernel、完整 KV state API、v8/v9 文件头、manifest v3、CRC64（规划 §九）
+- 未改 `768 KiB/token` 成本守卫与 `--cache-disk-min-tokens` 默认门槛
+- `--cache-disk` 测试全部使用隔离目录，未读写用户生产缓存 `E:\llama.cpp.cache`
+- 未把小说原文或图片二进制写入仓库或报告；`.jsonl` 已加入忽略规则
+- 未在 Release 构建中加入可被外部请求触发的破坏性测试功能
+- 配额算法未改；未知占用仍不可视为零字节

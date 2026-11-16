@@ -2585,8 +2585,20 @@ disk_cache_path_owner server_disk_cache::claim_path_locked(uint64_t hash, const 
 
             // the file is gone, so the path no longer needs to be excluded across
             // restarts either - this is the one place a quarantine is lifted on a
-            // confirmed removal during a run
-            quarantine_paths_drop(path);
+            // confirmed removal during a run.
+            //
+            // The result is checked rather than discarded. The file is confirmed absent,
+            // so the entry and its bytes are released either way - leaving an entry for
+            // a file that no longer exists would be a different lie. But if the record
+            // cannot be updated it still names this path, and a name that the durable
+            // record calls excluded must not be handed to a new write. That is what the
+            // conservative mode is for: the tier stops, so the name is not reused within
+            // this run, and the next startup re-checks the record against the directory.
+            if (quarantine_paths_drop(path) != disk_cache_commit_status::committed) {
+                SRV_ERR("disk cache: removed '%s' but could not clear its quarantine record\n", path.c_str());
+
+                disable_disk_tier_locked("a quarantine record could not be cleared after a confirmed removal");
+            }
 
             notify_invalidated(path);
             it = entries.erase(it);
@@ -2641,15 +2653,58 @@ disk_cache_remove_status server_disk_cache::remove_file(const std::string & path
     return disk_cache_remove_status::failed;
 }
 
-void server_disk_cache::quarantine_entry(server_disk_cache_entry & e, const char * why) {
-    if (e.quarantined) {
+void server_disk_cache::disable_disk_tier_locked(const char * why) {
+    // mtx must be held. Idempotent, because it is reached from several failure paths
+    // and the first one is the only one that has anything new to say.
+    if (!active && quarantine_untrusted) {
         return;
     }
 
+    active = false;
+    quarantine_untrusted = true;
+
+    SRV_ERR("disk cache: the disk tier is now disabled for the rest of this run: %s\n"
+            "disk cache: existing files are left where they are, no further snapshot will be\n"
+            "disk cache: written or restored, and the directory must be re-checked once it can be\n"
+            "disk cache: read and written again - a state that could not be recorded cannot be\n"
+            "disk cache: assumed to be absent after a restart\n", why);
+}
+
+bool server_disk_cache::disk_tier_usable_locked() const {
+    return active && !quarantine_untrusted;
+}
+
+disk_cache_commit_status server_disk_cache::quarantine_entry(server_disk_cache_entry & e, const char * why) {
+    // mtx must be held.
+
+    // The name is recorded first, then the entry is marked. If the record cannot be
+    // written the in-memory flag would be the only trace of the exclusion, and that is
+    // precisely the state that disappears at process exit: the next startup would see a
+    // file and a header that validates, and register it as an ordinary snapshot.
+    //
+    // So the order is deliberate - the durable part first, so that a failure leaves the
+    // entry *servable in this process* and the caller informed, rather than excluded in
+    // a way that will not survive.
+    const disk_cache_commit_status recorded = quarantine_paths_add({ e.path });
+
     e.quarantined = true;
+
+    if (recorded != disk_cache_commit_status::committed) {
+        // The exclusion exists only here. Continuing normally would mean the cache is
+        // serving from paths whose state a restart cannot reconstruct, so the tier stops
+        // instead. The entry keeps its bytes accounted either way - the file is still on
+        // disk and must not look freed.
+        SRV_ERR("disk cache: '%s' %s, and the quarantine record could not be updated\n",
+                e.path.c_str(), why);
+
+        disable_disk_tier_locked("a path that could not be deleted also could not be recorded as excluded");
+        return disk_cache_commit_status::failed;
+    }
 
     SRV_WRN("disk cache: '%s' %s, keeping %.2f MiB accounted for and excluding it from lookups\n",
             e.path.c_str(), why, e.size_file/(1024.0*1024.0));
+
+    return disk_cache_commit_status::committed;
 }
 
 void server_disk_cache::notify_committed(const server_disk_cache_entry & e) {
@@ -2848,13 +2903,53 @@ void server_disk_cache::scan() {
             continue;
         }
 
+        // Drop an entry that cannot be used, and record it if it cannot be removed.
+        //
+        // A file that is rejected but stays on disk must not simply disappear from the
+        // ledger. It would then be invisible: not in `entries`, not in the index, and
+        // nothing recording that its bytes are there. The next startup would find it
+        // again and re-run this same validation, and a later write of the same hash
+        // would meet a path no record accounts for.
+        //
+        // The removal result is therefore checked, not assumed. A confirmed removal
+        // frees the path; anything else leaves the name quarantined so it is accounted
+        // for and excluded, and the tier is disabled if even that cannot be recorded.
         auto drop = [&](const char * reason) {
             SRV_WRN("disk cache: dropping '%s': %s\n", de.path().string().c_str(), reason);
             f.close();
 
             std::error_code ec_rm;
             fs::remove(de.path(), ec_rm);
-            n_dropped++;
+
+            std::error_code ec_still;
+            const bool still_there = fs::exists(de.path(), ec_still);
+
+            if (!ec_rm && !ec_still && !still_there) {
+                n_dropped++;
+                return;
+            }
+
+            SRV_ERR("disk cache: '%s' was rejected (%s) but its file is still present%s; "
+                    "keeping it quarantined\n",
+                    de.path().string().c_str(), reason,
+                    ec_still ? " (its state could not be confirmed)" : "");
+
+            server_disk_cache_entry e;
+            e.path        = de.path().string();
+            e.size_file   = (uintmax_t) fsize;
+            e.last_used   = 0;
+            e.quarantined = true;
+
+            // the same routine the eviction paths use, so the durable record is written
+            // and a failure to write it disables the tier rather than being swallowed
+            if (quarantine_entry(e, "rejected during the startup scan") != disk_cache_commit_status::committed) {
+                n_quarantined_kept++;
+                return;
+            }
+
+            total_size += e.size_file;
+            entries.push_back(std::move(e));
+            n_quarantined_kept++;
         };
 
         char magic[8];
@@ -5542,6 +5637,11 @@ void server_disk_cache::worker() {
 
         const bool ok = write.outcome == disk_cache_write_outcome::committed;
 
+        // "the bytes reached the disk" and "this snapshot can be restored" are different
+        // claims, and a write that succeeded but could not be left usable must not be
+        // reported as though only the first happened
+        bool left_usable = ok;
+
         {
             std::lock_guard<std::mutex> lock(mtx);
 
@@ -5851,13 +5951,39 @@ void server_disk_cache::worker() {
                     // point the path was deliberately marked unusable, and only the
                     // completed admission is evidence that it may be used.
                     //
-                    // If the withdrawal cannot be recorded, the mark stays. That leaves
-                    // a usable file listed as quarantined until the next startup, which
-                    // costs a cache hit - the alternative would be a path whose state
-                    // memory and disk disagree about
+                    // If the withdrawal cannot be recorded, the two sides would
+                    // disagree: the record still names this path while the entry in
+                    // `entries` is an ordinary usable one. In-memory usability is not a
+                    // substitute for the record - `load()` and `is_reusable_entry()`
+                    // read the entry, but a restart reads the record - so the entry is
+                    // brought into line with the record instead of the other way round.
                     if (quarantine_paths_drop(path) != disk_cache_commit_status::committed) {
                         SRV_WRN("disk cache: could not withdraw the quarantine mark for '%s'; "
-                                "it stays excluded until the next startup clears it\n", path.c_str());
+                                "the entry is excluded now and stays excluded after a restart\n", path.c_str());
+
+                        bool marked = false;
+
+                        for (auto & cur : entries) {
+                            if (cur.path == path) {
+                                cur.quarantined = true;
+                                marked = true;
+                                break;
+                            }
+                        }
+
+                        // the path is no longer servable, so any persisted reference to it
+                        // must be withdrawn - the directory would otherwise hold a
+                        // reference the disk tier itself refuses to load
+                        if (marked) {
+                            notify_invalidated(path);
+                        }
+
+                        // and a record that could not be updated leaves the tier unable
+                        // to reconstruct its own state, which is the condition the
+                        // conservative mode exists for
+                        disable_disk_tier_locked("the quarantine record could not be updated after a commit");
+
+                        left_usable = false;
                     } else {
                         notify_committed(committed);
                     }
@@ -5868,8 +5994,15 @@ void server_disk_cache::worker() {
         if (ok) {
             counters.n_write_bytes += size_file;
 
-            SRV_INF("disk cache: stored %zu tokens, %.2f MiB in %.2f ms\n",
-                    n_tokens, size_file/(1024.0*1024.0), (ggml_time_us() - t_start)/1000.0);
+            if (left_usable) {
+                SRV_INF("disk cache: stored %zu tokens, %.2f MiB in %.2f ms\n",
+                        n_tokens, size_file/(1024.0*1024.0), (ggml_time_us() - t_start)/1000.0);
+            } else {
+                // the file is on disk and its bytes are accounted for, but it is not a
+                // snapshot this cache will restore
+                SRV_WRN("disk cache: wrote %zu tokens, %.2f MiB in %.2f ms, but the entry is not usable\n",
+                        n_tokens, size_file/(1024.0*1024.0), (ggml_time_us() - t_start)/1000.0);
+            }
 
             // throttle a burst of large writes so the disk stays responsive for
             // inference; only kicks in once a chunk's worth has been written
