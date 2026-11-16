@@ -20,6 +20,70 @@ The cache tier never changes computed results: an entry holds the KV bytes that 
 
 ---
 
+## How the disk cache works, and what it buys
+
+### The idea
+
+The KV state produced by prefilling a long prefix is, in the end, **deterministic bytes**: the same model, the same tokens and the same context configuration produce the same KV. All the cache does is keep those bytes and read them back the next time the same prefix appears, instead of recomputing them.
+
+```
+request -> slot (KV already held by this slot)
+             | miss
+          RAM prompt cache (--cache-ram)
+             | miss / eviction / idle mirror
+          disk KV state cache (--cache-disk) -> pc-<hash>.bin
+```
+
+Four design decisions carry the weight:
+
+**Content addressing.** An entry's filename is the hash of its token sequence plus media identity, so a hash match *is* a path match. When the identity differs, the write is refused rather than overwriting - a file is never lost because two prompts happened to share leading hash digits.
+
+**Matching by token-level longest common prefix.** A hit does not require an exact match: of two requests sharing a 100K-token prefix, the second only recomputes the part after they diverge. Media chunk identity (position, length, ID) takes part in the comparison, and both directions are scanned so the earliest divergence wins.
+
+**What is stored is the result, not the computation.** A hit reads back exactly the KV bytes that were written, which is why the cache **cannot change any result**: with the same configuration, generation is byte-identical whether the cache is on or off.
+
+**Reads validate before they restore.** The packed-metadata CRC, the structural bounds, the agreement with the index record and every state payload's CRC are all checked *before* any KV is written back, so a failing entry never reaches the slot's KV. Failures are split by kind: deterministic damage (CRC/length/signature mismatch) deletes the entry, while possibly-transient failures (file busy, VRAM pressure) keep it for a later retry.
+
+### What it buys
+
+**1. Restoring a long prefix is far cheaper than recomputing it.** Measured on this machine (spinning disk):
+
+| Operation | Time |
+|---|---|
+| Full prefill of 123K tokens | about 98 s |
+| Read + restore a 3 GiB entry | about 17 s |
+| Write a 3 GiB entry | about 20 s |
+
+Reads run at about 180 MiB/s and writes at 130-155 MiB/s, while prefill throughput is only 1.25-1.4K t/s at both 6K and 90K context. The longer the prefix, the larger the gain - restore cost tracks **entry size**, whereas recompute cost tracks the actual prefix length.
+
+**2. It survives a restart.** This is the substantive difference from a purely in-memory cache: a long prefix still hits after the process exits, the machine reboots, or a new session starts. Each entry carries a configuration signature (model path + `size@mtime`, K/V types, `n_ctx`, `n_parallel`, `kv_unified`, plus the mmproj signature when enabled), so changing the configuration invalidates the whole set instead of feeding one configuration's KV to another.
+
+**3. It does not write for nothing.** **Write suppression**: when an existing entry already shares everything but a short tail with the prompt about to be written, the write is skipped. Rewriting a 2.7 GiB entry on a 150 MiB/s disk costs about 18 s, while recomputing a 4K-token tail costs about 3 s. How far the stored prefix may lag is capped at 4096 tokens so the entry does not go stale.
+
+**4. Correctness is not traded for speed.** This is where most of the effort went:
+
+- **Cost guard**: an entry larger than `lcp x 768 KiB` is not used. Reading an 8 GiB entry to serve a 100-token request is slower than recomputing, and such a "hit" is not counted as one.
+- **An untrusted state disables rather than limps along**: if the quarantine record cannot be read, the disk tier stops entirely (`reused_disk=0`) while the directory is left intact for inspection - normal inference is unaffected.
+- **A file that could not be deleted is quarantined and accounted for**: it still counts against disk usage and is excluded from lookups until its removal is confirmed, so it never becomes a file that exists with nothing recording it.
+- **Counters are never conflated**: `candidate_lcp` (shared by a candidate), `restored` (what the entry actually restored) and `reused_*` (tokens genuinely exempted from prefill) stay distinct, with the identity `prompt = reused_slot + reused_ram + reused_disk + prefill`. A cache that looks like it hit is therefore never confused with one that saved real work.
+
+**5. It stays out of inference's way.** Serialization and writing happen on a separate background thread, yielding 10 ms per 256 MiB so a burst of evictions cannot starve inference of disk IO. A restore reads only the checkpoint that does not cross the divergence point and seeks past the rest.
+
+**6. It is observable.** Tiered logging covers hits, restores, writes, skipped writes, evictions and reject reasons; `--cache-stats` prints the per-request token breakdown and reject reason, with the matching counters on `/metrics`. When reuse does not happen, the log says which tier and why.
+
+### What it costs, and where the edges are
+
+- **The first request always prefills in full** - a cache only helps a repeated prefix.
+- **Entries can be large**: a long session grows to the 8 GiB range as checkpoints accumulate (a single state carries about 151 MiB of fixed overhead independent of context length). Lowering `--n-ctx-checkpoints` shrinks entries substantially at the cost of fewer usable origins on a partial hit.
+- **A restore reads the whole entry file**, so a long entry with a poor hit rate reads a lot for little.
+- **Each new turn of a conversation produces a new entry**; write suppression only stops the small increments, and a cumulative growth past 4096 tokens still triggers a rewrite. The write queue is bounded by `--cache-disk-queue-max`, so when writes cannot keep up the entry is dropped and the log records `write queue is full, skipping`.
+- **Killing the process skips destructors**, so persistence then depends on the idle mirror (`--cache-disk-idle-flush`, 60 s by default) or on RAM eviction.
+- **The disk tier follows the RAM prompt cache**: `--cache-ram 0` switches `--cache-disk` off with it, while any non-zero value leaves it working regardless of size.
+
+Practical advice for hits: keep system prompts, tool definitions and few-shot examples static and at the front; push timestamps and usernames later; append to multi-turn conversations rather than rewriting them. Details are in section 6, *Two-tier prefix cache*.
+
+---
+
 ## 1. Requirements
 
 | Item | Version |
