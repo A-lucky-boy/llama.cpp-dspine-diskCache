@@ -32,6 +32,14 @@ namespace {
 constexpr size_t LZ_MIN_MATCH  = 3;
 constexpr size_t LZ_MAX_MATCH  = 128;   // 125 + 3, the most a tag byte can express
 constexpr size_t LZ_MAX_OFFSET = 1 << 16;
+
+// The hash reads four bytes, so a position is only a valid hash source when four
+// bytes remain. This is deliberately a separate constant from LZ_MIN_MATCH: the
+// smallest match is three bytes, but the hash window is four, and conflating them
+// is exactly how the tail of a buffer gets read out of bounds. A position with only
+// three bytes left is still a fine place for the encoder to *be* - it just cannot be
+// hashed, so it stays a literal.
+constexpr size_t LZ_HASH_BYTES = 4;
 constexpr size_t LZ_HASH_BITS  = 15;
 constexpr size_t LZ_HASH_SIZE  = (size_t) 1 << LZ_HASH_BITS;
 constexpr uint8_t LZ_FLAG_MATCH = 0x01;
@@ -146,7 +154,9 @@ disk_cache_codec_id disk_cache_codec_encode(const void * src_ptr, size_t src_len
     std::vector<int32_t> prev(n, -1);
 
     auto insert_pos = [&](size_t p) {
-        if (p + 4 <= n) {
+        // the same window the lookup uses: hashing reads four bytes, so a position
+        // near the end that cannot supply them is simply not inserted
+        if (n - p >= LZ_HASH_BYTES) {
             const uint32_t h = lz_hash(&srcp[p]);
             prev[p] = head[h];
             head[h] = (int32_t) p;
@@ -160,7 +170,10 @@ disk_cache_codec_id disk_cache_codec_encode(const void * src_ptr, size_t src_len
         size_t best_len  = 0;
         size_t best_dist = 0;
 
-        if (pos + LZ_MIN_MATCH <= n) {
+        // A candidate needs four bytes to hash, not three to match. Using
+        // LZ_MIN_MATCH here left the last three bytes of a buffer reading one byte
+        // past its end: at `n - pos == 3` the hash loaded `srcp[pos+3]`.
+        if (n - pos >= LZ_HASH_BYTES) {
             int32_t cand  = head[lz_hash(&srcp[pos])];
             size_t  tried = 0;
 
@@ -208,9 +221,15 @@ disk_cache_codec_id disk_cache_codec_encode(const void * src_ptr, size_t src_len
         }
     }
 
-    // the trailing literal run ends the stream. it may be empty, which is how the
-    // loop finishes exactly on a match
-    put_token(dst, &srcp[lit_start], n - lit_start, 0, 0);
+    // The trailing literal run ends the stream, when there is one. If the loop
+    // finished exactly on a match then `lit_start == n` and the stream already ends
+    // on that match token: writing an extra empty-literal token would leave a byte
+    // the decoder never consumes, because it stops as soon as the output is
+    // complete. The decoder requires the stream to be consumed exactly, so the
+    // encoder must not produce a tail it will not read.
+    if (lit_start < n) {
+        put_token(dst, &srcp[lit_start], n - lit_start, 0, 0);
+    }
 
     if (dst.size() >= n) {
         // not worth it: hand back the original so the caller stores it verbatim
@@ -273,6 +292,14 @@ bool disk_cache_codec_decode(const void * src_ptr, size_t src_len, disk_cache_se
 
         const uint8_t flags = (uint8_t) srcp[pos++];
 
+        // Only bit 0 is defined. Accepting unknown bits would make a corrupted flags
+        // byte decode as an ordinary token - flipping the high bits of `0x01` leaves
+        // bit 0 set, so the stream would still parse and produce identical output.
+        // That is not a hypothetical: it is what the corrupt-stream test caught.
+        if ((flags & ~LZ_FLAG_MATCH) != 0) {
+            return false;
+        }
+
         uint64_t lit = 0;
 
         if (!get_varint(srcp, in_len, pos, lit)) {
@@ -331,5 +358,12 @@ bool disk_cache_codec_decode(const void * src_ptr, size_t src_len, disk_cache_se
         out += len;
     }
 
-    return out == want;
+    // The output reached its declared length. The stream must also have been
+    // consumed exactly: a well-formed stream ends on the final token, so anything
+    // left over means the encoded bytes do not describe what the header claims.
+    //
+    // This is a structural check, not a substitute for the caller's CRC over the
+    // decoded bytes - it catches a stream that is internally inconsistent rather
+    // than one that is merely damaged.
+    return out == want && pos == src_len;
 }

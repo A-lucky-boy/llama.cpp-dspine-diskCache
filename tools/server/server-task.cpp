@@ -3119,11 +3119,24 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         // whole snapshot, which for a target state is hundreds of MiB.
         const size_t n_segments = 2 + 3 * ckpts.size();
 
-        const std::streamoff off_table = f.tellp();
-        for (size_t i = 0; i < n_segments; i++) {
-            const uint64_t blank[3] = { 0, 0, 0 };
-            f.write(reinterpret_cast<const char *>(blank), sizeof(blank));
-            disk_cache_write(f, (uint32_t) 0);
+        // The table is reserved only for v9. A v8 file has no segment table at all,
+        // and reserving one anyway would push the payload `28 * (2 + 3N)` bytes past
+        // where read_entry() looks for it - the header would describe a layout the
+        // bytes do not follow.
+        //
+        // So the reservation and the backfill are both inside this single branch,
+        // and `off_table` only exists where it is meaningful. `emit()` below writes
+        // the payload either way; only the bookkeeping differs.
+        std::streamoff off_table = 0;
+
+        if (segmented) {
+            off_table = f.tellp();
+
+            for (size_t i = 0; i < n_segments; i++) {
+                const uint64_t blank[3] = { 0, 0, 0 };
+                f.write(reinterpret_cast<const char *>(blank), sizeof(blank));
+                disk_cache_write(f, (uint32_t) 0);
+            }
         }
 
         // one reusable buffer: the encoder's output for the segment in hand, then
@@ -3230,9 +3243,26 @@ bool server_disk_cache::write_entry(const server_disk_cache_pending & pending, s
         return false;
     }
 
+    // The caller uses the size this reports as the entry's real footprint: quota
+    // accounting, the read-cost guard and the prefix directory's physical reference
+    // all key off it. Guessing would be worse than failing - a zero would look like
+    // a free entry and a stale value would misstate the quota - so a failure to
+    // measure is a failed write, and the file just committed is removed rather than
+    // left as an unaccounted object.
     std::error_code ec_size;
+    const uintmax_t fsize = fs::file_size(path, ec_size);
+
+    if (ec_size) {
+        SRV_ERR("disk cache: cannot determine the size of '%s': %s\n", path.c_str(), ec_size.message().c_str());
+
+        std::error_code ec_rm;
+        fs::remove(path, ec_rm);
+
+        return false;
+    }
+
     path_out = path;
-    size_out = (size_t) fs::file_size(path, ec_size);
+    size_out = (size_t) fsize;
 
     return true;
 }
@@ -3547,9 +3577,19 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
         if ((int) i != want) {
             // the segments not being restored are skipped by their stored lengths -
             // not read, not decoded. this is the property that made per-segment
-            // encoding worth doing: one checkpoint costs one checkpoint
+            // encoding worth it: one checkpoint costs one checkpoint
             for (int k = 0; k < 3; k++) {
                 f.seekg((std::streamoff) seg_table[2 + 3*i + k].stored_len, std::ios::cur);
+
+                // a skip that runs past the end of the file means the table and the
+                // payload disagree. Without this check the next read would silently
+                // start at the wrong offset and the file could still pass its CRCs
+                // if the misalignment happened to land on matching bytes
+                if (!f) {
+                    SRV_WRN("disk cache: '%s' cannot skip the segments of checkpoint %zu\n", e.path.c_str(), i);
+                    out.checkpoints.clear();
+                    return disk_cache_read_status::corrupt;
+                }
             }
             continue;
         }

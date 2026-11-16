@@ -2990,3 +2990,133 @@ eligible K → 精确 K 的 target/draft 安全点
 - 本项目无训练过程；训练流水线不变。推理仅增加对既有完整状态字节的无损分段编码/解码，关闭态不受影响。
 - 实验人员在实际改动后追加 `change.md`；`projectSummary.md` 只描述真实已实现的架构和格式。
 - 若编码实验需要修改 llama.cpp 底层状态导出 API 才能实现，立即记录阻塞位置，保留既有 v8 缓存路径，不在同一实验中转向另一套 KV 状态切分算法。
+
+---
+
+# 2026-11-16 13-02 - test1_5
+
+## 一、实验目标与当前修改核查
+
+**性质：已实现的分段无损快照编码实验的缺陷修复；不启动另一项算法实验。** 维持此前独立实验及代码路线的有效内容，针对新 codec 在 v8 默认写盘、LZ77 输入边界上的确定性错误进行最小修复，并补充真正的关闭态持久化回归。当前问题未修复前，不得基于 v9 继续开发新的增量存储或物理压缩算法。
+
+在编写本节前已首先审阅 GitHub `change.md` 的最新两条相关记录（`2026-11-16 12-20` 与 `2026-11-16 13-05`），核对实验人员报告 `2026-11-16-handover-v10-segmented-codec.md`、`projectSummary.md`、实际源码及仓库提交历史。审查时远端最新文档提交为 `5237861bb66937446595bae122bfa5e209df32e6`，实际 codec 修复后代码为 `2ba93f48217239e2ceb9942f36d1b8e94b52b978`，分段编码最初功能提交为 `1f15c1b6ce5a4612be5436aed67728d936a12a72`。将代码分别与实验开始前 `a85e66c870030eefe25bbf58b87cbc2c1eeff698` 及原始 baseline `eb7681889f44304d2bd5b3e41572f5530af91a1d` 对比。`change.md` 报告已对 `read_bytes` 物理读取口径完成一次自查纠正，但未覆盖下面两种故障路径。
+
+**在实验机开始编码前**，须再次先阅读本地最新 `change.md`，核实 `projectSummary.md`、`git rev-parse HEAD`、`git status --short` 与对应函数的实际内容；若其他提交已改写这些位置，应先复核缺陷。发现错误先修复，不与新的存储策略混做。
+
+### 1.1 阻断问题 A：`--cache-disk-codec none` 的 v8 写入布局不符合自身读端
+
+源码位置：`tools/server/server-task.cpp::server_disk_cache::write_entry()`，以及 `read_entry()` 的 `version == DISK_CACHE_VERSION` 路径。
+
+当前 `write_entry()` 先依据 `codec_mode` 选择文件头版本；但随后无条件执行：
+
+```cpp
+const size_t n_segments = 2 + 3 * ckpts.size();
+const std::streamoff off_table = f.tellp();
+for (size_t i = 0; i < n_segments; i++) {
+    const uint64_t blank[3] = {0, 0, 0};
+    f.write(reinterpret_cast<const char *>(blank), sizeof(blank));
+    disk_cache_write(f, (uint32_t) 0);
+}
+```
+
+这使 `segmented == false` 时同样在 checkpoint 元数据表和状态 payload 之间留下 `28 × (2 + 3N)` 字节占位（N 为 checkpoint 数）。只有 v9 才回填段表，而 v8 `read_entry()` 不读取段表，直接从 checkpoint 表之后读取 `main/drft` 原始数据。结果是**新代码写出的默认 v8 文件头声明与实际字节布局不一致**，后续 CRC 检验与恢复因偏移出错。
+
+要求：
+
+1. 段表占位与回填必须全部置于 `if (segmented)` 的严格控制下，不能只让回填受控；`none` 写入完全沿用原始 v8 的 payload 紧随 checkpoint 元数据表布局。
+2. 为避免未来 v8/v9 写入逻辑再分叉，明确 `off_table` 仅在 segmented 分支有效；两个版本的段数据写入 API 可共享，但不得共享错误的物理偏移。
+3. 在 `none` 真实新写磁盘文件（不是只读取历史 v8、也不是“v9 文件 + none 读取端”）后立即独立进程重启，检查 `read_entry()`、CRC、target/draft 与 checkpoint 恢复、`source=disk` 和 `reused_disk`。
+4. 分别构造 `N=0`、`N=1`、`N=2` 的快照验证文件头 `version=8`、payload 起始偏移，以及 v8 默认写入与上一稳定实现的**布局等价性**（时间戳与实际 state 内容只按其字段语义对比，不要求运行间整个文件字节完全一样）。
+5. `none` 不应偷偷改为写 v9；默认行为必须真正恢复为原有 v8 格式，保持已提交 v8 与 v9 文件都可被最新读端识别。
+
+### 1.2 阻断问题 B：LZ77 编码末尾 3 字节存在越界读取
+
+源码位置：`tools/server/server-disk-cache-codec.cpp::disk_cache_codec_encode()` 与 `lz_hash()`。
+
+`lz_hash(const char * p)` 明确读取 `p[0]`、`p[1]`、`p[2]`、`p[3]` 共 **4** 个字节；但主循环仅用 `if (pos + LZ_MIN_MATCH <= n)`（`LZ_MIN_MATCH == 3`）保护 `lz_hash(&srcp[pos])`。当 `n-pos == 3` 且未提前跳过当前位置时，访问 `p[3]` 会越过有效输入缓冲末端。`insert_pos()` 已按 `p+4<=n` 防护，**查找端的条件比插入端弱一个字节**。
+
+要求：
+
+1. 单独定义 `LZ_HASH_BYTES = 4`，只有 `pos <= n && n - pos >= LZ_HASH_BYTES` 时才允许哈希查找；不足哈希窗口的尾部保留为字面量，不对它做 4 字节读取。
+2. `insert_pos()` 使用相同常量与防溢出的剩余长度判断；不能将匹配最小长度 3 与哈希窗口 4 混为同一常量。
+3. 原始 `memcmp`、匹配扩展及 back-reference 边界保留，确保修复不会改变允许的合法输出语义。
+4. 在**实际生产编码器**上运行长度 0–16 的短输入与不同尾部内容；强制使用恰好长度的缓冲区，覆盖 `n=4` 且 `pos=1`、`n=5` 且 `pos=2`、存在 match 与纯字面量两种路径，逐字节 round-trip。
+5. 采用编译器内存检查器（实验机环境允许时采用 MSVC AddressSanitizer）直接运行真实 `disk_cache_codec_encode()`，不是只对复制后的纯函数写另一套测试；确保无越界读取。结合随机长度/内容和可重复的固定种子回归。
+
+### 1.3 需要并行复核的防御性边界
+
+- `disk_cache_codec_decode()` 对已达到目标输出长度的编码流应检查输入消耗是否准确，拒绝带非规范尾随字节或未知 flags 的流；如目前 CRC 已能检测物理损坏，也不应把 CRC 当成编码协议结构校验的替代。
+- 复核 `read_entry()` 段表的 raw/stored 长度上界、seek 成功判断和解压后 CRC 及其错误回退；不得在段校验完成前调用 `llama_state_seq_set_data_ext()`。
+- 对 `write_entry()` 中 `fs::file_size(path, ec_size)` 的结果检查错误码，不能在获取真实文件字节失败时，以未核实的 `size_out` 作为 quota 与 `persisted` 的准入依据。该路径与此次新版本写盘相关，应列入最小异常回归，但不要借机重构整个文件生命周期。
+
+## 二、预期修改文件
+
+| 文件 | 修改内容 |
+|---|---|
+| `tools/server/server-task.cpp` | `write_entry()` 严格限定 v9 段表的预留与回填；v8 不写占位；复核真实文件大小错误分支与读取协议；保持既有 CRC 与提交时序 |
+| `tools/server/server-disk-cache-codec.cpp` | 将 4 字节哈希窗口与 3 字节最小匹配长度分离，避免尾部越界；在需要时收紧 decoder 结构拒绝 |
+| `tools/server/server-disk-cache-codec.h` | 如需要，将一致的哈希窗口/协议边界常量归位；不增加新的编码格式与用户可见参数 |
+| `tools/server/tests/unit/test_disk_cache_codec.cpp` | 加入真实编码器尾部越界用例、严格解码结构用例、确定性 round-trip 与内存检查运行方式 |
+| `test-run/` | 增加“当前版本真正写 v8→关闭进程→重启恢复”的独立脚本；结合 v9 与混合目录、checkpoint N=0/1/2 和损坏文件回退 |
+| `change.md` | 由实验人员记录实际修复、运行过的测试、构建与未覆盖项 |
+| `projectSummary.md` | 仅在修复落地后更新 v8/v9 写盘实际语义和已证实的状态范围 |
+
+本轮不修改模型、tokenize、DSpine speculative decoding、`src/llama-context.cpp`、前缀发现算法、preflight 准入、路径所有权、配额事务及前缀目录事件；如无必要不改 `server-task.h` 的格式与 manifest 结构。
+
+## 三、算法修改及预期数据流
+
+### 3.1 默认 v8 分支
+
+```text
+--cache-disk-codec none
+  → 头部写 version=8、signature、packed、state sizes、CRC、checkpoint 元数据表
+  → 【不预留 v9 段表】
+  → main raw → drft raw → checkpoints raw
+  → 原子文件提交 → manifest v3 → 原有可用性/配额与目录提交
+  → 重启后 v8 读取：元数据表之后立即读取 main/drft
+  → 解码原样字节与 CRC 校验 → 正常恢复
+```
+
+### 3.2 可选 v9 分支
+
+```text
+--cache-disk-codec lz
+  → 头部写 version=9、signature、packed、state sizes、CRC、checkpoint 元数据表
+  → 预留 28 × (2+3N) 字节段表
+  → 对各独立原始段执行【已修复 4 字节安全查找】的 codec 或 raw 回退
+  → 写入原始/编码段并回填 v9 段表
+  → 校验真实物理 size_file → 原子文件提交 / 现有配额事务
+  → 重启读段表、解码、验证原始 CRC → 正常恢复
+```
+
+### 3.3 训练与推理
+
+- **训练：**无训练任务，模型参数与任何训练流水线不变。
+- **推理：**不改变已验证的前缀物化安全点、target/draft 状态导出、请求 token 分解与采样。修复仅涉及后台已导出状态的文件布局和 codec 边界，关闭态必须完全走 v8 恢复路径。
+- **线程：**后台 worker 继续只处理不可变已导出缓冲区；不获取 live `llama_context`，不新增 worker。
+
+## 四、兼容性约束
+
+1. v8 的历史物理布局和 checkpoint 顺序必须完全保持；v9 仍用现有段表规范，版本由文件头判断而非当前编码参数判断。
+2. manifest v3、CRC64（原始字节与编码段校验）、配置签名与 `touch_entry()` 的 `last_used` 偏移不改变。
+3. `--cache-disk-codec` 默认 `none`；在修复被验证之前，不得将当前默认分支作为可靠跨重启快照写入路径。部署需要缓存时，使用修复前已验证的稳定代码版本，而不是将现有 `none` 与 `lz` 当作互相可替代的安全绕过。
+4. `768 KiB/token` 真实文件大小成本守卫、4096-token 写入抑制、preflight、完整 token/media 身份、in-flight 队列保护、quarantined 记账和同步事件通知均保持原语义。
+5. 本次修复不进一步开发 LZ 压缩优化、不新增 Zstd、不改变 KV 原始状态结构；不添加网络鉴权或多用户功能。本机单用户仍需保证字节越界和磁盘状态正确性。
+
+## 五、验证检查清单
+
+- [ ] 复读实验机最新 `change.md`、baseline、当前 HEAD、源代码和实际运行二进制；确认两项问题仍在当前源分支。
+- [ ] **默认 none 写盘→正常关闭→重启**，v8 文件头与 payload 偏移正确，`CRC`、`source=disk`、`reused_disk` 和输出一致性通过；此用例不得由现存旧 v8 文件代替。
+- [ ] `N=0/1/2` 三种 checkpoint 结构写入 v8，检查 `28×(2+3N)` 冗余占位确实不再存在；对照原始 baseline v8 字节布局。
+- [ ] `--cache-disk-codec lz` 写 v9，真实新文件正常关闭/重启恢复；新版本进程能够分别读取旧 v8 与新 v9，均保留正确 CRC 和输出。
+- [ ] 编码器对 0–16 字节及不同尾部、64 KiB/512 KiB 可压缩与不可压缩随机输入的 round-trip 完全一致；真实编码器的内存检查无越界报告。
+- [ ] 某段压缩后不变小的 raw 回退、多个 checkpoint 独立读取、恢复最后一个以及中间 checkpoint（如有可控实例）不越过段边界。
+- [ ] `touch_entry()` 在真正写出的 v8 和 v9 上均触发并验证时间戳外各字节保持不变，CRC 没有被触碰。
+- [ ] 截断、错误段长、未知 codec、payload CRC 错误、文件大小获取失败，均不允许未校验的字节进入 `set_data_ext()`；恢复失败应按已有策略安全回退。
+- [ ] 同一请求系列在新代码默认 none 与已知稳定版本 v8、以及 lz/v9 路径，`prompt = reused_slot + reused_ram + reused_disk + prefill` 成立且输出逐字节一致。
+- [ ] 用真实文件记录 v8 与 v9 的存储字节、实际读字节、编码耗时、解码耗时，明确区分 `read_bytes` 与完整 `size_file`；不得用尚未测得的性能数字写入变更记录。
+- [ ] 只把实际完成的结果写入 `change.md`；将已实现的整体结构更新到 `projectSummary.md`，不要在本规划中预写结果、早停条件或优劣判定。
+
+## 六、交付纪律
+
+保留历史实验设计。仅实施这一轮已经定位的错误修复与回归，不规划新的缓存算法；不修改原有计算图或训练流水线。若修复中发现更广泛的写盘/恢复不一致，先记录位置和最小复现，禁止同时推进新的实验方向。

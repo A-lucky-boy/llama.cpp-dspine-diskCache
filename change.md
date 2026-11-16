@@ -2815,3 +2815,188 @@ version 9, sig_len 206, size_main 195689284, size_drft 22970832, n_ckpt 2
 ### 七、对记录纪律的说明
 
 本轮暴露了我自己的一个流程问题：**引用了从未输出的日志行为证据**。`-lv 3` 下 `SRV_TRC` 不输出，而我在报告里把它当作已实现的证据。已在本节更正，并在后续核对中改为"先确认日志实际出现，再引用"。
+
+# 2026-11-16 14-20 - Change Record（test1_5 修复轮：v8 段表占位 + LZ77 尾部越界）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 13-02 - test1_5` 修复新 codec 引入的两个确定性错误，并加固规划 §1.3 列出的防御边界。基线 HEAD `5237861`。
+
+**两个问题均已由源码确认存在，不是我或规划作者的推断**——问题 B 另有 AddressSanitizer 的独立确证（见 §二）。
+
+## 一、阻断问题 A：`--cache-disk-codec none` 写出的 v8 文件布局与自身读端不符
+
+### 缺陷
+
+`write_entry()` 依据 `codec_mode` 选择文件头版本，但段表占位循环**无条件执行**：
+
+```cpp
+const size_t n_segments = 2 + 3 * ckpts.size();
+const std::streamoff off_table = f.tellp();
+for (size_t i = 0; i < n_segments; i++) {   // ← 未受 segmented 控制
+    const uint64_t blank[3] = { 0, 0, 0 };
+    ...
+}
+```
+
+只有 v9 分支回填该表（回填本身在 `if (segmented)` 内），而 v8 `read_entry()` 不读段表，直接从 checkpoint 表之后读 `main`/`drft`。结果是 `none` 写出的文件在 checkpoint 表与 payload 之间多出 `28 × (2 + 3N)` 字节，**文件头声明的布局与实际字节不符**。
+
+### 修复
+
+预留与回填**同置于一个 `if (segmented)` 分支**，`off_table` 声明在该分支外但仅在其内赋值：
+
+```cpp
+std::streamoff off_table = 0;
+
+if (segmented) {
+    off_table = f.tellp();
+    for (...) { /* 占位 */ }
+}
+```
+
+`emit()` 两个版本共用（它只负责把段写出去），差异仅在段表记账。
+
+### 验证
+
+| 检查 | 结果 |
+|---|---|
+| `none` 新写 v8 → 独立进程重启 | `scan 1 entries, 0 dropped`；`source=disk`、`reused_disk=2102`、`restored=2102`；sha 与历轮一致 |
+| v8 文件大小（真实写入） | `564668394` —— **与修复前历轮 v8 逐字节相同**（缺陷下会多 224 字节） |
+| 布局算术（N=2 真实文件解析） | header 止于 8830，计算 payload 尾 = 实际大小 = `564668394`，**精确 MATCH** |
+| 文件头 | `08 00 00 00` = version 8 |
+
+**新增布局夹具** `tools/server/tests/unit/test_disk_cache_layout.cpp`：不依赖等待自然快照产生特定 checkpoint 数（那由模型与 prompt 决定，不是测试），按与写端相同的常量复现 `N = 0/1/2` 的头部算术，断言 v8 的 payload 紧接 checkpoint 表、v9 的 payload 前有 `28×(2+3N)` 段表、两版本差值恰为该数。末项断言与**实测文件大小 564668394 精确对齐**，防止夹具自身算术漂移。
+
+**夹具能抓到该缺陷**：把占位改回无条件执行后 **16 项失败**，并暴露精确误差 `564668618 − 564668394 = 224`（即 `28×(2+3×2)`）。
+
+## 二、阻断问题 B：LZ77 末尾 4 字节越界读取
+
+### 缺陷
+
+`lz_hash()` 读 `p[0..3]` 共 4 字节，但查找端守卫用的是**匹配最小长度 3**：
+
+```cpp
+if (pos + LZ_MIN_MATCH <= n) {          // LZ_MIN_MATCH == 3
+    int32_t cand = head[lz_hash(&srcp[pos])];   // 读 4 字节
+```
+
+`n - pos == 3` 时 `srcp[pos+3]` 越界。`insert_pos()` 用的是 `p + 4 <= n`，**查找端比插入端弱一个字节**——两端用了同一个常量表达两件不同的事。
+
+### 修复
+
+- 新增独立常量 `LZ_HASH_BYTES = 4`，注释说明它与 `LZ_MIN_MATCH` 是**两件不同的事**（哈希窗口 4、最小匹配 3），混用正是尾部越界的成因
+- 查找端：`if (n - pos >= LZ_HASH_BYTES)`
+- 插入端：`if (n - p >= LZ_HASH_BYTES)`（同步改用新常量与防溢出的剩余长度形式）
+- `memcmp`、匹配扩展与 back-reference 边界**未改动**
+
+### 验证：AddressSanitizer 独立确证
+
+按规划 §1.2 第 5 条，在**真实 `disk_cache_codec_encode()`** 上运行（非复制出的纯函数）：
+
+```
+cl /std:c++17 /fsanitize=address /O1 /MDd ...
+```
+
+把守卫退回修复前的形式后：
+
+```
+==1327636==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x100480020494
+READ of size 1 at 0x100480020494 thread T0
+SUMMARY: AddressSanitizer: heap-buffer-overflow
+         server-disk-cache-codec.cpp:81 in `anonymous namespace'::lz_hash
+```
+
+第 81 行正是 `lz_hash` 中的 `p[3]`。修复后 ASan 静默通过、全部用例通过。
+
+**新增用例** `test_hash_window_tail()`：长度 0–16 × 4 种尾部内容的真实编码器 round-trip，缓冲区**恰为所测长度**（`shrink_to_fit()`，使越界无法落入冗余容量），并覆盖规划点名的 `n=4/pos=1`、`n=5/pos=2`、扩展循环触及缓冲末端、以及完全没有合法哈希位置的短输入。
+
+## 三、防御边界加固（规划 §1.3）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| decoder 拒绝非规范尾随字节 | **已修** | 原来 `return out == want;` 不检查输入是否耗尽。改为 `out == want && pos == src_len`。配套修正编码器：循环恰在 match 处结束时不再追加空字面量令牌（否则会留一个解码端永不消费的字节） |
+| decoder 拒绝未知 flags | **已修** | 原来只测 `bit 0`。翻转 `0x01` 的高位后 `bit 0` 仍置位，流照样解析并产出**相同输出**——这不是假设，是既有损坏用例实测到的。现拒绝任何 `~LZ_FLAG_MATCH` 位置位 |
+| `read_entry()` seek 成功判断 | **已修** | 跳过未选中 checkpoint 的 `seekg` **未检查成功**。越界 seek 会让后续读取从错误偏移开始，而错位若恰好落在匹配字节上文件仍可能通过 CRC。现检查 `!f` 并判 corrupt |
+| 段表上界 / 解压后 CRC 顺序 | **已复核** | 上界检查在分配之前；`raw_len`/`stored_len` 与 header 及 checkpoint 表逐项一致性均有校验；全部校验在 `llama_state_seq_set_data_ext()` 之前。未改 |
+| `fs::file_size` 错误码 | **已修** | `size_out` 原先直接取 `fs::file_size(path, ec_size)` 而**不检查 `ec_size`**，失败时调用方会拿未核实的大小作 quota 与 `persisted` 依据。现改为失败即报错、删除刚提交的文件并返回 false |
+
+**新增用例** `test_non_canonical_stream_rejected()`（尾随字节、未知 flags、短字面量流）与 `test_boundary_windows_encode_and_decode()`（哈希窗口开闭两侧各长度）。
+
+## 四、兼容性回归
+
+| 用例 | 结果 |
+|---|---|
+| `none` 新写 v8 → 重启恢复 | 通过（§一） |
+| `lz` 新写 v9 → 重启恢复 | 通过。`read_bytes = 391647888`，sha 一致 |
+| v9 逐段解析 | version 9、段表间隔 224、逐段累加 = 实际大小 **MATCH**、saved=38980、encoded=3/8 —— **与修复前完全一致**，证明修复 A 未影响 v9 |
+| v8 配置进程读 v9 文件 | 通过 |
+| **v9 配置进程读修复后的 v8 文件** | 通过（修复 A 的交叉验证） |
+| 六套独立单测 | 全通过 |
+
+## 五、修改文件
+
+### tools/server/server-task.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-task.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-task.cpp
+- 修改后路径：同名文件
+- 修改位置：`write_entry()` 段表预留分支；`read_entry()` 未选中 checkpoint 的 seek；`write_entry()` 尾部 `fs::file_size` 错误检查
+- 具体变更：见 §一、§三
+- 修改原因：规划 §1.1、§1.3
+
+### tools/server/server-disk-cache-codec.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-disk-cache-codec.cpp
+- 修改后路径：同名文件
+- 修改位置：常量定义；`insert_pos()`；主查找守卫；解码循环的 flags 校验与尾随检查；编码器收尾令牌
+- 具体变更：见 §二、§三
+- 修改原因：规划 §1.2、§1.3
+
+### tools/server/tests/unit/test_disk_cache_codec.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_disk_cache_codec.cpp
+- 修改后路径：同名文件
+- 修改位置：新增 `test_hash_window_tail()`、`test_non_canonical_stream_rejected()`、`test_boundary_windows_encode_and_decode()`
+- 具体变更：见 §二、§三
+- 修改原因：规划 §1.2 第 4 条、§1.3
+
+### tools/server/tests/unit/test_disk_cache_layout.cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 修改位置：全文件
+- 具体变更：v8/v9 头部布局夹具，N=0/1/2
+- 修改原因：规划 §1.1 第 4 条（`N=0/1/2` 三种结构的布局验证）
+
+## 六、验证执行记录
+
+- 已执行检查：CUDA release 构建，本轮 1 次
+- 检查结果：通过，`0 FAILED`
+
+- 已执行检查：ASan 构建（`/fsanitize=address /O1 /MDd`）2 次（修复前复现、修复后确认）
+- 检查结果：修复前捕获 `heap-buffer-overflow` @ `lz_hash` 第 81 行；修复后静默
+
+- 已执行检查：布局夹具反向验证（故意退回缺陷）
+- 检查结果：16 项失败，误差 224 字节，与 `28×(2+3N)` 一致
+
+- 已执行检查：六套独立单测
+- 检查结果：通过。`all disk-cache codec checks passed`、`all disk-cache layout checks passed`、`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`
+
+- 已执行检查：清理
+- 检查结果：通过
+
+- **未执行的检查及原因**：
+  - **`touch_entry()` 在真实 v8/v9 文件上的触发验证（规划 §5 第 6 项）**：**未完成**。`touch_entry()` 只在 `server_disk_cache` **析构**中经 `save_manifest` 后的 `last_used_dirty` 分支调用，运行期无其他可达路径。本环境下进程由非交互工具环境启动、无可附加的控制台，`GenerateConsoleCtrlEvent(CTRL_C_EVENT)` 无法送达（`AttachConsole` 成功但事件不生效），`taskkill`（无 `/F`）对控制台程序报"只能强制终止"，bash 的 `kill` 直接终止进程使析构不执行。因此**未能真正触发 touch**。已有的替代证据只是静态的：`last_used` 偏移在 v8 与 v9 上**实测均为 8670**（两版本保留同前置字段的设计效果），且两次运行后**非时间戳字节 hash 均未变化**（v8 `3f6bdc4ff38f9fc3`、v9 `1df84c699a850aec`）——但这**不等于**验证过 touch 本身
+  - **N=1 的布局**：夹具覆盖了 `N=0/1/2` 的算术，但真实文件只观察到 `N=2`（`cache-n1`/`cache-n2` 两次运行都产出 2 个 checkpoint）
+  - **损坏文件在真实 564 MB 文件上的注入**：截断、错误段长、未知 codec、payload CRC 错误的**合成流**用例已有（codec 单测），但未在真实文件上人为破坏后验证拒绝恢复与安全回退
+  - **`fs::file_size` 失败路径的注入**：已实现错误检查，**未构造实际失败**来验证
+  - **`encode_us` / `decode_us`**：仍未测
+  - **配额/TTL 淘汰、句柄占用后回收、强杀重启**：未执行
+  - **媒体输入端到端**：测试机无多模态模型；`media_state_unverified` 门禁未变
+
+## 七、对上一轮记录的更正
+
+上一轮（`12-20`）声称"`read_bytes` 报告真实物理读取量"，`13-05` 已更正为修正后实现。本轮的 v8 布局缺陷**同一个文件里还有更早就存在的一处**：`none` 写盘自 `1f15c1b` 起就是坏的。这说明**上一轮新增的 v9 路径测试没有覆盖 `codec_mode = none` 的真实写盘**——我测了 v9 写入、v9 恢复、以及"v8 进程读 v9 文件"，却没有测"`none` 进程写出 v8 文件再读回"。这是本轮问题 A 能存活到交付的原因。

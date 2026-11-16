@@ -126,6 +126,70 @@ void test_tiny_segments() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the hash window is four bytes, the minimum match is three
+//
+// The encoder used to guard its lookup with the match length, so at `n - pos == 3`
+// the four-byte hash read one byte past the end of the buffer. On a heap buffer that
+// is a silent over-read; with the address sanitizer it is a hard error.
+//
+// These cases drive the real encoder over every short length and over the exact
+// position where the window closes, and they allocate buffers of *exactly* the
+// tested size so an over-read cannot land in slack. `round_trips()` calls the
+// production `disk_cache_codec_encode()` / `disk_cache_codec_decode()`.
+// ---------------------------------------------------------------------------
+void test_hash_window_tail() {
+    // every length from 0 to 16, with several tail contents: the last three bytes
+    // are where the old guard let the lookup through
+    for (size_t n = 0; n <= 16; n++) {
+        for (unsigned variant = 0; variant < 4; variant++) {
+            std::vector<char> v(n);
+
+            for (size_t i = 0; i < n; i++) {
+                switch (variant) {
+                    case 0: v[i] = (char) (0x41 + (i % 3));      break; // repeating
+                    case 1: v[i] = (char) (0x10 * (int) i);      break; // all distinct
+                    case 2: v[i] = 0;                            break; // runs
+                    case 3: v[i] = (char) (i < n - 3 ? 'x' : 'y'); break; // tail differs
+                }
+            }
+
+            // a buffer of exactly this size: an over-read at any offset is caught
+            std::vector<char> exact(v.begin(), v.end());
+            exact.shrink_to_fit();
+
+            CHECK(round_trips(exact));
+        }
+    }
+
+    // the two positions the report calls out, with the padding removed so the
+    // window is exactly at the edge: n=4 with a hash at pos=1, n=5 with one at pos=2
+    {
+        std::vector<char> v = { 'a', 'a', 'a', 'a' };          // n=4, hash valid at pos=0 only
+        CHECK(round_trips(v));
+
+        std::vector<char> w = { 'a', 'b', 'a', 'b', 'a' };     // n=5, hash valid at pos=0,1
+        CHECK(round_trips(w));
+    }
+
+    // a match that would extend to the very last byte, so the extension loop runs
+    // against the end of the buffer
+    {
+        std::vector<char> v(64, 'z');
+        v.push_back('z');                                       // 65 bytes, all one run
+        CHECK(round_trips(v));
+    }
+
+    // no valid hash anywhere: every position has fewer than four bytes after it
+    {
+        std::vector<char> v = { 'q', 'w', 'e' };
+        CHECK(round_trips(v));
+
+        std::vector<char> u = { 'q', 'w', 'e', 'r' };
+        CHECK(round_trips(u));
+    }
+}
+
 void test_incompressible_segment() {
     // random bytes must round-trip even though they will not be encoded
     const std::vector<char> v = make_bytes(64 * 1024, 12345);
@@ -348,6 +412,85 @@ void test_literal_overrun_rejected() {
     CHECK(!disk_cache_codec_decode(stream.data(), stream.size(), d, out));
 }
 
+void test_non_canonical_stream_rejected() {
+    // a stream whose output reaches the declared length but which has bytes left
+    // over is not well formed: a valid stream ends on its final token
+    {
+        std::vector<char> v = make_zeros(4096);
+        const stored_segment s = store_segment(v, true);
+        CHECK(s.was_encoded);
+
+        // append a byte the decoder should never need
+        std::vector<char> padded = s.bytes;
+        padded.push_back(0x00);
+
+        disk_cache_segment_desc d = s.desc;
+        d.stored_len = padded.size();
+
+        std::vector<char> out;
+        CHECK(!disk_cache_codec_decode(padded.data(), padded.size(), d, out));
+    }
+
+    // unknown flag bits are not a valid token: only bit 0 is defined
+    {
+        std::vector<char> stream;
+        stream.push_back((char) 0x81);  // bit 0 (match) plus an undefined bit 7
+        stream.push_back((char) 0x00);  // lit_len = 0
+        stream.push_back((char) 0x00);  // match length 3
+        stream.push_back((char) 0x01);  // distance 1
+
+        disk_cache_segment_desc d;
+        d.raw_len    = 8;
+        d.stored_len = stream.size();
+        d.codec      = disk_cache_codec_id::lz;
+
+        std::vector<char> out;
+        CHECK(!disk_cache_codec_decode(stream.data(), stream.size(), d, out));
+    }
+
+    // a literal-only token that does not reach the declared length is short, not
+    // silently padded
+    {
+        std::vector<char> stream;
+        stream.push_back((char) 0x00); // flags: no match
+        stream.push_back((char) 0x02); // lit_len = 2
+        stream.push_back('a');
+        stream.push_back('b');
+
+        disk_cache_segment_desc d;
+        d.raw_len    = 8;
+        d.stored_len = stream.size();
+        d.codec      = disk_cache_codec_id::lz;
+
+        std::vector<char> out;
+        CHECK(!disk_cache_codec_decode(stream.data(), stream.size(), d, out));
+    }
+}
+
+void test_boundary_windows_encode_and_decode() {
+    // Every position where the four-byte hash window closes or opens, checked on
+    // both sides so an off-by-one in either guard shows up as a different result
+    // rather than as silent agreement.
+    for (size_t n = 3; n <= 20; n++) {
+        std::vector<char> v(n);
+
+        // a pattern with a real match at the start, so the match path is taken and
+        // the extension loop runs near the tail
+        for (size_t i = 0; i < n; i++) {
+            v[i] = (char) ((i < 2) ? 'A' + (int) i : v[i % 2]);
+        }
+
+        CHECK(round_trips(v));
+
+        // and the same length with no repeat at all: the literal path
+        std::vector<char> u(n);
+        for (size_t i = 0; i < n; i++) {
+            u[i] = (char) (0x80 + (int) i * 7);
+        }
+        CHECK(round_trips(u));
+    }
+}
+
 void test_empty_encoded_segment_rejected() {
     // the encoder never produces an encoded zero-length segment; a header claiming
     // one is inconsistent
@@ -429,6 +572,7 @@ void test_codec_mode_names() {
 int main() {
     test_empty_segment();
     test_tiny_segments();
+    test_hash_window_tail();
     test_incompressible_segment();
     test_compressible_segment();
     test_repetitive_pattern();
@@ -442,6 +586,8 @@ int main() {
     test_overshooting_match_rejected();
     test_backreference_into_nothing_rejected();
     test_literal_overrun_rejected();
+    test_non_canonical_stream_rejected();
+    test_boundary_windows_encode_and_decode();
     test_empty_encoded_segment_rejected();
     test_encode_is_deterministic();
     test_bound_is_respected();

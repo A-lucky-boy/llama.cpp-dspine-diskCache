@@ -71,6 +71,9 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| v8 写入不留段表 | 段表预留与回填同置于 `if (segmented)` 内，`codec=none` 的 payload 紧随 checkpoint 元数据表，与原有 v8 布局等价。缺陷期为无条件预留 `28×(2+3N)` 字节，使文件头声明与实际字节不符；现有独立布局夹具覆盖 N=0/1/2 |
+| 哈希窗口与最小匹配是两个常量 | `LZ_HASH_BYTES=4`（哈希读取字节数）与 `LZ_MIN_MATCH=3`（最短匹配）分开定义，查找端与插入端都用剩余长度 >= 4 判断。混用二者曾使查找端比插入端弱一个字节，在 `n-pos==3` 时越界读 `p[3]`（ASan 已在 `lz_hash` 定位） |
+| 编码流须被精确消耗 | decoder 除 `out == want` 外还要求 `pos == src_len`，并拒绝 bit0 以外的 flags 位。配套地，编码器在循环恰于 match 处结束时不再追加空字面量令牌 |
 | 状态段可独立编码 | `--cache-disk-codec lz` 写 v9：target 状态、draft 状态、每个 checkpoint 的 spec/tgt/dft 共 2+3N 个独立段各自编码，压缩后不缩小则原样存。**不串联成单一流**——`read_entry()` 只恢复一个 checkpoint，串联会强迫解压无关段。每段有自己的原始长度/磁盘长度/编码器 ID/编码字节 CRC |
 | v9 保留 v8 全部前置字段 | 段表**追加**在 checkpoint 表之后、payload 之前。这是为了 `touch_entry()`：它就地重写 `last_used`，偏移由前置字段决定，重排会让时间戳写坏 CRC。两版本共用同一偏移常量（有 static_assert 保护） |
 | 版本由文件头决定 | 读端按 header 里的 version 分派，不由当前配置决定。`--cache-disk-codec none` 的进程能正常读取已有的 v9 文件，反之亦然。v8 与 v9 都通过 `scan()` 的版本检查 |
