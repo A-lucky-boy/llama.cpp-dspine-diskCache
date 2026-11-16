@@ -281,4 +281,19 @@ if (slot.prompt.tokens.size() < K) {
 
 ## 8. 推送状态
 
-见推送后确认。
+已推送至 `origin/main`，fast-forward，无冲突。
+
+```
+To github.com:A-lucky-boy/llama.cpp-dspine-diskCache.git
+   6b35154..3b0f010  main -> main
+```
+
+| 项 | 值 |
+|---|---|
+| 推送前远端 HEAD | `6b35154` |
+| 推送后远端 HEAD | `3b0f010` |
+| 本地 HEAD | `3b0f010`（与远端一致） |
+| 工作区 | clean |
+| 推送的提交 | `d57d09c`（代码与测试）、`3b0f010`（本说明） |
+
+`git fetch` 确认推送前远端无新增提交，推送为 fast-forward，未重写任何历史。
