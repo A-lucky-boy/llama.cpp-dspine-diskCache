@@ -142,13 +142,21 @@ void test_beyond_input() {
 }
 
 // a prefix whose end lands inside a media chunk has no complete-state boundary
+// a prefix ending inside a chunk has no boundary; ending at a chunk's own start or
+// end, between two chunks, or past all of them, does.
+//
+// these cases ask the planner, not the predicate, so the *reason* is part of the
+// check: a boundary that is refused on its geometry still says `media`, while one
+// that passes the geometry and only stops at the capture gate says
+// `media_state_unverified`. That difference is what tells the two apart now that
+// media requests are never captured
 void test_media_boundary() {
     auto r = req(true, 512, 8192);
     r.media_chunks.push_back(chunk(1024, 2048));
 
     skip_t sk = skip_t::none;
 
-    // 1500 ends inside the chunk: refused
+    // 1500 ends inside the chunk: refused on geometry
     {
         const auto plan = disk_cache_plan_materialize(r, { cand(1500) }, sk);
         CHECK(!plan.capture);
@@ -156,28 +164,25 @@ void test_media_boundary() {
     }
 
     // 1024 is exactly the chunk start: the chunk is entirely ahead, so the prefix
-    // ends before it and is fine
+    // ends before it and the geometry is fine. only the capture gate stops it
     {
         const auto plan = disk_cache_plan_materialize(r, { cand(1024) }, sk);
-        CHECK(plan.capture);
-        CHECK_EQ(plan.prefix_tokens, 1024);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
     }
 
     // 2048 is exactly one past the chunk: the chunk is fully contained
     {
         const auto plan = disk_cache_plan_materialize(r, { cand(2048) }, sk);
-        CHECK(plan.capture);
-        CHECK_EQ(plan.prefix_tokens, 2048);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
     }
 
-    // 1023 and 2049 are outside it entirely
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(1023) }, sk);
-        CHECK(plan.capture);
-    }
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(4096) }, sk);
-        CHECK(plan.capture);
+    // 1023 and 4096 are outside it entirely
+    for (const size_t k : { (size_t) 1023, (size_t) 4096 }) {
+        const auto plan = disk_cache_plan_materialize(r, { cand(k) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
     }
 }
 
@@ -192,46 +197,43 @@ void test_media_gap_is_legal() {
 
     skip_t sk = skip_t::none;
 
-    // k = 800 sits between the two chunks: allowed. one span from 600 to 1000
-    // would have refused it
+    // k = 800 sits between the two chunks: geometrically legal. one span from 600
+    // to 1000 would have refused it as `media`
     {
         const auto plan = disk_cache_plan_materialize(r, { cand(800) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
+    }
+
+    // k = 700 is the first chunk's end and k = 900 the second's start: both legal
+    for (const size_t k : { (size_t) 700, (size_t) 900, (size_t) 2048 }) {
+        const auto plan = disk_cache_plan_materialize(r, { cand(k) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
+    }
+
+    // inside either chunk: refused on geometry
+    for (const size_t k : { (size_t) 650, (size_t) 950 }) {
+        const auto plan = disk_cache_plan_materialize(r, { cand(k) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media);
+    }
+
+    // the geometry verdict does not depend on the other candidates present: a
+    // legal one between the chunks and an illegal one inside a chunk both keep
+    // their own reason
+    {
+        const auto plan = disk_cache_plan_materialize(r, { cand(650), cand(800) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified); // 800 is legal geometry, so the gate wins
+    }
+
+    // and with no media the identical candidate is captured
+    {
+        auto plain = req(true, 512, 8192);
+        const auto plan = disk_cache_plan_materialize(plain, { cand(800) }, sk);
         CHECK(plan.capture);
         CHECK_EQ(plan.prefix_tokens, 800);
-    }
-
-    // k = 700 is the first chunk's end and k = 900 the second's start: both allowed
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(700) }, sk);
-        CHECK(plan.capture);
-    }
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(900) }, sk);
-        CHECK(plan.capture);
-    }
-
-    // inside either chunk: refused
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(650) }, sk);
-        CHECK(!plan.capture);
-    }
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(950) }, sk);
-        CHECK(!plan.capture);
-    }
-
-    // past every chunk: allowed
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(2048) }, sk);
-        CHECK(plan.capture);
-    }
-
-    // the longest usable candidate still wins across the gap: a longer one past
-    // the chunks beats the one between them
-    {
-        const auto plan = disk_cache_plan_materialize(r, { cand(800), cand(2048) }, sk);
-        CHECK(plan.capture);
-        CHECK_EQ(plan.prefix_tokens, 2048);
     }
 }
 
@@ -278,13 +280,15 @@ void test_media_chunks_malformed() {
         CHECK(sk == skip_t::media);
     }
 
-    // a well-formed list is accepted
+    // a well-formed list passes validation: it is not reported as malformed, it
+    // simply stops at the capture gate
     {
         auto r = req(true, 512, 8192);
         r.media_chunks.push_back(chunk(100, 200));
         r.media_chunks.push_back(chunk(300, 400));
         const auto plan = disk_cache_plan_materialize(r, { cand(1024) }, sk);
-        CHECK(plan.capture);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
     }
 }
 
@@ -387,46 +391,145 @@ void test_eligible_beats_observed() {
 // ---------------------------------------------------------------------------
 // the paired-state contract: target and draft must both end exactly on the prefix
 // ---------------------------------------------------------------------------
-void test_capture_bounds() {
+void test_capture_position_bounds() {
     using b = disk_cache_capture_bounds;
 
-    // target exactly on K, no draft configured: this is the target-only path
-    CHECK(disk_cache_check_capture_bounds(100, 100, false, -1) == b::exact);
+    // every argument is a position
 
-    // target exactly on K, draft exactly on K
-    CHECK(disk_cache_check_capture_bounds(100, 100, true, 100) == b::exact);
+    // target exactly on the expected end, no draft configured: target-only path
+    CHECK(disk_cache_check_capture_position_bounds(100, 100, false, -1) == b::exact);
+
+    // target and draft both exactly there
+    CHECK(disk_cache_check_capture_position_bounds(100, 100, true, 100) == b::exact);
 
     // target has not arrived: the plan waits, this is not a failure
-    CHECK(disk_cache_check_capture_bounds(100,  99, true,  99) == b::target_short);
+    CHECK(disk_cache_check_capture_position_bounds(100,  99, true,  99) == b::target_short);
 
     // target past the prefix: the state no longer describes it
-    CHECK(disk_cache_check_capture_bounds(100, 101, true, 101) == b::target_past);
+    CHECK(disk_cache_check_capture_position_bounds(100, 101, true, 101) == b::target_past);
 
-    // the draft lags the target
-    CHECK(disk_cache_check_capture_bounds(100, 100, true,  99) == b::draft_short);
+    // the draft lags
+    CHECK(disk_cache_check_capture_position_bounds(100, 100, true,  99) == b::draft_short);
 
-    // the draft ran ahead: this is the branch that was missing. no rewinding, no
-    // slicing of the draft's opaque state
-    CHECK(disk_cache_check_capture_bounds(100, 100, true, 101) == b::draft_past);
+    // the draft ran ahead: no rewinding, no slicing of its opaque state
+    CHECK(disk_cache_check_capture_position_bounds(100, 100, true, 101) == b::draft_past);
 
     // target short and draft past: the target's own problem is reported first
-    CHECK(disk_cache_check_capture_bounds(100,  99, true, 101) == b::target_short);
+    CHECK(disk_cache_check_capture_position_bounds(100,  99, true, 101) == b::target_short);
 
     // a draft context is configured but holds nothing
-    CHECK(disk_cache_check_capture_bounds(100, 100, true,  -1) == b::draft_missing);
+    CHECK(disk_cache_check_capture_position_bounds(100, 100, true,  -1) == b::draft_missing);
 
     // a negative target endpoint means the sequence holds nothing
-    CHECK(disk_cache_check_capture_bounds(  1,  -1, false, -1) == b::target_short);
+    CHECK(disk_cache_check_capture_position_bounds(  1,  -1, false, -1) == b::target_short);
 
     // a target-only deployment never reports a draft problem
-    CHECK(disk_cache_check_capture_bounds(100, 100, false, 101) == b::exact);
-    CHECK(disk_cache_check_capture_bounds(100, 101, false, -1) == b::target_past);
+    CHECK(disk_cache_check_capture_position_bounds(100, 100, false, 101) == b::exact);
+    CHECK(disk_cache_check_capture_position_bounds(100, 101, false, -1) == b::target_past);
+
+    // an expected end of zero means the prefix covers no positions
+    CHECK(disk_cache_check_capture_position_bounds(  0,   0, false, -1) == b::target_short);
+    CHECK(disk_cache_check_capture_position_bounds(  0,   0, true,   0) == b::target_short);
+    CHECK(disk_cache_check_capture_position_bounds( -1,   0, false, -1) == b::target_short);
+
+    // a position span wider than the token count is handled the same way, because
+    // only positions are compared
+    CHECK(disk_cache_check_capture_position_bounds(2104, 2104, true, 2104) == b::exact);
+    CHECK(disk_cache_check_capture_position_bounds(2104, 2102, true, 2104) == b::target_short);
+    CHECK(disk_cache_check_capture_position_bounds(2104, 2104, true, 2102) == b::draft_short);
 
     // every outcome has its own name
     const b all[] = { b::exact, b::target_short, b::target_past, b::draft_short, b::draft_past, b::draft_missing };
     for (const auto v : all) {
         CHECK(std::string(disk_cache_capture_bounds_name(v)) != "unknown");
     }
+}
+
+// the unit error this round fixes: a prefix whose position span differs from its
+// token count must be judged on positions. with the old interface, the token count
+// was passed where a position was expected, so a prefix of 2102 tokens ending at
+// position 2104 could never be judged exact
+void test_position_vs_token_units() {
+    using b = disk_cache_capture_bounds;
+
+    const int64_t K_tokens        = 2102;
+    const int64_t expected_end    = 2104; // two media chunks each adding one extra position
+    const int64_t target_end_real = 2104;
+
+    // positions compared to positions: exact
+    CHECK(disk_cache_check_capture_position_bounds(expected_end, target_end_real, true, 2104) == b::exact);
+
+    // what the old code did: pass the token count as the expected bound and the
+    // real position as the actual end. it reports "past" for a state that is in
+    // fact exactly on the prefix
+    CHECK(disk_cache_check_capture_position_bounds(K_tokens, target_end_real, true, 2104) == b::target_past);
+
+    // and it would also accept a genuinely short state as exact when the counts
+    // happen to line up the other way
+    CHECK(disk_cache_check_capture_position_bounds(K_tokens, K_tokens, false, -1) == b::exact);
+
+    // with the position-domain interface, the same short state is caught
+    CHECK(disk_cache_check_capture_position_bounds(expected_end, K_tokens, false, -1) == b::target_short);
+}
+
+// ---------------------------------------------------------------------------
+// media requests are planned and observed, but not captured
+// ---------------------------------------------------------------------------
+void test_media_state_unverified_gate() {
+    skip_t sk = skip_t::none;
+
+    // a long enough, reachable, well-formed candidate, but the request has media
+    {
+        auto r = req(true, 512, 8192);
+        r.media_chunks.push_back(chunk(600, 700));
+
+        const auto plan = disk_cache_plan_materialize(r, { cand(2048) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
+    }
+
+    // the gate applies even when the candidate sits entirely after the chunks
+    {
+        auto r = req(true, 512, 8192);
+        r.media_chunks.push_back(chunk(600, 700));
+
+        const auto plan = disk_cache_plan_materialize(r, { cand(4096) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
+    }
+
+    // several chunks: same gate
+    {
+        auto r = req(true, 512, 8192);
+        r.media_chunks.push_back(chunk(600, 700));
+        r.media_chunks.push_back(chunk(900, 1000));
+
+        const auto plan = disk_cache_plan_materialize(r, { cand(2048) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media_state_unverified);
+    }
+
+    // a malformed list is still reported as malformed, not as unverified: the
+    // structure is checked first
+    {
+        auto r = req(true, 512, 8192);
+        r.media_chunks.push_back(chunk(20, 20));
+
+        const auto plan = disk_cache_plan_materialize(r, { cand(2048) }, sk);
+        CHECK(!plan.capture);
+        CHECK(sk == skip_t::media);
+    }
+
+    // without media the same candidate is captured
+    {
+        auto r = req(true, 512, 8192);
+        const auto plan = disk_cache_plan_materialize(r, { cand(2048) }, sk);
+        CHECK(plan.capture);
+        CHECK_EQ(plan.prefix_tokens, 2048);
+    }
+
+    // the reason has its own printable name
+    CHECK(std::string(disk_cache_materialize_skip_name(skip_t::media_state_unverified)) == "media_state_unverified");
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +646,9 @@ int main() {
     test_media_gap_is_legal();
     test_media_chunks_malformed();
     test_media_chunk_predicate();
-    test_capture_bounds();
+    test_capture_position_bounds();
+    test_position_vs_token_units();
+    test_media_state_unverified_gate();
     test_checkpoint_fits();
     test_prefix_pos_max_text();
     test_past_the_boundary();

@@ -71,6 +71,9 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| 端点比较只在 position 域 | `K` 是 token 数，`llama_memory_seq_pos_max()+1` 是 position 数。纯文本两者相等，但媒体块的 `n_pos` 与 `n_tokens` 不同，含媒体前缀的 KV 末端位置不等于其 token 数。期望端点由 `server_tokens::pos_next(K)` 得出，**只与真实 position 比较**；token 数仍用于快照元数据、文件身份与最小长度判定 |
+| checkpoint 位置界取真实端点 | checkpoint 的位置上界来自已验证 exact 的 target `pos_max`，不对媒体路径使用文本专用 `K-1` 计算。`disk_cache_prefix_pos_max_text()` 仅保留给纯文本单测，生产路径不再引用 |
+| 媒体请求不进入主动写盘 | 请求含媒体块时，候选选择、长度与可达性、块边界合法性均照常执行（用于诊断），但不 arm 物化、不导出 state、不写盘，理由 `media_state_unverified`。主动物化路径的多模态状态导出与恢复**尚未在任何真实 mtmd 输入下验证过**；该门禁不影响多模态推理本身与既有 RAM/磁盘缓存 |
 | 物化边界须成对 | 捕获要求 target 与 draft 的序列端点都**恰好等于** K；缺 draft 配置时保持 target-only 路径。draft 落后/超前均只取消本次可选物化，不重算、不裁剪 opaque state |
 | 输入末端可捕获 | K 等于本次输入终点时，最后一个 prefill 批次会使 slot 转入 `DONE_PROMPT`；判定依据是实际序列端点而非 slot 状态，故该安全点同样可导出 |
 | 媒体区间按块判定 | 媒体约束是有序互不重叠的真实块集合，仅当 K 严格落在某块内部（`start < K < end`）才拒绝；块起点、块终点、块之间、全部块之后均为合法边界。结构不合法的块列表直接拒绝而非当作无媒体 |

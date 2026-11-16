@@ -2243,3 +2243,200 @@ tokenize → 精确 token/media 候选识别 → 计划 K
 - 开发人员交付实际源码提交、更新的 `change.md`、相关单元与单用户回归记录；只有已经实施的结构写入 `projectSummary.md`。
 - 本 `betterModification.md` **仅记录实验规划与算法修改日志**，不预填实验结果、性能预测、早停要求、计算报告或最终优劣判定规则。
 - 本次不启动分块 KV、增量写入、范围读取、热点淘汰等新的算法实现；先修复现有前缀物化路径的问题。
+
+---
+
+# 2026-11-16 08-38 - test1_3
+
+## 一、本轮定位与目标
+
+本节是**既有公共前缀主动 KV 物化算法的正确性修复补充**，不启动新的缓存算法实验，不更改分块格式或推理模型。保留前面全部实验设计与实现记录。当前仅针对本机单用户、单实例、单 Slot（`-np 1`）运行，不设计网络鉴权、多用户隔离或跨机器存储系统。
+
+**目标**：消除主动前缀物化中“token 数”和“KV position”被当作相同量比较的实现错误，并确保未经实际恢复验证的多模态输入不会进入物化写盘路径。保留已经通过实际测试的纯文本前缀捕获、配额事务、完整 KV 序列化以及跨重启磁盘恢复能力。
+
+本轮不增加其他缓存候选策略、不改变缓存 token 门槛、不降低读取成本守卫，也不修改 `llama_state_seq_get_data_ext`、`llama_state_seq_set_data_ext` 的底层语义。
+
+## 二、实施前代码核查与 baseline 对比
+
+### 2.1 已查验依据
+
+在提出本轮修复前，首先查阅 GitHub 最新 `change.md` 的 `2026-11-16 03-20 - Change Record（test1_3：物化路径边界收紧）`，随后核对 `projectSummary.md`、上传的 `2026-11-16-handover-v6-materialize-bounds.md` 和仓库实际源码。审查时远端 `main` HEAD 为 `6b35154a05350b5b599aa59a48aea83993e7178d`（后续说明文档提交）；关键功能提交依次为 `7aedd5604bb7564198cd2ebcf4175edd4442fa5f` 与 `d0537f11eda91c6e557cfef988a23b4c9b01e3ed`。
+
+对比了本阶段之前的 `010c68ad4675cbde1c2c7c303ab5d1ba11459546` 以及原始改造前的 baseline `eb7681889f44304d2bd5b3e41572f5530af91a1d`：原始 baseline 无 `server-prefix-materialize.*` 主动物化分支；新增分支负责候选选择、精确 prefill 截断和完整 target/draft KV 捕获，不能把其中新增错误归咎于原始推理框架。原有 `server_tokens::pos_next()` 已明确处理多模态位置膨胀，因此新物化代码必须服从该旧有位置语义。
+
+**报告确认的已落地工作继续保留**：target/draft 成对端点判定、`DONE_PROMPT` 终点捕获、媒体块合法端点筛选、checkpoint 双边界、配置依赖诊断、纯文本实际磁盘恢复及默认关闭兼容性。它们不需要推倒重写。
+
+实验人员动手前必须再次读取实验机器最新 `change.md`，并与本仓库 baseline及本轮提交比较。记录当前 `git rev-parse HEAD`、`git status --short`、构建产物及实际源码 SHA。若修改已经被其他人合并，先核查当前差异，不允许重复覆盖现有修复。若发现更严重的已存在代码错误，先暂停本轮并按错误位置修复。
+
+### 2.2 本轮明确缺陷：媒体 token 数不等于实际 KV position 数
+
+**位置一**：`tools/server/server-common.cpp` 的 `server_tokens::pos_next(int64_t n_tokens)`。
+
+在 `!has_mtmd` 时，`pos_next(K) == K`。存在媒体块时，函数遍历 token 流，每遇到媒体块，会把 `mtmd_input_chunk_get_n_pos(chunk)`（实际模型位置数）加到 `pos`，再跳过 `mtmd_input_chunk_get_n_tokens(chunk)`（token 占位数量）。因此对于一个包含媒体块的公共前缀，一般情况下：
+
+```text
+K = prefix token count
+P = server_tokens::pos_next(K)       // prefix KV position end, exclusive
+P may differ from K
+```
+
+**位置二**：`tools/server/server-context.cpp` 的 `materialize_prefix(server_slot & slot)`，目前直接用：
+
+```cpp
+const disk_cache_capture_bounds bounds = disk_cache_check_capture_bounds(
+        K, (int64_t) tgt_pos_max + 1, ctx_dft != nullptr, (int64_t) dft_pos_max + 1);
+```
+
+`disk_cache_check_capture_bounds()` 的首参在现有实现中是 `prefix_tokens`，生产代码因此把 `K` 与真实的 `pos_max + 1` 直接比较。对纯文本有效，对媒体块 `n_pos != n_tokens` 的输入无法正确判断 exact/short/past：可能错误拒绝本应合法的捕获，也可能在特殊位置差异下误把不一致状态视为 exact。此处属于**源码可确认的语义单位错误**，但报告未执行真实 mtmd 测试，不能将“实际错误恢复已发生”写成实验事实。
+
+**位置三**：同一函数的 checkpoint 筛选：
+
+```cpp
+disk_cache_checkpoint_fits({ ckpt->pos_min, ckpt->pos_max, ckpt->n_tokens },
+        K, disk_cache_prefix_pos_max_text(K))
+```
+
+`disk_cache_prefix_pos_max_text(K)` 明确只适用于纯文本，返回 `K-1`。对于带媒体块、实际最高有效 KV 位置为 `P-1` 的前缀，应使用真实位置边界而非文本专用计算。报告本身已指出媒体下 token 数与位置数不同，但当前调用点仍对媒体路径使用文本计算公式，必须修正。
+
+**额外核查**：本次报告提及多媒体块端点“几何合法”不等于真实导出成功。除核对 `pos_next(K)`，还应静态审查从 `slot.task->tokens` 进入 `slot.prompt.tokens`、`keep_first(K)`、以及 prefill 分批与 `n_past` 的语义：前者是 token 索引、后者在当前缓存调度层是复用 token 数，不能因为 `KV position` 膨胀就把所有 token 计数替换为位置数。
+
+## 三、修复方案：统一 token 与位置的显式类型语义
+
+### 3.1 将端点检查改为 KV position 领域
+
+建议在 `materialize_prefix()` 获取请求限定的前缀序列位置：
+
+```cpp
+const size_t K_tokens = slot.materialize.prefix_tokens;
+const llama_pos expected_end_pos = slot.prompt.tokens.pos_next((int64_t) K_tokens);
+const llama_pos tgt_end_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1;
+const llama_pos dft_end_pos = ctx_dft
+    ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) + 1
+    : -1;
+```
+
+必须先验证 `K_tokens` 在 `slot.prompt.tokens` 范围内、媒体块完整且状态未发生 context shift 等不兼容变换；随后**仅用位置端点比较位置端点**。对有 draft 的情况依然要求 target/draft 两边严格等于 `expected_end_pos`；target-only 保留单模型比较。若实际 seq position 不连续，或模型当前 memory backend 的 `pos_max` 不足以证明已覆盖完整前缀，则保守拒绝物化。
+
+建议将纯函数接口从混合语义的 `disk_cache_check_capture_bounds(prefix_tokens, target_end, ...)` 调整为命名明确的 `disk_cache_check_capture_position_bounds(expected_position_end, target_position_end, has_draft, draft_position_end)`（也可采用其他等价名称）。`prefix_tokens` 仍用于快照的 token 元数据、文件身份和最小长度判断，不作为真实 KV end。
+
+不能把 `pos_next(K)` 直接拿去截断 token 容器、决定缓存 token 身份或修改 disk LCP：prefill 批次及缓存身份仍按原 token 索引 `K` 进行；只有状态边界与 checkpoint 位置比较按 `expected_end_pos` / `pos_max` 判断。
+
+### 3.2 checkpoint 双边界保持独立
+
+将 checkpoint 检查显式写作：
+
+```cpp
+disk_cache_checkpoint_fits(checkpoint_view, K_tokens, verified_tgt_pos_max)
+```
+
+`verified_tgt_pos_max` 必须来自已验证 exact 的真实 target memory 位置，而不是无条件调用 `disk_cache_prefix_pos_max_text(K)`。在纯文本无 shift 且从位置 0 开始的既有测试范围内，二者应等价。针对媒体与 position shift 的路径，不因使用新的上界而自动认为状态可复用，仍须单独校验实际 state API 与 checkpoint 的恢复语义。
+
+保留 `disk_cache_prefix_pos_max_text()` 作为只在文本单测或明确文本模式中使用的辅助函数，不要求删除；如果生产代码已不需要它，不得为了制造使用点而继续错误引用。
+
+### 3.3 未验证的媒体实际状态：先采用保守禁用门禁
+
+尽管新的位置比较能修复单位错误，但用户当前的实验设备**没有真实 mtmd 模型与图片输入的端到端验证条件**，不能由纯元数据用例推出媒体+draft 实际导出/恢复一定可行。
+
+因此在本轮修复中加入**默认保守的实际写盘门禁**：当本请求 `server_tokens` 含有媒体块，`plan_prefix_materialize()` 可继续完成只读候选观察与区间合法性判定，但不得 arm 主动物化、不得触发真实 state 导出或 disk store；必须返回明确的 `media_state_unverified`（或已有的准确跳过理由）。在没有真实恢复证据之前不提供“强制实验性写入”绕过选项；将未来真实媒体支持作为单独设计，不在本轮承诺。
+
+注意这项限制**只作用于新的主动前缀物化路径**，不得关闭原有 llama.cpp 多模态推理、RAM/磁盘已知完整快照缓存或前缀元数据观察能力。新功能关闭态行为不变。
+
+### 3.4 补齐流程安全点与异常分支审查
+
+- `n_past == K` 直接捕获与 `DONE_PROMPT` 精确结束捕获共用同一个位置端点判定；保持一次请求至多导出一次。
+- 模型当前 KV 已超过预计位置时只能跳过当前物化，不能对已导出的 opaque state 作按 token 字节裁剪。
+- 发生 context shift、请求取消、`decode()` 缩批重试、不同 request 的 slot 复用或 target/draft 不同位置时不导出、不排队；保持已有正常前向流程。
+- `capture_boundary()` 通用路径已经使用实际 `pos_max` 筛选 checkpoint，不将它改回 `K-1`；仅比较本次新增分支与其位置边界语义的一致性。
+- 不修改缓存的 v8 快照、v3 manifest、CRC、文件名、IO 守卫、隔离与配额事务；新物化写入仍只通过原有 `server_prompt_cache::materialize()` 与 disk worker。
+
+## 四、预期修改文件
+
+| 文件 | 具体修改位置 | 修改要求 |
+|---|---|---|
+| `tools/server/server-context.cpp` | `plan_prefix_materialize()` | 加入“真实媒体输入禁用主动写盘”门禁；保留媒体元数据校验与独立前缀目录观察 |
+| `tools/server/server-context.cpp` | `materialize_prefix()` | 用 `server_tokens::pos_next(K)` 建立 expected KV position end；严格检查 target/draft；checkpoint 使用真实位置上界 |
+| `tools/server/server-prefix-materialize.h` | capture-bounds 接口与 skip enum | 明确参数单位，区分 token 数与 position；必要时新增 `media_state_unverified` |
+| `tools/server/server-prefix-materialize.cpp` | 端点谓词与 planner | 只比较同单位的 position，媒体禁用分支返回准确原因，纯文本路径保持原样 |
+| `tools/server/tests/unit/test_prefix_materialize.cpp` | 既有单元测试基础上扩展 | 增加位置数与 token 数不一致、exact/short/past、draft 领先/落后、媒体门禁与 checkpoint 的最小复现 |
+| `test-run/pmat.py` | 单用户纯文本回归脚本 | 复用请求中间位置、输入末端、`n_past==K`、重启后的磁盘真正复用；检查新参数默认关闭和媒体跳过日志 |
+| `change.md` | 最新条目之后追加 | 仅记实际实现、错误位置与执行过的测试，不预写性能结果 |
+| `projectSummary.md` | 现有整体架构说明 | 在实现完成后更新“已验证纯文本/多媒体尚未验证”的真实能力边界 |
+
+如无需新增源文件或参数则不新增，继续复用当前四套单测与现有 CLI 选项。
+
+## 五、预期数据流变更
+
+```text
+请求 token 化、媒体识别
+    ↓
+prefix_index::candidates()（只读，不改变观察数）
+    ↓
+合法候选 K_tokens
+    ├─ 含媒体且未验证 → skipped(media_state_unverified)
+    │                      → 原推理与原缓存路径继续，不触发主动捕获
+    └─ 纯文本 → request-scoped materialize plan(K_tokens)
+                    ↓
+                 前缀 prefill 批次截至 K_tokens（token 单位）
+                    ↓
+                 expected_pos_end = prompt.tokens.pos_next(K_tokens)
+                    ↓
+                 target_pos_end == expected_pos_end
+                 draft_pos_end  == expected_pos_end（如配置）
+                    ├─ 任一不等 → skipped，不触碰 disk
+                    └─ 两者准确 → checkpoint 的 token 和 position 分别验证
+                                     ↓
+                                 完整 seq state 导出
+                                     ↓
+                                 原 disk store / queue / quota / manifest
+                                     ↓
+                                 有效提交后 persisted；重启真实恢复计入 reused_disk
+```
+
+**训练流水线**：不存在训练，不修改模型权重、数据集或梯度。**推理流水线**：修复仅发生在启用前缀物化后的计划与安全点；普通 prefill、speculative decode、采样和关闭态保持不变。`K_tokens` 是被缓存的输入 token 数，`expected_pos_end` 是模型状态位置的 exclusive 上界，两者不得混记或直接相加。
+
+## 六、与既往修改的兼容性
+
+1. 单用户本机 `-np 1`，不增加网络鉴权、多租户权限、多 Slot 调度或分布式功能。
+2. 保留 `--cache-prefix-discovery` 与目录的 `observed/eligible/persisted` 生命周期；候选不计入真实命中。
+3. 原有纯文本 `K==pos_next(K)` 路径沿用，已经通过的中间 prefill、`DONE_PROMPT`、`n_past==K` 三类捕获继续具备相同语义。
+4. 维持 target/draft 成对状态、完整 state 导出、v8/v3 文件格式、CRC、配置签名、checkpoint、`768 KiB/token` 读盘守卫及 `4096 token` 写入抑制。
+5. 保留原有隔离/配额/真实删除记账和单一磁盘 worker，不允许通过错误的 `persisted` 引用绕过既有磁盘层校验。
+6. 媒体门禁只禁止**新主动中间前缀物化**，不得影响多模态模型本身的推理和已存在的一般 KV 缓存。
+7. 关闭 `--cache-prefix-materialize` 时无额外批次划分和状态导出；无理由改变 baseline 输出。
+
+## 七、验证检查清单
+
+### 7.1 版本与源码
+
+- [ ] 实验机重新阅读最新 `change.md` 和 `projectSummary.md`，锁定当前 HEAD、构建产物，并与 baseline 比对。
+- [ ] 搜索 `materialize_prefix` 与 `capture_boundary` 中所有 `pos_max + 1`、`K-1`、`pos_next(K)`，确认每处变量单位清晰。
+- [ ] 所有纯元数据 helper 由生产路径调用同一份实现，不复制单测专用逻辑。
+
+### 7.2 token-position 映射
+
+- [ ] 纯文本 `K=0/1/2/1024`：`pos_next(K)` 与原纯文本关系一致，K=0 不允许物化。
+- [ ] 用模拟多媒体块创建 `n_tokens != n_pos` 的前缀，分别令目标/草稿端点等于、短于、超过 `expected_pos_end`；新的捕获谓词只按真实 position 结果判断。
+- [ ] 双向验证 `expected_pos_end`：包含一个媒体块、两个分离媒体块、K 在媒体起点/末端/块间以及 token 索引合法但位置膨胀的情况。
+- [ ] 对 metadata 有媒体的请求，即使候选边界合法也不会发起真实物化，不增加 exported/queued/persisted；仍能正常完成原推理请求。
+- [ ] 不从媒体 token 数直接推断 checkpoint 最大 position；纯文本下 checkpoint 的 `K-1` 规则仍由原单测覆盖。
+
+### 7.3 边界与实际恢复
+
+- [ ] 纯文本预先建立 eligible 公共前缀，以 `K<input_end` 验证中途批次精准物化。
+- [ ] `K==input_end` 与 `n_past==K` 的回归均只导出一次，不出现空批次循环。
+- [ ] target/draft 的 exact/short/past 六种状态仍按原判定处理；状态不一致不能导出完整快照。
+- [ ] context shift、任务取消与 decode retry 不执行旧请求遗留计划；若环境无法注入，明确记录尚未覆盖，不能声称测试通过。
+- [ ] 采用独立磁盘目录，服务重启后从 `source=disk` 真实恢复；核对 restored、reused_disk 与 prompt token 分解恒等式。
+- [ ] 关闭新功能后对照同参数相同请求的输出与 token 统计；不改变正常磁盘缓存、RAM 或单 Slot 在位 KV 复用。
+
+### 7.4 报告与交接
+
+- [ ] `change.md` 只写本轮真实修改位置、已执行检查和仍缺少的实测条件。
+- [ ] `projectSummary.md` 更新真实能力边界，不能在没有媒体+draft 端到端测试的情况下宣称支持多模态主动 KV 物化。
+- [ ] 本文件仅保留实验规划和算法修改日志，不填实验结果预想、训练早停要求、性能计算报告或最终优劣判定规则。
+
+## 八、实施顺序
+
+第一步核查当前最新 `change.md`/源码与 baseline 差异，确认错误尚未被其他提交处理；第二步完成 token-position 语义修复及媒体门禁；第三步补齐确定性单测；第四步运行单用户纯文本请求、实际重启恢复与关闭态对照；第五步将真实变更追加到 `change.md`，同步项目总体结构至 `projectSummary.md`。
+
+**本轮授权范围只到已有主动前缀物化路径的正确性修复**，不开始新的物理 KV 格式、差量写入或范围读取实现。

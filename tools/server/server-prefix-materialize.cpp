@@ -80,14 +80,21 @@ const char * disk_cache_capture_bounds_name(disk_cache_capture_bounds bounds) {
     return "unknown";
 }
 
-disk_cache_capture_bounds disk_cache_check_capture_bounds(size_t prefix_tokens,
-        int64_t target_end, bool has_draft, int64_t draft_end) {
-    // a negative endpoint means the sequence holds nothing
-    if (target_end < 0 || (size_t) target_end < prefix_tokens) {
+disk_cache_capture_bounds disk_cache_check_capture_position_bounds(int64_t expected_position_end,
+        int64_t target_position_end, bool has_draft, int64_t draft_position_end) {
+    // every argument is a position. comparing them to each other is what makes
+    // this correct for prefixes whose token count and position span differ
+    if (expected_position_end <= 0) {
+        // a prefix with no positions has no state to capture
         return disk_cache_capture_bounds::target_short;
     }
 
-    if ((size_t) target_end > prefix_tokens) {
+    // a negative endpoint means the sequence holds nothing
+    if (target_position_end < 0 || target_position_end < expected_position_end) {
+        return disk_cache_capture_bounds::target_short;
+    }
+
+    if (target_position_end > expected_position_end) {
         return disk_cache_capture_bounds::target_past;
     }
 
@@ -97,15 +104,15 @@ disk_cache_capture_bounds disk_cache_check_capture_bounds(size_t prefix_tokens,
         return disk_cache_capture_bounds::exact;
     }
 
-    if (draft_end < 0) {
+    if (draft_position_end < 0) {
         return disk_cache_capture_bounds::draft_missing;
     }
 
-    if ((size_t) draft_end < prefix_tokens) {
+    if (draft_position_end < expected_position_end) {
         return disk_cache_capture_bounds::draft_short;
     }
 
-    if ((size_t) draft_end > prefix_tokens) {
+    if (draft_position_end > expected_position_end) {
         // the draft ran ahead. the only ways to fix that here would be to rewind
         // it or to slice its opaque state, and neither is allowed for a state that
         // is part of a live request
@@ -163,6 +170,7 @@ const char * disk_cache_materialize_skip_name(disk_cache_materialize_skip reason
         case disk_cache_materialize_skip::media:            return "media";
         case disk_cache_materialize_skip::past:             return "past";
         case disk_cache_materialize_skip::duplicate:        return "duplicate";
+        case disk_cache_materialize_skip::media_state_unverified: return "media_state_unverified";
     }
     return "unknown";
 }
@@ -259,6 +267,20 @@ disk_cache_materialize_plan disk_cache_plan_materialize(const disk_cache_materia
             plan.capture       = true;
             plan.prefix_tokens = c.prefix_tokens;
         }
+    }
+
+    // a request that carries media gets the full read-only treatment above - the
+    // candidate is selected, its length and reachability are checked, and its end
+    // is verified not to split a chunk. what it does not get is the capture: the
+    // sequence state of a multimodal prefix has never been verified to export and
+    // restore correctly, and none of the checks above can establish that. putting
+    // the gate here, at the point a capture would be armed, keeps the reasons
+    // above meaningful for media requests
+    if (plan.capture && !req.media_chunks.empty()) {
+        plan.capture       = false;
+        plan.prefix_tokens = 0;
+        skipped = disk_cache_materialize_skip::media_state_unverified;
+        return plan;
     }
 
     if (!plan.capture) {

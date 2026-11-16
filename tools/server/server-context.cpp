@@ -2240,37 +2240,51 @@ private:
 
         const size_t K = slot.materialize.prefix_tokens;
 
-        // both contexts are asked for the number of positions they cover, which is
-        // what `pos_max + 1` is. target and draft are checked together, because a
-        // snapshot pairs them: a state copied from two contexts that disagree
-        // would describe a prompt that was never executed
+        // `pos_next` is only defined for a prefix the token view actually holds, so
+        // an unfilled view is checked first. A mid-prompt batch leaves the view
+        // short of K, and that is not a failure - the batch that reaches it will
+        // arrive, so the plan stays armed
+        if (slot.prompt.tokens.size() < K) {
+            return;
+        }
+
+        // K counts tokens; the contexts are indexed by positions. For text the two
+        // coincide, but a media chunk occupies more positions than the tokens it
+        // stands for, so a prefix containing one ends at a position that is not its
+        // token count. `pos_next(K)` is the request's own mapping from one to the
+        // other - the same call the prefill batches use to place their tokens
+        const int64_t expected_end = (int64_t) slot.prompt.tokens.pos_next((int64_t) K);
+
+        if (expected_end <= 0) {
+            // the prefix maps to no positions: nothing can be captured from it
+            SLT_WRN(slot, "cache_stats: materialize = skipped (prefix %zu maps to position %lld)\n",
+                    K, (long long) expected_end);
+            slot.materialize.done = true;
+            counters_materialize.skipped++;
+            return;
+        }
+
         const llama_pos tgt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
         const llama_pos dft_pos_max = ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1;
 
-        const disk_cache_capture_bounds bounds = disk_cache_check_capture_bounds(
-                K, (int64_t) tgt_pos_max + 1, ctx_dft != nullptr, (int64_t) dft_pos_max + 1);
+        // positions are compared to positions. target and draft are checked
+        // together, because a snapshot pairs them: a state copied from two contexts
+        // that disagree would describe a prompt that was never executed
+        const disk_cache_capture_bounds bounds = disk_cache_check_capture_position_bounds(
+                expected_end, (int64_t) tgt_pos_max + 1, ctx_dft != nullptr, (int64_t) dft_pos_max + 1);
 
         if (bounds == disk_cache_capture_bounds::target_short) {
-            // the batch that ends at K has not been decoded yet. this is not a
-            // failure: the next one will arrive, so the plan stays armed
+            // the batch that ends at the prefix has not been decoded yet. this is
+            // not a failure: the next one will arrive, so the plan stays armed
             return;
         }
 
         if (bounds != disk_cache_capture_bounds::exact) {
             // the state cannot be paired up. nothing is exported and no file is
             // queued - the prefix simply stays without its own snapshot
-            SLT_WRN(slot, "cache_stats: materialize = skipped (%s), prefix = %zu, target_end = %d, draft_end = %d\n",
-                    disk_cache_capture_bounds_name(bounds), K, (int) tgt_pos_max + 1, (int) dft_pos_max + 1);
-            slot.materialize.done = true;
-            counters_materialize.skipped++;
-            return;
-        }
-
-        // the token view must hold the prefix: a snapshot claiming tokens whose KV
-        // is not there cannot be restored
-        if (slot.prompt.tokens.size() < K) {
-            SLT_WRN(slot, "cache_stats: materialize = skipped (prompt has %zu < %zu tokens)\n",
-                    slot.prompt.tokens.size(), K);
+            SLT_WRN(slot, "cache_stats: materialize = skipped (%s), prefix = %zu tokens, expected_end = %lld, target_end = %d, draft_end = %d\n",
+                    disk_cache_capture_bounds_name(bounds), K, (long long) expected_end,
+                    (int) tgt_pos_max + 1, (int) dft_pos_max + 1);
             slot.materialize.done = true;
             counters_materialize.skipped++;
             return;
@@ -2281,15 +2295,17 @@ private:
         snapshot.tokens.keep_first(K);
 
         // a checkpoint that reaches past the snapshot's positions describes KV the
-        // entry cannot account for. the check is done before any buffer is sized,
-        // so a refusal here costs nothing
+        // entry cannot account for. the position bound is the target's verified
+        // endpoint, not a token count: the text-only `K-1` arithmetic is not valid
+        // once a media chunk makes the two differ. the check is done before any
+        // buffer is sized, so a refusal here costs nothing
         for (const auto & ckpt : slot.prompt.checkpoints) {
             if (disk_cache_checkpoint_fits({ ckpt->pos_min, ckpt->pos_max, ckpt->n_tokens },
-                        K, disk_cache_prefix_pos_max_text(K))) {
+                        K, (int64_t) tgt_pos_max)) {
                 snapshot.checkpoints.push_back(ckpt);
             } else {
-                SLT_WRN(slot, "cache_stats: materialize: dropping checkpoint (pos_min = %d, pos_max = %d, n_tokens = %lld) past prefix %zu\n",
-                        (int) ckpt->pos_min, (int) ckpt->pos_max, (long long) ckpt->n_tokens, K);
+                SLT_WRN(slot, "cache_stats: materialize: dropping checkpoint (pos_min = %d, pos_max = %d, n_tokens = %lld) past prefix %zu tokens / position %d\n",
+                        (int) ckpt->pos_min, (int) ckpt->pos_max, (long long) ckpt->n_tokens, K, (int) tgt_pos_max);
             }
         }
 

@@ -1996,3 +1996,154 @@ W srv load_model: --cache-prefix-materialize needs a disk cache tier (--cache-di
   - **draft 超前的端到端**：单测覆盖了 `draft_past` 分支，但运行中 `common_speculative_process()` 之后 draft 与 target 始终对齐，未能自然构造 draft 越过 K 的场景，也未能注入
   - **context shift / 取消 / decode 重试**：捕获点已限定在 `PROCESSING_PROMPT`/`DONE_PROMPT` 且要求端点严格等于 K，但规划 §11.3 要求逐一构造的这些异常时序未执行
   - **多个媒体块的真实输入**：本轮无法构造，仅单测覆盖
+
+# 2026-11-16 09-30 - Change Record（test1_3：token 与 position 单位分离 + 媒体门禁）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 08-38 - test1_3` 修复主动前缀物化中"token 数"与"KV position"被当作同一量比较的单位错误，并加入媒体输入的实际写盘门禁。基线 HEAD `6b35154`，上一功能提交 `7aedd56`（含 `d0537f1` 的边界算术整理）。本轮未改分块格式、低估门槛、读盘守卫与配额事务。
+
+### 缺陷：端点比较混用单位
+
+`materialize_prefix()` 把前缀 token 数 `K` 与 `llama_memory_seq_pos_max() + 1`（position 数）直接比较。纯文本下二者相等（`pos_next(N) == N`），所以既有测试全部通过；但含媒体块时：
+
+- `server_tokens::pos_next(K)` 遍历 token 流，每遇媒体块累加 `mtmd_input_chunk_get_n_pos()`（实际模型位置数）并跳过 `mtmd_input_chunk_get_n_tokens()`（token 占位数量）
+- 确认 `mtmd_image_tokens_get_n_pos()` 由 clip 行数计算（`1 + clip_suffix_rows(...).size()` 之和），与 token 占位数量是相互独立的量
+
+因此含媒体前缀的 KV 末端位置不等于其 token 数。旧写法会**错误拒绝**本应合法的捕获（把位置数当成"越过 token 数"），也可能在计数恰好错开时把不一致状态判为 exact。
+
+### 修复一：端点比较移入 position 域
+
+- `disk_cache_check_capture_bounds(prefix_tokens, target_end, ...)` 重命名为 `disk_cache_check_capture_position_bounds(expected_position_end, target_position_end, has_draft, draft_position_end)`，三个参数统一为 position
+- 调用点改为先求 `expected_end = slot.prompt.tokens.pos_next(K)`，再与 `tgt_pos_max + 1` / `dft_pos_max + 1` 比较
+- `K` 继续用于快照 token 元数据、文件身份与最小长度判定；`pos_next(K)` **不**用于截断 token 容器或修改 disk LCP
+- 新增 `expected_end <= 0` 判据：前缀映射不到任何位置时无法捕获
+
+### 修复二：checkpoint 位置界取真实端点
+
+原调用点对媒体路径使用了文本专用 `disk_cache_prefix_pos_max_text(K)`（返回 `K-1`）。改为传入已验证 exact 的 target `tgt_pos_max`。该 helper 保留但**生产路径不再引用**，仅由单测固定 `pos_next(N) == N` 这一文本恒等式。
+
+### 修复三：媒体门禁
+
+实验机无真实 mtmd 模型与图片输入，无法端到端验证多模态状态导出与恢复。加入默认保守门禁：请求含媒体块时，`disk_cache_plan_materialize()` 仍完成候选选择、长度与可达性、块边界合法性判定（这些用于诊断），但**不 arm 捕获**，返回 `media_state_unverified`。
+
+门禁位置经过一次修正：初版放在函数开头，导致媒体块的几何边界判定成为不可达代码（单测立刻暴露）。改放在"将要 arm"处，使 `media`（几何不合法）与 `media_state_unverified`（几何合法但状态未验证）两个理由各自可达、可区分。
+
+未提供"强制实验性写入"绕过选项，符合规划 §3.3。
+
+## 修改文件
+
+### tools/server/server-prefix-materialize.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-prefix-materialize.h
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：skip 枚举、端点谓词签名、checkpoint 文档、text helper 文档
+- 具体变更：
+  - 新增 `disk_cache_materialize_skip::media_state_unverified`
+  - `disk_cache_check_capture_bounds` → `disk_cache_check_capture_position_bounds`，参数语义改为 position 并写明理由
+  - `disk_cache_checkpoint_fits` 文档说明位置界必须是真实端点、不可由 token 数推导
+  - `disk_cache_prefix_pos_max_text` 文档标明仅文本单测使用，禁止用作媒体路径的位置界
+- 修改原因：规划 §3.1、§3.2、§3.3
+
+### tools/server/server-prefix-materialize.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-prefix-materialize.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：`disk_cache_check_capture_position_bounds()`、`disk_cache_plan_materialize()`、`disk_cache_materialize_skip_name()`
+- 具体变更：
+  - 谓词改为纯 position 比较，新增 `expected_position_end <= 0` 判据
+  - 媒体门禁置于"将要 arm 捕获"处，使几何不合法仍报 `media`
+  - 新增理由名 `media_state_unverified`
+- 修改原因：规划 §3.1、§3.3、§4
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/tools/server/server-context.cpp
+- 修改后路径：同名文件
+- 修改位置：`materialize_prefix()`
+- 具体变更：
+  - token 视图长度检查改为"未填满则 return 等下一批"（初版误设为硬失败，会拒绝所有中间批次，已修正）
+  - 新增 `expected_end = slot.prompt.tokens.pos_next(K)`，与真实位置端点比较
+  - checkpoint 位置上界由 `disk_cache_prefix_pos_max_text(K)` 改为 `(int64_t) tgt_pos_max`
+  - 诊断日志增列 `expected_end`
+- 修改原因：规划 §3.1、§3.2
+
+### tools/server/tests/unit/test_prefix_materialize.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/tests/unit/test_prefix_materialize.cpp
+- 修改前备份：.backupChange/2026-11-15 20-10/（同批备份）
+- 修改后路径：同名文件
+- 修改位置：谓词改名、媒体用例改写、三个新用例组
+- 具体变更：
+  - 全部 `disk_cache_check_capture_bounds` 调用改为位置域名
+  - `test_capture_position_bounds()`：原 12 项 + `expected_end <= 0` 三项 + 宽位置跨度三项
+  - `test_position_vs_token_units()`（新增）：同一组数字（K=2102、expected_end=2104）在位置域判为 exact、在旧混合语义下判为 `target_past`；反向构造旧语义误判为 exact 而位置域正确报 `target_short`
+  - `test_media_state_unverified_gate()`（新增）：单块/多块/候选在块后/几何不合法优先/无媒体对照/理由名
+  - `test_media_boundary()`、`test_media_gap_is_legal()`、`test_media_chunks_malformed()` 改写为区分 `media` 与 `media_state_unverified`
+- 修改原因：规划 §4、§7.2
+
+### README.md、README_EN.md、projectSummary.md
+
+- 修改类型：修改
+- 修改前路径：README.md、README_EN.md、projectSummary.md
+- 修改前备份：.backupChange/2026-11-15 20-10/（projectSummary.md 在备份目录）
+- 修改后路径：同名文件
+- 修改位置：行为边界；projectSummary §3.1 不变量表
+- 具体变更：新增"端点比较只在 position 域""checkpoint 位置界取真实端点""媒体请求不进入主动写盘"三条不变量
+- 修改原因：规划 §4、§7.4
+
+## 验证记录
+
+- 已执行检查：CUDA 构建（`build-cuda-shared.bat`，MSVC 19.44.35226，sm_86-real + sm_89-real），本轮 2 次
+- 检查结果：通过，`0 FAILED`。`--version` 为 `0.9.0-dev (build 33, commit 6b35154)`
+
+- 已执行检查：`mtmd` 位置语义核对
+- 检查结果：确认 `mtmd_input_chunk_get_n_pos()`（`tools/mtmd/mtmd.cpp:3492`）对图像块转调 `mtmd_image_tokens_get_n_pos()`（`3738`），后者按 clip 行数累加（`3755`：`n_pos += 1 + clip_suffix_rows(entry.suffix_type).size()`），与 `mtmd_input_chunk_get_n_tokens()` 是独立量。单位错误的前提成立
+
+- 已执行检查：**本轮单位错误的定位与修正**（自查发现一处我自己的回归）
+- 检查结果：**发现并修正**。首版把 token 视图长度检查提前为硬失败（`skipped (prompt has 1478 < 2102 tokens)` 并置 `done`），导致所有中间批次捕获全部失效，端到端 `exported_total` 从 2 降为 0。修正为"未填满则 return 等下一批"后恢复：`scheduled 2 / exported 2 / cache_disk_entries 1 / persisted_refs 1`。该回归由端到端数值发现，不是单测——单测只覆盖纯元数据
+
+- 已执行检查：**媒体门禁位置修正**
+- 检查结果：首版门禁置于 `disk_cache_plan_materialize()` 开头，使媒体块的几何边界判定成为不可达代码，单测立刻暴露 15 项失败。改为置于"将要 arm"处后，`media`（几何不合法）与 `media_state_unverified`（几何合法）两个理由均可区分，单测全部通过
+
+- 已执行检查：**端到端核心链路**（`test-run/logs/fix9-w2.log`，`--cache-prefix-materialize`，`--cache-ram 512`，`--cache-disk-min-tokens 256`）
+- 检查结果：通过。
+
+  ```
+  plan_prefix_: materialize = skipped (no_candidates), n_past = 1476
+  plan_prefix_: materialize = scheduled, prefix = 2102 tokens, n_past = 1476
+  materialize_: materialize = exported, prefix = 2102 tokens
+  plan_prefix_: materialize = scheduled, prefix = 2101 tokens, n_past = 1478
+  materialize_: materialize = exported, prefix = 2101 tokens
+  metrics: scheduled 2 / exported 2 / cache_disk_entries 1 / persisted_refs 1
+  ```
+
+- 已执行检查：**重启后磁盘真实恢复**（`fix9-w2r.log`，同配置重启）
+- 检查结果：通过。`cache_scan_end: 1 entries, 538.51 MiB`、`1 snapshot(s) registered`；请求恢复 `source = disk, reused_disk = 2102, restored = 2102, read_bytes = 564668394`（与文件大小一致）；恒等式 `0 + 0 + 2102 + 394 = 2496` 成立
+
+- 已执行检查：**开启/关闭态输出一致性**（`fix9-off.log` vs `fix9-w2.log`，各 4 个相同请求）
+- 检查结果：通过。**12 个请求（开启态 8、关闭态 4）输出 sha 逐字节一致**：`f283d36a836120c4`、`9bceec30889f8bda`、`ad661337d3aa8896`、`b9febb26949711a2`。关闭态三个 materialize 指标全 0、`cache_disk_entries 0`
+
+- 已执行检查：恒等式抽查（`fix9-w2.log`）
+- 检查结果：通过。`2504 = 0+0+0+2504`、`2468 = 1476+0+0+992`、`2506 = 1476+0+0+1030`、`2540 = 1478+0+0+1062`，全部成立
+
+- 已执行检查：四套独立单测
+- 检查结果：通过。`all disk-cache match checks passed`、`all disk-cache quota checks passed`、`all prefix-index checks passed`、`all prefix-materialize checks passed`
+
+- 已执行检查：清理
+- 检查结果：通过。测试缓存目录、临时编译脚本与可执行文件、`__pycache__`、根目录 `.obj` 均已删除；`test-run/` 为 1.3 MB
+
+- 未执行的检查及原因：
+  - **媒体输入的端到端（含门禁本身）**：测试机无多模态模型与图片输入。规划 §7.2 要求"用模拟多媒体块创建 `n_tokens != n_pos` 的前缀，分别令目标/草稿端点等于、短于、超过 `expected_pos_end`"——我用**纯元数据**在 `test_position_vs_token_units()` 中构造了 `K=2102 / expected_end=2104` 的分离情形，但**没有用真实 mtmd 请求验证门禁日志与"原推理请求仍正常完成"**。门禁的生效路径（不 arm、不导出、不写盘）由单测覆盖，**未在真实服务上触发过**
+  - **`pos_next()` 的媒体路径未被本轮任何测试执行**：生产调用点的 `pos_next(K)` 只在纯文本下走过（此时恒等于 K）。媒体分支的 `while` 循环由既有代码与静态核对确认，**未运行**
+  - **`expected_end <= 0` 判据**：单测覆盖，运行中未构造（需要 `pos_next` 返回 0 或负的前缀）
+  - **target/draft 位置不一致的端到端**：运行中 `common_speculative_process()` 之后两者始终对齐，未能自然构造，也未能注入
+  - **checkpoint 过滤**：本机 `--checkpoint-min-step` 默认 8192，且还需 `is_user_start` 或 `near_prompt_end`；上一轮用 14990 token 纯文本输入仍未触发任何 checkpoint。本轮同样未触发，**只有单测覆盖**；`tgt_pos_max` 替代 `K-1` 的改动在运行中未被执行
+  - **context shift / 取消 / decode 重试**：未构造

@@ -42,6 +42,10 @@ enum class disk_cache_materialize_skip : uint8_t {
     media,           // the prefix end falls inside a media chunk
     past,            // the KV already moved past the position
     duplicate,       // this request already scheduled one
+    // this request carries media blocks, and the sequence state of a multimodal
+    // prefix has not been verified to export and restore correctly. the request
+    // is still planned and observed; it is simply not captured
+    media_state_unverified,
 };
 
 const char * disk_cache_materialize_skip_name(disk_cache_materialize_skip reason);
@@ -95,10 +99,15 @@ disk_cache_materialize_plan disk_cache_plan_materialize(const disk_cache_materia
 //
 // where a capture stands, in terms of the two contexts' real sequence endpoints
 //
-// `end` is "one past the highest position the sequence holds", i.e. the number of
-// positions it covers - the same quantity `llama_memory_seq_pos_max() + 1` gives.
-// It is compared against the planned prefix length, so the comparison is in
-// tokens on both sides.
+// Everything here is a **position**, not a token count. The two are the same
+// number for text only: a media chunk occupies more positions than the number of
+// tokens it stands for (`mtmd_input_chunk_get_n_pos()` vs
+// `mtmd_input_chunk_get_n_tokens()`), so for a prefix that contains one, the
+// position its KV ends at is not its token count.
+//
+// Each endpoint is "one past the highest position the sequence holds", which is
+// what `llama_memory_seq_pos_max() + 1` gives. The expected endpoint is
+// `server_tokens::pos_next(prefix_tokens)`, again a position.
 //
 enum class disk_cache_capture_bounds : uint8_t {
     exact = 0,     // both endpoints sit on the prefix: this is the only exportable state
@@ -112,15 +121,19 @@ enum class disk_cache_capture_bounds : uint8_t {
 const char * disk_cache_capture_bounds_name(disk_cache_capture_bounds bounds);
 
 // A snapshot pairs the target and the draft state, so both must end exactly on
-// the prefix. "the batch was cut at K" makes this true for the target but says
-// nothing about the draft: speculative decoding advances it on its own path, and
-// a state copied across two contexts that disagree would describe a prompt that
-// was never executed.
+// the prefix. "the batch was cut at K tokens" makes this true for the target but
+// says nothing about the draft: speculative decoding advances it on its own path,
+// and a state copied across two contexts that disagree would describe a prompt
+// that was never executed.
+//
+// All three numbers are positions. `expected_position_end` comes from
+// `server_tokens::pos_next(prefix_tokens)`; passing a token count here would
+// compare two different units and silently misjudge every multimodal prefix.
 //
 // `has_draft == false` keeps the target-only path: a deployment without a draft
 // model has one context to check.
-disk_cache_capture_bounds disk_cache_check_capture_bounds(size_t prefix_tokens,
-        int64_t target_end, bool has_draft, int64_t draft_end);
+disk_cache_capture_bounds disk_cache_check_capture_position_bounds(int64_t expected_position_end,
+        int64_t target_position_end, bool has_draft, int64_t draft_position_end);
 
 // select the checkpoints that may travel with a prefix snapshot.
 //
@@ -134,8 +147,10 @@ disk_cache_capture_bounds disk_cache_check_capture_bounds(size_t prefix_tokens,
 // against `prefix_tokens` therefore admits one position too many - a checkpoint
 // whose KV the entry cannot account for.
 //
-// With media chunks the two bounds diverge further, since a chunk occupies more
-// positions than its token count. Each field is checked against its own bound.
+// With media chunks the two bounds diverge, since a chunk occupies more positions
+// than its token count. Each field is checked against its own bound, and the
+// position bound is a real verified endpoint - never derived from the token
+// count, which is only valid for text.
 struct disk_cache_checkpoint_view {
     int64_t pos_min  = 0;
     int64_t pos_max  = 0;
@@ -145,11 +160,12 @@ struct disk_cache_checkpoint_view {
 bool disk_cache_checkpoint_fits(const disk_cache_checkpoint_view & ckpt,
         size_t prefix_tokens, int64_t prefix_pos_max);
 
-// The position bound for a text-only prefix of `prefix_tokens` tokens.
+// The position a text-only prefix of `prefix_tokens` tokens ends at, i.e.
+// `prefix_tokens - 1` (and -1 for an empty prefix).
 //
-// Boundary arithmetic lives here rather than at the call site so it is covered by
-// the same tests as the predicate. A prefix of N tokens occupies positions
-// [0, N), so the highest covered position is N - 1; passing N instead would admit
-// a checkpoint covering one extra position. Returns -1 for an empty prefix, which
-// the predicate treats as "no valid bound".
+// This is the text-only identity `pos_next(N) == N`. It is kept for unit tests
+// that pin that identity down and must NOT be used as the position bound for a
+// request that may contain media: there the two numbers differ, and the caller
+// has the verified endpoint from the live memory instead.
 int64_t disk_cache_prefix_pos_max_text(size_t prefix_tokens);
+
