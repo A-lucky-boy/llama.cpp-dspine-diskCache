@@ -4,8 +4,8 @@
 |---|---|
 | 仓库 | `A-lucky-boy/llama.cpp-dspine-diskCache` |
 | 本次交付起点 | `010c68a`（会话前 HEAD，第七轮交付说明提交） |
-| 本次交付终点 | `d0537f1` |
-| 功能提交 | `d0537f1` |
+| 本次交付终点 | 分支 `main` 顶端（功能提交 `d0537f1`，其后仅有本说明自身的文档提交） |
+| 功能提交 | `d0537f1`（全部代码与测试改动） |
 | 规划依据 | `betterModification.md` → `2026-11-16 01-12 - test1_3` |
 | 构建产物 | `0.9.0-dev (build 31, commit d0537f1)`，MSVC 19.44.35226，sm_86-real + sm_89-real |
 | 交付性质 | **正确性修复 + 回归补充**（规划 §1 明示不是新算法实验） |
@@ -273,7 +273,7 @@ disk_cache_checkpoint_fits({ ... }, K, disk_cache_prefix_pos_max_text(K))
 
 | 项 | 值 |
 |---|---|
-| 本地 HEAD | `d0537f1` |
+| 本地 HEAD | 分支 `main` 顶端；功能提交 `d0537f1` |
 | 远端 | `git@github.com:A-lucky-boy/llama.cpp-dspine-diskCache.git` |
 | 分支 | `main` |
 | 工作树 | 干净（无未提交改动） |
