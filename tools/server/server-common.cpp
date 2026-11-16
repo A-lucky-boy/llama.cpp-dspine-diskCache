@@ -726,6 +726,54 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     }
 }
 
+bool server_tokens::bind_media_mode(bool server_has_mtmd) {
+    // A container without media is pure text: adopting the server's mode is a
+    // metadata-only change. The KV for these tokens was computed from the token ids
+    // alone, and the token ids are untouched, so the restored state stays valid - this
+    // is the whole reason the promotion is safe.
+    if (map_idx_to_media.empty()) {
+        has_mtmd = server_has_mtmd;
+        return true;
+    }
+
+    // A container holding media cannot be re-bound by simply flipping the flag: the
+    // media map has to describe the same token positions the placeholders occupy.
+    // If the server cannot do media at all, or the mapping is inconsistent, the caller
+    // gets `false` and discards the state - a wrong container is not usable, and
+    // asserting here would turn a request error into a process abort.
+    if (!server_has_mtmd) {
+        return false;
+    }
+
+    has_mtmd = true;
+
+    for (const auto & item : map_idx_to_media) {
+        const size_t idx = item.first;
+        const auto & chunk = item.second;
+
+        if (!chunk || idx >= tokens.size()) {
+            return false;
+        }
+
+        const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
+        const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+
+        // the placeholder run must be inside the container and start at the recorded
+        // index, and the tokens it covers must still be placeholders
+        if (n_tokens == 0 || n_pos <= 0 || idx + n_tokens > tokens.size()) {
+            return false;
+        }
+
+        for (size_t j = idx; j < idx + n_tokens; ++j) {
+            if (tokens[j] != LLAMA_TOKEN_NULL) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
     auto type = mtmd_input_chunk_get_type(chunk);
     if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {

@@ -71,6 +71,8 @@
 | 先准入、后替代 | `server-disk-cache-quota.*` 做只读配额试算：隔离条目按真实字节计入且不参与淘汰，新条目受保护；试算不通过即回滚新文件、保留原有快照。只有新条目存活过容量处理（`drop_prefixes(..., replacement_is_admitted=true)`）才允许删除被它替代的短快照 |
 | 替代存活不变量 | 任何以"长快照 L 可替代短快照 S"为由删除 S 的事务，结束时 L 必须仍在 `entries` 中、未隔离、且文件存在；否则不删 S |
 | 保护身份不随容器移动 | 配额事务的保护集是路径字符串集合（`disk_cache_protected_paths`），不是指向 `entries` 元素的指针；TTL 清扫与 LRU 淘汰共用它，每次 `erase()` 后按路径重新判定 |
+| has_mtmd 是能力标志而非内容标志 | 该标志描述"这个容器是否允许承载媒体占位"（取值依据：服务器是否有 mctx），却被 tokenizer 按"本次输入是否含媒体"赋值——纯文本请求恒为 false。于是纯文本请求产生的容器在媒体服务器上被标为不可承载媒体，后续带图请求追加占位即断言退出。修复：新增 `bind_media_mode()`，无媒体映射的容器采纳服务器模式（纯元数据变更，已恢复的 KV 有效）；有媒体映射的容器逐条校验 chunk 起点/长度/占位，不一致则返回 false 交由调用方清理重 prefill |
+| 媒体模式在请求进入 prefill 前统一绑定 | 同步点选在 `launch_slot_with_task()` 尾部一处，因为调用顺序是"选槽 → 恢复 → 交付 prefill"，一处即可覆盖 Slot 直接复用、RAM 恢复、Disk 恢复三条路径，避免三条路径各写一遍造成漂移。断言未被改动——修复发生在进入该路径之前 |
 | 启用标志是原子的、单向的 | `active` 为 `std::atomic<bool>`：后台 worker 持锁禁用，前台 `load`/`store`/`mirror`/`preflight_materialize` 及 `flush_to_disk`/`mirror_latest` 无锁读取，普通 `bool` 在此构成数据竞争。禁用侧 release、读取侧 acquire，转移单向（判定元数据不可信后同一轮内不再可信），因此不需 compare-exchange。acquire 只证明读取那一刻的状态，故在磁盘锁内做实际决定处**再次复检** |
 | 封锁只有一个入口 | `disable_disk_tier_locked()` 是唯一组合更新 `quarantine_untrusted`、`active` 与诊断的地方。此前有两处只写 `quarantine_untrusted = true` 而不置 `active = false`——记录了疑虑却没据此行动 |
 | 禁用后队列不再产生文件 | worker 取出任务后即判断禁用并取消，归还字节预算与 in-flight 身份槽（`cancel_pending_locked()`）。仅禁止新任务入队不足以保证"禁用后无新增写入" |

@@ -2949,6 +2949,33 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
+        // Re-bind the prompt container to this server's media capability before the
+        // request can reach prefill.
+        //
+        // The three restore paths above - a reused slot, the RAM cache, the disk cache -
+        // all carry a container that was built for an *earlier* request, and the
+        // tokenizer marks a text-only request with `has_mtmd = false` whatever the
+        // server can do. So a prompt restored from a text-only request is flagged as
+        // not-media-capable, and the moment this request carries an image the append
+        // path trips an assertion. The flag describes the container, not the request,
+        // and this is the point where the container is about to be used.
+        //
+        // Doing it here rather than in each restore path means slot reuse, RAM and disk
+        // are covered by one rule: for a media-free container the change is metadata
+        // only, so the KV already restored stays valid and this costs nothing.
+        {
+            const bool server_has_mtmd = mctx != nullptr;
+
+            if (!slot.prompt.tokens.bind_media_mode(server_has_mtmd)) {
+                // The container holds media this server cannot describe, or its media map
+                // no longer matches its placeholders. Neither state can be used, so the
+                // prompt is dropped and the request is served by a plain prefill - a
+                // cache miss, not a crash and not a wrong KV.
+                SLT_WRN(slot, "%s", "prompt media state does not match the server; re-prefilling\n");
+                slot.prompt_clear();
+            }
+        }
+
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
     }

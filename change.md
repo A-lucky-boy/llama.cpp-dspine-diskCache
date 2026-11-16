@@ -4019,3 +4019,216 @@ prompt.tokens.append_media_placeholders_from(tokens_new);
 `has_mtmd` 取自**本次请求**（图片请求为 true），而磁盘条目来自**纯文本**请求、不含任何媒体块——于是无媒体的 prompt 被标记为 `has_mtmd=true`，后续媒体占位插入走到 `GGML_ASSERT(has_mtmd)` 的失败路径。
 
 **影响与本轮边界**：规划 §七要求"至少重复一次三篇小说的交替跨重启磁盘恢复，以及 1.png/2.png 不同媒体身份隔离"。**文本部分已完成并通过**；**媒体身份隔离部分被这个既有崩溃阻断，未能执行**。这属于"明确的缓存功能错误"，但按规划 §十二"应先修复实际错误位置"——它不在本轮四项范围（§二"预期修改文件"）内，且修复需要改动 `server-context.cpp` / `server-common.cpp` 的 `has_mtmd` 传播语义。**本轮未修改这两处**，如实记录为待办。
+
+# 2026-11-16 19-20 - Change Record（test1_5 修复轮：has_mtmd 媒体模式不变量 + 崩溃修复）
+
+## 变更概述
+
+按 `betterModification.md` 的 `2026-11-16 18-45 - test1_5` 与算法规划文档 `v16_mtmd_transition_repair.md`，修复"纯文本磁盘缓存恢复后紧接着发送图像请求导致 `GGML_ASSERT(has_mtmd)` 进程退出"。
+
+**规划 §2.2 的告诫是对的**：规划明确指出"报告指向的 `server_disk_cache::load()` 构造 `server_tokens(restored_tokens, tokens_new.has_mtmd)` 本身并不足以证明最终根因"，并要求先定位最后一次赋值。按此执行后，实测证明**磁盘那一行不是根因**——它忠实地复制了一个上游就已经错误的标志。真正的错源在 tokenizer。因此 `server-task.cpp` **一行未改**。
+
+## 一、故障定位（按规划 §2.2 执行，非假设）
+
+在四个阶段加入临时诊断（请求入槽前 / 恢复完成后 / 追加媒体前 / `push_back_placeholder()` 入口），复现崩溃序列，得到完整轨迹：
+
+```text
+tokenize_input_subprompt: mctx=1 computed_has_mtmd=1 is_string=1
+tokenize_input_subprompt: returning TEXT tokens with has_mtmd=0 (2480 tokens)   ← 错源
+disk restore:             tokens_new.has_mtmd=0 restored=2480
+disk restore done:        prompt.tokens.has_mtmd=0 n_media=0                    ← 忠实传播
+push_back_placeholder:    has_mtmd=0 n_tokens=46 n_media=0 chunk_type=1        ← 断言
+```
+
+**最后一次改变该标志的地方**是 `tokenize_input_subprompt()`，不是磁盘恢复。源码位置 `tools/server/server-common.cpp`（诊断前 1186–1194 行）：
+
+```cpp
+const bool has_mtmd = mctx != nullptr;
+if (json_prompt.is_string() || json_is_array_of_mixed_numbers_strings(json_prompt)) {
+    llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
+    return server_tokens(tmp, false);   // ← 恒为 false，上面算出的 has_mtmd 被丢弃
+}
+```
+
+### 根因：`has_mtmd` 被同时用于两种含义
+
+| 含义 | 取值依据 | 使用点 |
+|---|---|---|
+| **能力**：该容器是否允许承载媒体占位、遍历媒体映射 | 服务器是否有 `mctx` | slot 初始化 `has_mtmd = (mctx != nullptr)`（`server-context.cpp:1642`）、`push_back_placeholder()` 的断言、`pos_next()` / `keep_first()` / `get_common_prefix()` 的媒体分支 |
+| **内容**：本次输入是否含媒体块 | 本次请求 | tokenizer 对纯文本请求返回 `false` |
+
+两者被混为一谈：tokenizer 认为"本次请求是纯文本"→ 标 `false`（对**请求**而言正确），但这个容器随后被 slot 当作"能力"承载。于是纯文本请求产生的容器在媒体服务器上被标为"不能承载媒体"，一旦后续请求带图，追加占位就撞上断言。
+
+**与既有行为的关系**（规划 §一判断成立）：`server_tokens` 的这一设计、断言、slot 初始化都属 baseline 行为。当前缓存增强只是**扩大了容器跨请求存活的范围**，使这个既有缺陷从"几乎不会发生"变成"图文交替必现"。
+
+## 二、修复（规划 §2.3：最小且覆盖三条缓存路径）
+
+### 2.1 新增 `server_tokens::bind_media_mode(bool server_has_mtmd)`
+
+按容器当前内容分两种处理：
+
+- **无媒体映射**（纯文本容器）→ 采纳服务器模式。这是**纯元数据变更**：token id 与被恢复的 KV 都未改变，因此已恢复的文本 KV 完全有效，升级不需要重算任何东西。返回 `true`。
+- **有媒体映射** → 不翻转布尔，而是**逐条校验**：chunk 非空、起始索引在范围内、`n_pos > 0`、占位长度不越界、且该区间内 token 确实都是 `LLAMA_TOKEN_NULL`。同时校验服务器确实支持媒体。任一不满足 → 返回 `false`。
+
+**返回 `false` 而非断言**是刻意的：不可用的状态应该变成一次 cache miss，而不是进程退出。规划 §2.3.5 明确要求"不得把 `GGML_ASSERT(has_mtmd)` 改为无条件跳过，更不能以压制断言来掩盖数据结构不一致"——本实现没有动那个断言，而是让**调用方在进入该路径前**就把状态修正或丢弃。
+
+### 2.2 唯一同步点：`launch_slot_with_task()` 尾部
+
+```cpp
+{
+    const bool server_has_mtmd = mctx != nullptr;
+
+    if (!slot.prompt.tokens.bind_media_mode(server_has_mtmd)) {
+        SLT_WRN(slot, "%s", "prompt media state does not match the server; re-prefilling\n");
+        slot.prompt_clear();
+    }
+}
+```
+
+选址理由（规划 §2.3.2 要求"选择最少的必需调用点"）：调用顺序实测为 `get_available_slot()`（3887）→ 恢复 → `launch_slot_with_task()`（3920）。**放在这一处即可覆盖全部三条路径**：
+
+| 路径 | 如何被覆盖 |
+|---|---|
+| Slot 直接复用（`f_keep >= 0.5`，**不**调用 `prompt_load`） | 容器原样保留，此处统一绑定 |
+| RAM 恢复（`prompt = std::move(it_best->prompt)`） | 同上 |
+| Disk 恢复（`server_tokens(restored_tokens, tokens_new.has_mtmd)`） | 同上 |
+
+规划 §2.3.4 明确要求"RAM 缓存 `std::move` 后应遵守与 Disk 恢复相同的媒体模式约束；不能只修 Disk 分支"——单一同步点天然满足，且避免了在三条路径各写一遍导致漂移。也因此在 `server-task.cpp` 的 Disk 构造处**无需改动**。
+
+### 2.3 未做的事
+
+- **未修改** `push_back_placeholder()` 的断言（避免压制不一致）
+- **未修改** `server_tokens` 的既有语义（`clear()` 不清标志、`clone()` 复制标志——实测确认，并在单测中固化）
+- **未新增** 媒体状态导出路径；`media_state_unverified` 门禁不变
+
+## 三、修改文件
+
+### tools/server/server-common.h
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-common.h
+- 修改后路径：同名文件
+- 修改位置：`server_tokens` 新增 `bind_media_mode()` 声明及语义注释
+- 具体变更：见 §2.1
+- 修改原因：规划 §三（"增加最小的媒体模式安全绑定/校验辅助，使用真正的 `server_tokens` 生产实现"）
+
+### tools/server/server-common.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-common.cpp
+- 修改后路径：同名文件
+- 修改位置：实现 `bind_media_mode()`
+- 具体变更：见 §2.1
+- 修改原因：同上
+
+### tools/server/server-context.cpp
+
+- 修改类型：修改
+- 修改前路径：tools/server/server-context.cpp
+- 修改后路径：同名文件
+- 修改位置：`launch_slot_with_task()` 尾部（`n_empty_consecutive = 0;` 之后、`return true` 之前）新增媒体模式同步
+- 具体变更：见 §2.2
+- 修改原因：规划 §三、§2.3.2
+
+### tools/server/tests/unit/test_cache_media_transition.cpp（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 修改位置：全文件
+- 具体变更：10 组用例，全部调用**生产函数**
+- 修改原因：规划 §三、§六.1
+
+### test-run/build_media_transition_test.bat（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：该测试需链接 `server-common.cpp` 与 mtmd/ggml 库，故单独成脚本；固定 MSVC 14.44.35207（默认 `vcvars64` 会选中另一套安装，导致 `msvcprt.lib` 找不到）
+- 修改原因：规划 §六.1（"直接调用生产函数"需要可构建入口）
+
+### test-run/run_unit_tests.bat
+
+- 修改类型：修改
+- 修改前路径：test-run/run_unit_tests.bat
+- 修改后路径：同名文件
+- 修改位置：新增 media transition 一节
+- 具体变更：见上
+- 修改原因：规划 §六.4
+
+### test-run/cache_mixed_matrix.py（新增）
+
+- 修改类型：新增
+- 修改后路径：同名文件
+- 具体变更：文本/图片交替序列、跨小说恢复后插图、同图重复、换图、混合 prompt（文本+图+文本）
+- 修改原因：规划 §三、§六.3
+
+### **tools/server/server-task.cpp（未修改）**
+
+规划要求"审核 Disk 构造与 RAM 的媒体模式传播；**仅修改可确定的失配点**"。审核结论：Disk 那行如实复制入参标志，失配发生在更上游。故未改动，也未新增任何规避代码。
+
+## 四、验证执行记录
+
+- 已执行检查：CUDA release 构建（含临时诊断版 1 次、正式版 2 次）
+- 检查结果：通过。最终 `output\llama-server.exe` 含本轮修改（`prompt media state does not match the server` 字符串可检出）
+
+- 已执行检查：**故障定位**（规划 §2.2）
+- 检查结果：通过。捕捉到完整轨迹（§一），确认**最后一次改变标志的函数是 `tokenize_input_subprompt()`**，并据此否定了"磁盘那一行是根因"的假设
+
+- 已执行检查：**崩溃序列回归**（磁盘恢复文本 → 1.png → 2.png → 1.png）
+- 检查结果：**通过**。修复前该序列使进程退出；修复后：
+
+| 步骤 | 结果 |
+|---|---|
+| 文本磁盘恢复 | `source=disk`，`reused_disk=2476` |
+| 1.png（原崩溃点） | 正常，内容正确（"文件资源管理器窗口…"） |
+| 2.png | 正常，答案不同 |
+| 1.png 再次 | 正常，sha 与首次一致 |
+
+**断言 0 次**，进程存活。且**回退计数为 0**——纯元数据升级已足够，没有丢弃任何已恢复的 KV
+
+- 已执行检查：媒体迁移单测（10 组）
+- 检查结果：通过。**反向验证**：让 `bind_media_mode()` 不再采纳服务器模式（即退回修复前行为）后 **6 项失败**——测试确实约束该不变量
+- 覆盖：纯文本容器升级/不升级、幂等、空容器、`pos_next` 不受标志影响、`keep_first`、`clear()` 保留标志、`clone()` 携带标志且相互独立、`get_common_prefix()` 跨模式变更仍正确（含分叉点与短请求两种形状）
+- **未覆盖**：有媒体映射的容器（构造需真实 mtmd chunk），已在文件中明确标注
+
+- 已执行检查：十套独立单测
+- 检查结果：全部通过（codec / layout / lifecycle / match / quota / prefix-index / materialize / ASan codec / fs replace / **media transition**）
+
+- 已执行检查：**混合矩阵**（规划 §6.3）
+- 检查结果：通过。逐请求记录真实 `source`：
+
+```text
+A(disk,2476) -> A(slot,2476) -> 1.png -> 2.png -> A(ram,2476)
+B(disk,2251) -> 2.png(ram,3282) -> 1.png(ram,597) -> B(ram,2251)
+A -> B -> C(disk,2457) -> A
+1.png -> 1.png -> 2.png
+1.png 可复现 True / 2.png 可复现 True / 1.png != 2.png True
+```
+
+- 每行满足 `prompt = reused_slot + reused_ram + reused_disk + prefill`
+- **附件**：本轮日志的原始位置见 `test-run/logs/`（被 `.gitignore` 忽略，不入库）
+
+- 已执行检查：**混合 prompt**（文本 + 图 + 文本于同一请求，占位在 token 串中间）
+- 检查结果：通过。两次运行 `cached=2091`，输出 sha 完全一致（`cfdf3b1fb6fc0de2`），断言 0
+
+- 已执行检查：**Cache-off 对照**（规划 §6.2）
+- 检查结果：通过。`--cache-disk-max 0` 下 文本→1.png→2.png 正常完成，sha 与开启缓存时一致，断言 0——排除通用媒体模型缺陷
+
+- 已执行检查：清理
+- 检查结果：通过。所有 `test-run/cache-*` scratch 目录已删，未触碰 `E:\llama.cpp.cache`、`E:\小说` 与桌面两张 PNG
+
+- **未执行的检查及原因**：
+  - **规划 §6.2 "RAM 恢复"的独立构造**：**部分执行**。矩阵中出现 `source=ram`（如 `2.png(ram,3282)`、`A(ram,2476)`），但**未构造"先让文本移入 RAM 再发图"的定向用例**——RAM 的淘汰/迁移时机由内部预算决定，我没有可控手段指定某个条目进入某一层
+  - **规划 §6.2 "Disk-only 对照（降低/关闭 RAM 以隔离 Slot/RAM）"**：**未执行**。实测 `--cache-ram 0` 会使 `--cache-disk` 整体不生效（日志明确 `--cache-disk requires the RAM prompt cache`），无法在保留磁盘层的前提下关闭 RAM
+  - **规划 §6.3 边界项**：`n_past = 0`、媒体在文本之前（占位在 token 串开头）、多媒体 chunk —— **未单独构造**。已覆盖的是"媒体在文本之后"与"文本-图-文本"两种位置
+  - **规划 §6.3 "图片 A 与图片 B 的缓存身份"中的磁盘路径**：**未执行**。实测图片请求不产生磁盘条目（`media_state_unverified` 门禁使主动媒体前缀物化保持关闭），因此 "图片 A 落盘 → 重启 → 请求图片 B" 这一形状在本机配置下无法建立。图片身份验证是在 **RAM/Slot 层**完成的，已在报告中如实区分
+  - **既有未验证项**：队列异常注入、精确崩溃窗口、`touch_entry` 端到端——**仍未验证**，未因本轮修复而改写
+
+## 五、范围确认
+
+- 未改 `src/llama-context.cpp` 的 seq state API、DSpine 投机解码 kernel、磁盘 v8/v9 文件、manifest v3、侧车 CRC、写入配额、in-flight 身份、主动前缀捕获算法（规划 §三、§二）
+- 未把 `GGML_ASSERT(has_mtmd)` 改为无条件跳过，未以压制断言掩盖不一致（规划 §2.3.5）
+- 保持 `std::atomic<bool> active`、唯一 `disable_disk_tier_locked()`、禁用后队列取消逻辑不动（规划 §五.1）
+- 媒体状态异常只导致**保守清理 + 普通 prefill**，不会导致进程退出（规划 §五.4）
+- 未开启未验证的媒体状态导出；`media_state_unverified` 门禁不变（规划 §2.3.7）
+- 测试全程使用隔离缓存目录，**未写入** `E:\llama.cpp.cache`
+- 未上传小说原文与图片二进制；诊断代码在定位完成后已全部移除，正式构建不含诊断输出

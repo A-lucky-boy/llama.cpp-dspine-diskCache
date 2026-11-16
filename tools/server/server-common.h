@@ -236,6 +236,32 @@ public:
     // only use this if the chunk will never be encoded again (e.g. it is already in the KV cache)
     void push_back_placeholder(const mtmd_input_chunk * chunk);
 
+    // Re-bind this container to the media mode of the server it is about to be used
+    // with.
+    //
+    // `has_mtmd` is a *capability* flag: it says whether this container may hold media
+    // placeholders and whether operations that walk media (pos_next, keep_first,
+    // get_common_prefix) must consult the media map. It is not a statement that the
+    // prompt happens to contain an image.
+    //
+    // Those two meanings get conflated because the tokenizer builds text-only requests
+    // with `has_mtmd = false` - correct for a text request, but it is the *request*
+    // that is text-only, not the server. When such tokens are later used to serve a
+    // request that does carry an image, the container must be promoted before any media
+    // placeholder is appended, or the append trips an assertion that the container is
+    // not media-capable.
+    //
+    // A text-only container is pure tokens with no media map, so promoting it is a pure
+    // metadata change: nothing has to be recomputed, and in particular the KV already
+    // restored for those tokens stays valid. A container that *does* hold media is
+    // checked rather than converted - the media map has to line up with the token
+    // placeholders, and if it does not the caller has a state it cannot trust and must
+    // fall back to a plain prefill instead of asserting.
+    //
+    // Returns false when the container holds media whose mapping is inconsistent; the
+    // caller must then discard the state rather than use it.
+    bool bind_media_mode(bool server_has_mtmd);
+
     // appends server tokens, updates the media map. copies media chunks.
     void push_back(server_tokens & tokens);
 

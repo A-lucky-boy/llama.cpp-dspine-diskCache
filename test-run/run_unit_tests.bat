@@ -56,5 +56,9 @@ echo === fs replacement semantics ===
 cl %FLAGS% /Fe:%OUT%t_fsreplace.exe %OUT%fs_replace_probe.cpp || exit /b 1
 %OUT%t_fsreplace.exe || exit /b 1
 
+echo === media transition ===
+rem links server-common.cpp, so it carries its own toolchain pinning and library set
+call "%~dp0build_media_transition_test.bat" || exit /b 1
+
 echo ALL PASSED
 exit /b 0
