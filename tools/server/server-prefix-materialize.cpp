@@ -115,6 +115,14 @@ disk_cache_capture_bounds disk_cache_check_capture_bounds(size_t prefix_tokens,
     return disk_cache_capture_bounds::exact;
 }
 
+int64_t disk_cache_prefix_pos_max_text(size_t prefix_tokens) {
+    if (prefix_tokens == 0) {
+        return -1;
+    }
+
+    return (int64_t) prefix_tokens - 1;
+}
+
 bool disk_cache_checkpoint_fits(const disk_cache_checkpoint_view & ckpt,
         size_t prefix_tokens, int64_t prefix_pos_max) {
     if (prefix_tokens == 0) {

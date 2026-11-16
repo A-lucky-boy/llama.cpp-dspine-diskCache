@@ -144,3 +144,12 @@ struct disk_cache_checkpoint_view {
 
 bool disk_cache_checkpoint_fits(const disk_cache_checkpoint_view & ckpt,
         size_t prefix_tokens, int64_t prefix_pos_max);
+
+// The position bound for a text-only prefix of `prefix_tokens` tokens.
+//
+// Boundary arithmetic lives here rather than at the call site so it is covered by
+// the same tests as the predicate. A prefix of N tokens occupies positions
+// [0, N), so the highest covered position is N - 1; passing N instead would admit
+// a checkpoint covering one extra position. Returns -1 for an empty prefix, which
+// the predicate treats as "no valid bound".
+int64_t disk_cache_prefix_pos_max_text(size_t prefix_tokens);

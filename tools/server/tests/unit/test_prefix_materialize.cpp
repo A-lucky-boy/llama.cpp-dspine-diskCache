@@ -474,6 +474,43 @@ void test_checkpoint_fits() {
     CHECK(!disk_cache_checkpoint_fits({ 0,  26,   8 }, 10, 25));
 }
 
+// the boundary arithmetic itself. it lives in the module so it is covered here
+// instead of being recomputed at each call site - an off-by-one there would
+// silently admit one extra position
+void test_prefix_pos_max_text() {
+    // N tokens occupy positions [0, N): the highest one is N - 1
+    CHECK_EQ(disk_cache_prefix_pos_max_text(   1),    0);
+    CHECK_EQ(disk_cache_prefix_pos_max_text(   2),    1);
+    CHECK_EQ(disk_cache_prefix_pos_max_text( 100),   99);
+    CHECK_EQ(disk_cache_prefix_pos_max_text(2102), 2101);
+
+    // an empty prefix has no valid position, reported as -1. the predicate
+    // refuses a negative bound, so this is a refusal rather than "everything fits"
+    CHECK_EQ(disk_cache_prefix_pos_max_text(0), -1);
+    CHECK(!disk_cache_checkpoint_fits({ 0, 0, 1 }, 0, disk_cache_prefix_pos_max_text(0)));
+
+    // the two functions agree: a checkpoint of exactly N tokens fits, one of N+1
+    // does not. the lower variant needs N >= 2 for a non-negative pos_max
+    for (size_t n = 1; n <= 32; ++n) {
+        const int64_t bound = disk_cache_prefix_pos_max_text(n);
+
+        CHECK(disk_cache_checkpoint_fits({ 0, (int64_t) n - 1, (int64_t) n }, n, bound));
+
+        if (n >= 2) {
+            CHECK(disk_cache_checkpoint_fits({ 0, (int64_t) n - 2, (int64_t) n - 1 }, n, bound));
+        }
+
+        CHECK(!disk_cache_checkpoint_fits({ 0, (int64_t) n, (int64_t) n + 1 }, n, bound));
+    }
+
+    // passing the token count as the position bound is the historical mistake.
+    // the shape below fits the token check (100 tokens in a 100-token prefix) and
+    // is refused only because its position bound is off by one
+    CHECK( disk_cache_checkpoint_fits({ 0,  99, 100 }, 100,  99)); // correct bound: inside
+    CHECK(!disk_cache_checkpoint_fits({ 0, 100, 100 }, 100,  99)); // ... and the next position is out
+    CHECK( disk_cache_checkpoint_fits({ 0, 100, 100 }, 100, 100)); // bound taken as K: wrongly admitted
+}
+
 // every refusal reason has a printable name, distinct from "none"
 void test_skip_names() {
     const skip_t all[] = {
@@ -508,6 +545,7 @@ int main() {
     test_media_chunk_predicate();
     test_capture_bounds();
     test_checkpoint_fits();
+    test_prefix_pos_max_text();
     test_past_the_boundary();
     test_zero_length_ignored();
     test_shared_prefix_scenario();

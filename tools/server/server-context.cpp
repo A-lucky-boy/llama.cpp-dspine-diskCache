@@ -2285,7 +2285,7 @@ private:
         // so a refusal here costs nothing
         for (const auto & ckpt : slot.prompt.checkpoints) {
             if (disk_cache_checkpoint_fits({ ckpt->pos_min, ckpt->pos_max, ckpt->n_tokens },
-                        K, (int64_t) K - 1)) {
+                        K, disk_cache_prefix_pos_max_text(K))) {
                 snapshot.checkpoints.push_back(ckpt);
             } else {
                 SLT_WRN(slot, "cache_stats: materialize: dropping checkpoint (pos_min = %d, pos_max = %d, n_tokens = %lld) past prefix %zu\n",

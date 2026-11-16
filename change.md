@@ -1928,7 +1928,7 @@ W srv load_model: --cache-prefix-materialize needs a disk cache tier (--cache-di
 - 检查结果：通过。覆盖 `target=K/draft=K`、`draft<K`、**`draft>K`（原缺失分支）**、`target<K`、`target>K`、`draft_missing`、负端点、仅 target 无 draft、以及"target 短且 draft 超前时优先报 target"
 
 - 已执行检查：**缺陷 C 缺陷复现**（把判定临时改回单区间语义）
-- 检查结果：**确认缺陷存在**。同一组用例出现 6 项失败：
+- 检查结果：**确认缺陷存在**。同一组用例出现 7 项失败：
 
   ```
   FAIL test_prefix_materialize.cpp:199: plan.capture
@@ -1976,6 +1976,16 @@ W srv load_model: --cache-prefix-materialize needs a disk cache tier (--cache-di
 
 - 已执行检查：恒等式抽查（`fix8-n1.log` / `fix8-n2.log`）
 - 检查结果：通过。`2504 = 0 + 0 + 0 + 2504`、`2468 = 1476 + 0 + 0 + 992`、`2506 = 1476 + 0 + 0 + 1030`、`2540 = 1478 + 0 + 0 + 1062`、`2512 = 2101 + 0 + 0 + 411`、`2477 = 2101 + 0 + 0 + 376`，全部成立
+
+- 已执行检查：**自查发现的交付级测试缺口**（本轮交付前补做）
+- 检查结果：**发现并修复**。规划 §3.2 要求"引入可独立测试的状态边界判定函数……单测不要复制另一套相似条件"。我照此抽出了谓词 `disk_cache_checkpoint_fits()`，但位置上界 `K-1` 的算术**仍留在调用点**（`disk_cache_checkpoint_fits({...}, K, (int64_t) K - 1)`）——谓词有测试，而这段算术没有。
+- 验证方式：构造回归，把调用点的 `K - 1` 改回 `K`（即重新引入 off-by-one），四套单测**全部通过**——测试完全无法发现它。这证明该缺口真实存在。
+- 修复：把算术移入被测模块，新增 `disk_cache_prefix_pos_max_text(size_t prefix_tokens)`（返回 `N-1`；`N==0` 返回 `-1`），调用点改为 `disk_cache_checkpoint_fits({...}, K, disk_cache_prefix_pos_max_text(K))`。
+- 新增测试 `test_prefix_pos_max_text()`：直接断言 4 个取值、`N==0` 的拒绝对照、`N=1..32` 的循环一致性（N 个 token 恰好通过、N+1 个被拒）、以及"token 数当位置上界会被错误接纳"的对照。回归验证：把 helper 改回 `return prefix_tokens` 后 **4 项失败直接命中**（`disk_cache_prefix_pos_max_text(1) == 0 (1 vs 0)` 等）
+- 同类排查：通用路径 `capture_boundary()` 直接传真实 `pos_max`、无算术；`materialize_prefix()` 的其余入参均为 `llama_memory_seq_pos_max() + 1` 的直读，无算术
+
+- 已执行检查：修复后的最终端到端回归（`test-run/logs/fix9-z1.log`）
+- 检查结果：通过。`scheduled 1 / exported 1 / cache_disk_entries 1 / persisted_refs 1`，输出 sha 与上一轮逐字节一致（`f283d36a…`、`452bdcadc89d353f`、`ad661337d3aa8896`、`f5fad3402cd0d5e9`）
 
 - 已执行检查：清理
 - 检查结果：通过。测试缓存目录、临时编译脚本与可执行文件、`__pycache__`、根目录 `.obj` 均已删除；`test-run/` 为 1.2 MB
