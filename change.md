@@ -2709,3 +2709,109 @@ test_state_size_calls_total      1
   - **配额/TTL 淘汰、文件句柄占用后回收、强杀重启**：未执行
   - **媒体输入端到端**：测试机无多模态模型；`media_state_unverified` 门禁未变
   - **v8 的反向兼容实测**：只验证了"v9 代码读 v8 文件"和"v8 进程读 v9 文件"中的后者，**未单独构造 v8 文件由新版进程恢复**（不过历轮全部 v8 恢复都在新代码上跑过，等价覆盖）
+
+# 2026-11-16 13-05 - Change Record（test1_5 修正：read_bytes 语义 + 真实 checkpoint 实测）
+
+## 本轮性质
+
+交付前自查发现**上一份记录（`2026-11-16 12-20`）中的一条实现陈述与实际代码不符**，已修正；同时意外获得了第 `12-20` 条目列为"未验证"的 checkpoint 真实数据。本节如实记录，不覆盖上一节，作为其更正与补充。
+
+### 一、自查发现：`read_bytes` 并未反映真实读取量
+
+第 `12-20` 条目 §四声称"`read_bytes` 报告 `stored_read`（真实物理读取），与解压后长度分开"。核对源码发现**该陈述是错的**：
+
+- `server_disk_cache_files::load()` 中为 `info.read_bytes += best.size_file;`
+- `size_file` 是**条目文件的总大小**，包含未选中 checkpoint 的全部段（那些段只被 `seek` 跳过，从未读取）
+- 我写的 `stored_read` 只喂给一条 `SRV_TRC` 日志，**未进入任何指标**
+
+规划 §3.4 第 4 条明确要求"`read_bytes` 统计**本次真正从磁盘读取的**压缩字节和相关元数据，与 `file_bytes` 的完整物理文件大小区分"。本条**未达到规划要求**，且已被写入记录，属记录与实现不一致。
+
+**为何未在 `12-20` 轮被发现**：`stored_read` 的 trace 行是 `SRV_TRC`（TRACE 级），而历轮运行的 `-lv 3` 是 INFO 级，**该行从未输出**。我在报告中引用了一个从未被观察过的日志行。
+
+### 二、修正
+
+- `server_disk_cache_payload` 新增 `uint64_t stored_bytes`
+- `read_entry()` 以 `hdr_end` 初始化 `stored_read`（header 与段表是读取过程的一部分），逐段累加 `d.stored_len`，结束时写入 `out.stored_bytes`
+- `load()` 改为 `info.read_bytes += payload.stored_bytes > 0 ? payload.stored_bytes : best.size_file;`（回退分支仅为极端情况保留）
+
+### 三、修正后的对应指标与实测
+
+`test-run/logs/fix12-v9fr.log`（`-lv 5`，v9 文件，2 个 checkpoint）：
+
+```
+read_entry: disk cache: read 373.50 MiB stored (373.53 MiB decoded) of 538.47 MiB, checkpoints 1/2, segmented
+add_cache_st: reused_disk = 2102, source = disk, read_bytes = 391647888
+```
+
+| 量 | 值 |
+|---|---|
+| 物理读取（修正后 `read_bytes`） | 373.50 MiB / 391647888 B |
+| 解压后 | 373.53 MiB |
+| 文件总大小（修正前误报为此值） | 538.47 MiB |
+
+修正前 `read_bytes` **高估 44%**。差异来源正是未选中的 checkpoint 0（其 tgt 段 156894364 B 只被 seek 跳过）。修正后 `read_bytes` 与 trace 的 stored 值自洽。
+
+### 四、意外获得：真实 checkpoint 数据
+
+第 `12-20` 条目将 checkpoint 相关验证列为"未验证"（历轮 `--checkpoint-min-step` 默认 8192 且需 `is_user_start`/`near_prompt_end`，从未触发）。本轮因 `-lv 5` 运行，**实际触发了 2 个 checkpoint**：
+
+```
+load_model: context checkpoints enabled, max = 32, min spacing = 8192
+read_entry: ..., checkpoints 1/2, segmented
+```
+
+**因此以下各项首次获得真实模型证据**（此前只有 codec 层元数据用例）：
+
+1. 多 checkpoint 独立编码——写入文件含 2 个 checkpoint，各 3 段共 6 段
+2. 未选段的 seek 跳过——恢复选中 checkpoint 1，跳过 checkpoint 0
+3. 只恢复一个 checkpoint——`checkpoints 1/2`
+4. checkpoint 三 CRC 在解压后字节上校验——恢复成功且输出 sha 一致
+
+**尚未获得证据**：只恢复**最后一个** checkpoint 的情形（本轮选中的是索引 1，即最后一个；索引 0 被跳过——实际已有覆盖）。恢复**中间** checkpoint 需要 ≥3 个 checkpoint，未构造。
+
+### 五、逐段构成（规划 §3.5 要求的数据）
+
+对 `test-run/cache-v9f/pc-bf495e2785d51ca5.bin` 直接解析段表：
+
+```
+version 9, sig_len 206, size_main 195689284, size_drft 22970832, n_ckpt 2
+  ckpt0: n_tokens=1476 pos=[1475,1475] spec=0 tgt=156894364 dft=16094456
+  ckpt1: n_tokens=1478 pos=[1477,1477] spec=0 tgt=156894364 dft=16116264
+
+  seg 0 main       raw= 195689284 stored= 195689284 codec=0 raw
+  seg 1 drft       raw=  22970832 stored=  22945990 codec=1 ENCODED
+  seg 2 ck0.spec   raw=         0 stored=         0 codec=0 raw
+  seg 3 ck0.tgt    raw= 156894364 stored= 156894364 codec=0 raw
+  seg 4 ck0.dft    raw=  16094456 stored=  16087386 codec=1 ENCODED
+  seg 5 ck1.spec   raw=         0 stored=         0 codec=0 raw
+  seg 6 ck1.tgt    raw= 156894364 stored= 156894364 codec=0 raw
+  seg 7 ck1.dft    raw=  16116264 stored=  16109196 codec=1 ENCODED
+
+  TOTAL raw=564659564 stored=564620584 saved=38980 encoded=3/8
+```
+
+**规律**：8 段中 3 段被编码（`drft` 与两个 checkpoint 的 `dft`），`main` 与全部 checkpoint `tgt` 完全不可压缩并原样存储。第 `12-20` 条目只报了"减少 38756 字节"，未说明**哪类段可压缩**；此处补全。
+
+推测：draft 模型的状态（`drft`、`dft`）冗余度高于 target 状态（`main`、`tgt`），但**本轮只有一个快照、一个模型组合**，不足以支撑结论，需要多快照才能判断是否稳定。
+
+### 六、据此更新的验证状态
+
+第 `12-20` 条目 §7 的表格中，以下各项状态**需要更正**：
+
+| 检查项 | `12-20` 记录 | 实际 |
+|---|---|---|
+| checkpoint 段真实模型验证 | 未做 | **已做**（2 个 checkpoint，含未选段跳过与 CRC 校验） |
+| 只恢复最后一个 checkpoint | 未做 | **已做**（本轮即选中索引 1） |
+| `read_bytes` 区分物理/解码 | 已实现 | **原先未实现**（误报文件总大小），本轮修正后已实现并实测 |
+| 压缩收益数据 | 完全没有 | **有部分数据**：8 段中 3 段编码、逐段 raw/stored 已知、单快照总节省 38980 B |
+| `codec_fallback_raw_segments` | 未加 | 仍未加为指标，但已由文件直接解析得出（5/8 回退） |
+| `encode_us` / `decode_us` | 未加 | **仍未加** |
+| `raw_bytes` / `stored_bytes` 指标 | 未加 | **仍未加为指标** |
+| 损坏文件注入 | 未做 | **仍未做** |
+| `touch_entry()` 对 v9 实测 | 未做 | **仍未做** |
+| 解压后与 `get_data_ext()` 逐字节比对 | 未做 | **仍未做**（仅 CRC 校验） |
+| 配额/TTL、句柄占用、强杀重启 | 未执行 | **仍未执行** |
+
+### 七、对记录纪律的说明
+
+本轮暴露了我自己的一个流程问题：**引用了从未输出的日志行为证据**。`-lv 3` 下 `SRV_TRC` 不输出，而我在报告里把它当作已实现的证据。已在本节更正，并在后续核对中改为"先确认日志实际出现，再引用"。

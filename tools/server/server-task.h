@@ -896,6 +896,14 @@ enum class disk_cache_read_status {
 // one entry file decoded and validated, in the order the file stores it
 struct server_disk_cache_payload {
     std::vector<char> packed;
+
+    // how many physical bytes this read actually consumed: the stored segment
+    // lengths plus the header and segment table, NOT the decoded sizes. An encoded
+    // segment occupies less on disk than it decodes to, and a checkpoint that was
+    // skipped was never read at all, so the entry's total file size is not the
+    // answer either. read_entry() sets it; load() reports it.
+    uint64_t stored_bytes = 0;
+
     llama_tokens tokens;
     std::vector<uint32_t> media_indices;
     std::vector<uint32_t> media_token_counts;

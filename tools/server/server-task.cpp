@@ -3461,11 +3461,12 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
 
     const std::streamoff hdr_end = f.tellg();
 
-    // how many physical bytes this read actually consumed. it is reported for the
-    // trace below and must stay the *stored* count: an encoded segment occupies less
-    // on disk than it decodes to, and calling the latter "bytes read" would
-    // overstate the IO
-    uint64_t stored_read = 0;
+    // how many physical bytes this read actually consumed. It must stay the
+    // *stored* count: an encoded segment occupies less on disk than it decodes to,
+    // and a skipped checkpoint was never read, so neither the decoded sizes nor the
+    // entry's total file size answer this. The header and the segment table were
+    // consumed to get here, so they are part of it
+    uint64_t stored_read = (uint64_t) hdr_end;
 
     // The decoded bytes land in a plain buffer first and are moved into the state
     // container only once they are known to be exactly the declared length. A
@@ -3585,8 +3586,11 @@ disk_cache_read_status server_disk_cache::read_entry(const server_disk_cache_ent
 
     (void) ckpt_bytes;
 
-    // `stored_read` is what came off the disk; `size_main + size_drft` would be the
-    // decoded size and must not be reported as IO
+    // publish the physical byte count so the caller reports IO rather than the
+    // entry's total size: `size_main + size_drft` would be the decoded size, and
+    // the entry's file size includes checkpoints that were only seeked over
+    out.stored_bytes = stored_read;
+
     const uint64_t decoded_read = (uint64_t) hdr_end + size_main + size_drft + ckpt_bytes;
     SRV_TRC("disk cache: read %.2f MiB stored (%.2f MiB decoded) of %.2f MiB, checkpoints %d/%zu%s\n",
             (double) stored_read/1048576.0, decoded_read/1048576.0, e.size_file/1048576.0,
@@ -3971,7 +3975,9 @@ bool server_disk_cache::load(server_prompt & prompt, const server_tokens & token
 
         const disk_cache_read_status status = read_entry(best, best_lcp, payload);
         if (status == disk_cache_read_status::ok) {
-            info.read_bytes += best.size_file;
+            // the physical bytes this restore read, not the entry's total size:
+            // skipped checkpoints and encoded segments make the two differ
+            info.read_bytes += payload.stored_bytes > 0 ? payload.stored_bytes : best.size_file;
             info.elapsed_us += ggml_time_us() - t_read;
             have = true;
             break;
